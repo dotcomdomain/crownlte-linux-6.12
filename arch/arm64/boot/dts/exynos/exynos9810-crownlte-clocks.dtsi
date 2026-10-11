@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Actual crownlte live DT resources. Disabled until firmware bring-up. */
+/ {
+	/* Original crownlte S2MPS18 firmware transport channel, not an I2C device. */
+	legacy_acpm_pmic: acpm-pmic-client {
+		compatible = "samsung,exynos9810-acpm-pmic-client";
+		acpm-ipc-channel = <2>;
+		status = "disabled";
+	};
+	legacy_cmu_ewf: cmu-ewf@1a240000 {
+		compatible = "samsung,exynos-cmuewf";
+		reg = <0 0x1a240000 0x1000>;
+		status = "disabled";
+	};
+	legacy_osc: exynos9810-oscclk {
+		compatible = "samsung,exynos9810-oscclk";
+		clock-frequency = <26000000>;
+	};
+	legacy_cmu: clock-controller@15a80000 {
+		compatible = "samsung,exynos9810-clock";
+		reg = <0 0x15a80000 0x8000>;
+		#clock-cells = <1>;
+		status = "disabled";
+	};
+	legacy_acpm: acpm@14020000 {
+		compatible = "samsung,exynos-acpm";
+		reg = <0 0x14020000 0x1000>;
+		reg-names = "timer_apm";
+		acpm-ipc-channel = <4>;
+		fvmap_offset = <0x6700>;
+		peritimer-cnt = <0xffff>;
+		status = "disabled";
+	};
+	legacy_acpm_ipc: acpm-ipc@14100000 {
+		compatible = "samsung,exynos-acpm-ipc";
+		reg = <0 0x14100000 0x1000>, <0 0x02039000 0x30000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 68 IRQ_TYPE_NONE>;
+		initdata-base = <0x7f00>;
+		dump-base = <0x0203c000>;
+		dump-size = <0x1d000>;
+		logging-period = <500>;
+		num-timestamps = <32>;
+		debug-log-level = <0>;
+		status = "disabled";
+	};
+	legacy_acpm_dvfs: acpm-dvfs {
+		compatible = "samsung,exynos-acpm-dvfs";
+		acpm-ipc-channel = <5>;
+		status = "disabled";
+	};
+};

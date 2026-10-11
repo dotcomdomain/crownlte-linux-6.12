@@ -34,10 +34,19 @@
 		      <0x8 0x80000000 0x80000000>,
 		      <0x9 0x0 0x80000000>;
 	};
+	ect {
+		parameter_address = <0xa0000000>;
+		parameter_size = <0x32000>;
+	};
+
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <1>;
 		ranges;
+		ect-table@a0000000 {
+			reg = <0 0xa0000000 0x32000>;
+		};
+
 		modem-if@f0000000 {
 			reg = <0x0 0xf0000000 0x9200000>;
 			no-map;
@@ -138,3 +147,5 @@
 		status = "disabled";
 	};
 };
+
+#include "exynos9810-crownlte-clocks.dtsi"

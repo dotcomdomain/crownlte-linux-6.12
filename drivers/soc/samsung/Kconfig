@@ -90,3 +90,48 @@ config EXYNOS9810_DIAGNOSTIC_MUIC
 	help
 	  Source-only diagnostic helper for the Note9 MAX77705 Type-C MCU.
 	  Applies the vendor D+/D- path opcode; not the Android MUIC ABI.
+
+config EXYNOS9810_LEGACY_CAL
+	bool "Exynos9810 original CAL, ASV and ACPM clock foundation"
+	depends on ARCH_EXYNOS && ARM64 && OF && COMMON_CLK
+	select PM
+	select CAL_IF
+	select CMUCAL
+	select CMU_EWF
+	select PMUCAL
+	select FLEXPMU
+	select CP_PMUCAL
+	select ACPM_DVFS
+	select EXYNOS_ACPM
+	select ECT
+	select SOC_EXYNOS9810
+	help
+	  Compile the original crownlte hardware clock tables and real firmware
+	  transport. Board nodes must remain disabled until bring-up validation.
+	  CPU/devfreq thermal policy and vendor power domains need further work.
+
+config CAL_IF
+	bool
+config CMUCAL
+	bool
+config PMUCAL
+	bool
+config FLEXPMU
+	bool
+config CP_PMUCAL
+	bool
+config ACPM_DVFS
+	bool
+config EXYNOS_ACPM
+	bool
+config ECT
+	bool
+config SOC_EXYNOS9810
+	bool
+
+config CMUCAL_QCH_IGNORE_SUPPORT
+	bool
+	default y if EXYNOS9810_LEGACY_CAL
+
+config CMU_EWF
+	bool
