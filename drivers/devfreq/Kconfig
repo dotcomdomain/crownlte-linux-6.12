@@ -75,6 +75,17 @@ config DEVFREQ_GOV_PASSIVE
 
 comment "DEVFREQ Drivers"
 
+config EXYNOS9810_BUS_TABLES
+	bool "Exynos9810 CAL/ECT bus table and FVP protocol component"
+	depends on ARCH_EXYNOS && EXYNOS9810_LEGACY_CAL && EXYNOS_ACPM && ECT
+	help
+	  Validate actual calibrated bus levels, exact ECT dependency rows and
+	  prepare the original response-enabled MIF constraint protocol.
+	  This does not register a bus devfreq provider or enable hardware nodes.
+	  Real BTS, thermal and supplier transitions remain required.
+
+
+
 config ARM_EXYNOS_BUS_DEVFREQ
 	tristate "ARM Exynos Generic Memory Bus DEVFREQ Driver"
 	depends on ARCH_EXYNOS || COMPILE_TEST
