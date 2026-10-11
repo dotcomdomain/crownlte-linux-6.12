@@ -550,6 +550,40 @@ s32 freq_qos_read_value_excluding(struct freq_constraints *qos,
 EXPORT_SYMBOL_GPL(freq_qos_read_value_excluding);
 
 /**
+ * freq_qos_read_min_request_value - Read one exact MIN-list vote.
+ * @qos: Constraints kept alive by the caller.
+ * @request: Request storage kept alive by the caller.
+ * @value: Written only when the request is present in this exact MIN list.
+ *
+ * Return 1 for an active vote, including zero, 0 for absent/inactive/foreign,
+ * or a negative argument error. Membership and priority are read under the
+ * core list lock. Mutable request type/qos metadata is never inspected.
+ */
+int freq_qos_read_min_request_value(struct freq_constraints *qos,
+		const struct freq_qos_request *request, s32 *value)
+{
+	struct plist_node *node;
+	const struct plist_node *wanted;
+	unsigned long flags;
+	int present = 0;
+
+	if (IS_ERR_OR_NULL(qos) || !request || !value)
+		return -EINVAL;
+	wanted = &request->pnode;
+	spin_lock_irqsave(&pm_qos_lock, flags);
+	plist_for_each(node, &qos->min_freq.list) {
+		if (node == wanted) {
+			*value = node->prio;
+			present = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&pm_qos_lock, flags);
+	return present;
+}
+EXPORT_SYMBOL_GPL(freq_qos_read_min_request_value);
+
+/**
  * freq_qos_apply - Add/modify/remove frequency QoS request.
  * @req: Constraint request to apply.
  * @action: Action to perform (add/update/remove).

@@ -192,6 +192,50 @@ static int bus_current(struct device *dev, unsigned long *hz)
 	return exynos9810_bus_transition_current(&bus->transition, hz);
 }
 
+/* Caller holds this provider's df->lock. This rejects software-initiated
+ * decreases below protection; it does not repair an already unsafe rate or
+ * prevent firmware changing clocks between current-rate and transition reads.
+ */
+static int bus_protect_down(struct crownlte_bus *bus, unsigned long requested_hz,
+		bool forced)
+{
+	const struct dev_pm_qos_request *incoming;
+	unsigned long current_hz, minimum_hz;
+	s32 floor;
+	int ret;
+
+	ret = exynos9810_bus_transition_current(&bus->transition, &current_hz);
+	if (ret)
+		return ret;
+	if (requested_hz >= current_hz)
+		return 0;
+	if (!forced) {
+		/* Read the raw aggregate, before core MAX truncates a conflicting MIN. */
+		floor = dev_pm_qos_read_value(bus->dev, DEV_PM_QOS_MIN_FREQUENCY);
+	} else {
+		/* Forced PM deliberately ignores ordinary client/boot minimums. MIF
+		 * has no incoming bus guard. INT and FSYS0 must prove exact ownership.
+		 */
+		if (bus->table.cal_id == EXYNOS9810_MIF_CAL_ID)
+			return 0;
+		if (bus->table.cal_id != EXYNOS9810_INT_CAL_ID &&
+		    bus->table.cal_id != EXYNOS9810_FSYS0_CAL_ID)
+			return -EINVAL;
+		incoming = exynos9810_bus_guard_min_request(bus->dev);
+		if (!incoming)
+			return -ENODEV;
+		ret = dev_pm_qos_read_min_request_value(bus->dev, incoming, &floor);
+		if (ret <= 0)
+			return ret < 0 ? ret : -ENODEV;
+	}
+	if (floor < 0)
+		return -ERANGE;
+	minimum_hz = (unsigned long)floor * 1000UL;
+	if (minimum_hz / 1000UL != (unsigned long)floor)
+		return -EOVERFLOW;
+	return requested_hz < minimum_hz ? -ERANGE : 0;
+}
+
 static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 {
 	struct crownlte_bus *bus = dev_get_drvdata(dev);
@@ -214,6 +258,9 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 		if (bus->forced_hz > cap)
 			return -ERANGE;
 		*hz = bus->forced_hz;
+		ret = bus_protect_down(bus, *hz, true);
+		if (ret)
+			return ret;
 		ret = exynos9810_bus_transition_rate(&bus->transition, *hz);
 		if (ret)
 			return ret;
@@ -223,6 +270,9 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
+	ret = bus_protect_down(bus, *hz, false);
+	if (ret)
+		return ret;
 	ret = exynos9810_bus_transition_rate(&bus->transition, *hz);
 	if (ret)
 		return ret;

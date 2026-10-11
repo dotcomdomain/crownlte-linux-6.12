@@ -170,6 +170,8 @@ s32 __dev_pm_qos_resume_latency(struct device *dev);
 s32 dev_pm_qos_read_value(struct device *dev, enum dev_pm_qos_req_type type);
 s32 dev_pm_qos_read_min_freq_excluding(struct device *dev,
 				     const struct dev_pm_qos_request *exclude);
+int dev_pm_qos_read_min_request_value(struct device *dev,
+		const struct dev_pm_qos_request *request, s32 *value);
 int dev_pm_qos_add_request(struct device *dev, struct dev_pm_qos_request *req,
 			   enum dev_pm_qos_req_type type, s32 value);
 int dev_pm_qos_update_request(struct dev_pm_qos_request *req, s32 new_value);
@@ -242,6 +244,12 @@ static inline s32 dev_pm_qos_read_min_freq_excluding(struct device *dev,
 	return PM_QOS_MIN_FREQUENCY_DEFAULT_VALUE;
 }
 
+static inline int dev_pm_qos_read_min_request_value(struct device *dev,
+		const struct dev_pm_qos_request *request, s32 *value)
+{
+	return 0;
+}
+
 static inline int dev_pm_qos_add_request(struct device *dev,
 					 struct dev_pm_qos_request *req,
 					 enum dev_pm_qos_req_type type,
@@ -312,6 +320,9 @@ s32 freq_qos_read_value(struct freq_constraints *qos,
 s32 freq_qos_read_value_excluding(struct freq_constraints *qos,
 				enum freq_qos_req_type type,
 				const struct freq_qos_request *exclude);
+
+int freq_qos_read_min_request_value(struct freq_constraints *qos,
+		const struct freq_qos_request *request, s32 *value);
 
 int freq_qos_add_request(struct freq_constraints *qos,
 			 struct freq_qos_request *req,

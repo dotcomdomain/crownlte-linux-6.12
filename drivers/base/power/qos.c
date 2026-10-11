@@ -110,11 +110,12 @@ s32 __dev_pm_qos_resume_latency(struct device *dev)
  */
 s32 dev_pm_qos_read_value(struct device *dev, enum dev_pm_qos_req_type type)
 {
-	struct dev_pm_qos *qos = dev->power.qos;
+	struct dev_pm_qos *qos;
 	unsigned long flags;
 	s32 ret;
 
 	spin_lock_irqsave(&dev->power.lock, flags);
+	qos = dev->power.qos;
 
 	switch (type) {
 	case DEV_PM_QOS_RESUME_LATENCY:
@@ -175,6 +176,36 @@ s32 dev_pm_qos_read_min_freq_excluding(struct device *dev,
 	return value;
 }
 EXPORT_SYMBOL_GPL(dev_pm_qos_read_min_freq_excluding);
+
+/**
+ * dev_pm_qos_read_min_request_value - Read presence/value of an exact MIN vote.
+ * @dev: Device kept alive by the caller.
+ * @request: Request storage kept alive by the caller.
+ * @value: Written only if this request belongs to this device's MIN list.
+ *
+ * Returns 1 for presence, including an active zero, 0 for absence, or a
+ * negative argument error. Hold the device power lock before loading its
+ * constraints pointer and through the core list read, protecting lifetime.
+ * This takes no sleeping mutex and reads no mutable request dev/type/qos
+ * metadata, so it is usable from a devfreq target with df->lock held.
+ */
+int dev_pm_qos_read_min_request_value(struct device *dev,
+		const struct dev_pm_qos_request *request, s32 *value)
+{
+	struct dev_pm_qos *qos;
+	unsigned long flags;
+	int ret = 0;
+
+	if (!dev || !request || !value)
+		return -EINVAL;
+	spin_lock_irqsave(&dev->power.lock, flags);
+	qos = dev->power.qos;
+	if (!IS_ERR_OR_NULL(qos))
+		ret = freq_qos_read_min_request_value(&qos->freq, &request->data.freq, value);
+	spin_unlock_irqrestore(&dev->power.lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(dev_pm_qos_read_min_request_value);
 
 /**
  * apply_constraint - Add/modify/remove device PM QoS request.
