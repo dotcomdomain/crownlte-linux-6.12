@@ -26,6 +26,68 @@ struct exynos9810_bus_table {
 	unsigned int resume_khz;
 };
 
+/* Reverse the validated consumer MIN guidance table into a consumer ceiling.
+ * Input supplier limits are Hz; original guidance floor values are kHz.
+ * No extrapolation is permitted below the smallest supported dependency.
+ * Validate every row before publishing an output, even after a match is found.
+ */
+static inline int exynos9810_bus_reverse_cap(const struct exynos9810_bus_table *table,
+		unsigned int supplier_cal_id, unsigned long supplier_limit_hz,
+		unsigned long *consumer_limit_hz)
+{
+	unsigned int expected, i;
+	unsigned long ceiling = 0;
+
+	if (!table || !consumer_limit_hz || !supplier_limit_hz ||
+	    supplier_limit_hz % 1000 || supplier_limit_hz / 1000 > 0x7fffffffUL ||
+	    !table->count || table->count > EXYNOS9810_BUS_LEVELS)
+		return -EINVAL;
+	switch (table->cal_id) {
+	case EXYNOS9810_MIF_CAL_ID:
+		expected = EXYNOS9810_INT_CAL_ID;
+		break;
+	case EXYNOS9810_INT_CAL_ID:
+		expected = EXYNOS9810_FSYS0_CAL_ID;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (supplier_cal_id != expected)
+		return -EINVAL;
+	for (i = 0; i < table->count; i++) {
+		const struct exynos9810_bus_level *level = &table->levels[i];
+
+		if (!level->hz || level->hz % 1000 ||
+		    level->hz / 1000 > 0x7fffffffUL || !level->uv ||
+		    !level->dependency_khz || level->dependency_khz > 0x7fffffffU ||
+		    (i && (level->hz >= table->levels[i - 1].hz ||
+		           level->dependency_khz > table->levels[i - 1].dependency_khz)))
+			return -EINVAL;
+		if (!ceiling && level->dependency_khz <= supplier_limit_hz / 1000)
+			ceiling = level->hz;
+	}
+	if (!ceiling)
+		return -ERANGE;
+	*consumer_limit_hz = ceiling;
+	return 0;
+}
+
+/* Original DM policy caps use full CAL IDs and a distinct command tag.
+ * The original fourth word was uninitialized; always initialize all words.
+ */
+static inline int exynos9810_bus_policy_command(unsigned int cal_id,
+		unsigned int maximum_khz, unsigned int command[4])
+{
+	if (!command || !maximum_khz || maximum_khz > 0x7fffffffU ||
+	    (cal_id != EXYNOS9810_MIF_CAL_ID && cal_id != EXYNOS9810_INT_CAL_ID))
+		return -EINVAL;
+	command[0] = cal_id;
+	command[1] = maximum_khz;
+	command[2] = 4; /* Original Samsung POLICY_REQ. */
+	command[3] = 0;
+	return 0;
+}
+
 /* Original FVP AP-state protocol uses devfreq type0/1, not an arbitrary CAL
  * domain index. FSYS0 has CAL index6 but does not use this release message.
  */
@@ -129,5 +191,8 @@ int exynos9810_bus_upload_mif_constraints(struct device_node *node,
 		const struct exynos9810_bus_table *table);
 int exynos9810_bus_set_ap_running(struct device_node *node,
 		unsigned int cal_id, unsigned int running);
+
+int exynos9810_bus_set_policy_max(struct device_node *node,
+		unsigned int cal_id, unsigned int maximum_khz);
 
 #endif

@@ -171,3 +171,32 @@ int exynos9810_bus_set_ap_running(struct device_node *node,
 		return -EINVAL;
 	return acpm_ipc_send_data(channel, &config);
 }
+
+/* This sends a requested firmware policy ceiling. Transport success alone
+ * does not prove a physical rate or that dependent consumers were lowered.
+ * A provider must coordinate consumers and confirm actual CAL rates first.
+ */
+int exynos9810_bus_set_policy_max(struct device_node *node,
+		unsigned int cal_id, unsigned int maximum_khz)
+{
+	unsigned int channel, size, requested, command[4];
+	struct ipc_config config = {
+		.cmd = command,
+		.response = true,
+		.indirection = false,
+	};
+	int ret;
+
+	ret = exynos9810_bus_policy_command(cal_id, maximum_khz, command);
+	if (ret)
+		return ret;
+	if (!node || of_property_read_u32(node, "acpm-ipc-channel", &requested) ||
+	    requested != 1)
+		return -EINVAL;
+	ret = acpm_ipc_request_channel(node, NULL, &channel, &size);
+	if (ret)
+		return ret;
+	if (channel != requested || size != sizeof(command))
+		return -EINVAL;
+	return acpm_ipc_send_data(channel, &config);
+}
