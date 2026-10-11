@@ -76,6 +76,27 @@ int cal_dfs_get_bigturbo_max_freq(unsigned int *table)
 	return vclk_get_bigturbo_table(table);
 }
 
+bool cal_dfs_is_ready(unsigned int id)
+{
+	struct vclk *vclk;
+	unsigned int voltage[48], i;
+	if (!cal_if_is_initialized() || !IS_ACPM_VCLK(id) ||
+	    !exynos_acpm_dvfs_is_ready())
+		return false;
+	vclk = cmucal_get_node(id);
+	if (!vclk || !vclk->lut || !vclk->num_rates ||
+	    vclk->num_rates > ARRAY_SIZE(voltage) ||
+	    !vclk->max_freq || vclk->max_freq == UINT_MAX ||
+	    vclk->min_freq == UINT_MAX || vclk->min_freq > vclk->max_freq ||
+	    fvmap_get_voltage_table(id, voltage) != vclk->num_rates)
+		return false;
+	for (i = 0; i < vclk->num_rates; i++)
+		if (!voltage[i])
+			return false;
+	return true;
+}
+EXPORT_SYMBOL_GPL(cal_dfs_is_ready);
+
 int cal_dfs_set_rate(unsigned int id, unsigned long rate)
 {
 	struct vclk *vclk;

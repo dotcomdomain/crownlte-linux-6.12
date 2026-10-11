@@ -43,13 +43,13 @@ bool is_set_regmap = false;
 
 void acpm_ipc_set_waiting_mode(bool mode)
 {
-	if (acpm_ipc_ready)
+	if (smp_load_acquire(&acpm_ipc_ready))
 		acpm_ipc->w_mode = mode;
 }
 
 void acpm_fw_log_level(unsigned int on)
 {
-	if (acpm_ipc_ready)
+	if (smp_load_acquire(&acpm_ipc_ready))
 		acpm_debug->debug_log_level = on;
 }
 
@@ -64,7 +64,7 @@ void acpm_ramdump(void)
 void timestamp_write(void)
 {
 	unsigned int tmp_index;
-	if (!acpm_ipc_ready)
+	if (!smp_load_acquire(&acpm_ipc_ready))
 		return;
 	if (spin_trylock(&acpm_debug->lock)) {
 		tmp_index = __raw_readl(acpm_debug->time_index);
@@ -146,7 +146,7 @@ void acpm_log_print(void)
 	unsigned int log_level;
 	unsigned int reg_id;
 
-	if (!acpm_ipc_ready || is_acpm_stop_log)
+	if (!smp_load_acquire(&acpm_ipc_ready) || is_acpm_stop_log)
 		return ;
 	/* ACPM Log data dequeue & print */
 	front = __raw_readl(acpm_debug->log_buff_front);
@@ -247,7 +247,7 @@ int acpm_ipc_set_ch_mode(struct device_node *np, bool polling)
 	int i, len, req_ch_id;
 	const __be32 *prop;
 
-	if (!np || !acpm_ipc_ready)
+	if (!np || !smp_load_acquire(&acpm_ipc_ready))
 		return -ENODEV;
 
 	prop = of_get_property(np, "acpm-ipc-channel", &len);
@@ -279,7 +279,7 @@ int acpm_ipc_request_channel(struct device_node *np, ipc_callback handler,
 	int i, len, req_ch_id;
 	const __be32 *prop;
 
-	if (!np || !acpm_ipc_ready)
+	if (!np || !smp_load_acquire(&acpm_ipc_ready))
 		return -ENODEV;
 
 	prop = of_get_property(np, "acpm-ipc-channel", &len);
@@ -317,7 +317,7 @@ int acpm_ipc_release_channel(struct device_node *np, unsigned int channel_id)
 	struct acpm_ipc_ch *channel;
 	struct list_head *cb_list;
 	struct callback_info *cb;
-	if (!acpm_ipc_ready || channel_id >= acpm_ipc->num_channels)
+	if (!smp_load_acquire(&acpm_ipc_ready) || channel_id >= acpm_ipc->num_channels)
 		return -ENODEV;
 	channel = &acpm_ipc->channel[channel_id];
 	cb_list = &channel->list;
@@ -461,7 +461,7 @@ static irqreturn_t acpm_ipc_irq_handler(int irq, void *data)
 	struct acpm_ipc_info *ipc = data;
 	unsigned int status;
 	int i;
-	if (!acpm_ipc_ready)
+	if (!smp_load_acquire(&acpm_ipc_ready))
 		return IRQ_NONE;
 
 	/* ACPM IPC INTERRUPT STATUS REGISTER */
@@ -483,7 +483,7 @@ static irqreturn_t acpm_ipc_irq_handler_thread(int irq, void *data)
 {
 	struct acpm_ipc_info *ipc = data;
 	int i;
-	if (!acpm_ipc_ready)
+	if (!smp_load_acquire(&acpm_ipc_ready))
 		return IRQ_NONE;
 
 	for (i = 0; i < acpm_ipc->num_channels; i++)
@@ -586,7 +586,7 @@ int acpm_ipc_send_data(unsigned int channel_id, struct ipc_config *cfg)
 	u64 timeout, now;
 	u32 retry_cnt = 0;
 
-	if (!acpm_ipc_ready || !cfg || channel_id >= acpm_ipc->num_channels)
+	if (!smp_load_acquire(&acpm_ipc_ready) || !cfg || channel_id >= acpm_ipc->num_channels)
 		return -EIO;
 
 	channel = &acpm_ipc->channel[channel_id];
@@ -865,7 +865,7 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 	acpm_ipc = devm_kzalloc(&pdev->dev,
 			sizeof(struct acpm_ipc_info), GFP_KERNEL);
 
-	acpm_ipc_ready = false;
+	smp_store_release(&acpm_ipc_ready, false);
 	if (!acpm_ipc)
 		return -ENOMEM;
 
@@ -921,12 +921,12 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 	if (!update_log_wq)
 		return -ENOMEM;
 	INIT_WORK(&acpm_debug->update_log_work, acpm_update_log);
-	acpm_ipc_ready = true;
+	smp_store_release(&acpm_ipc_ready, true);
 
 	if (acpm_debug->period) {
 		debug_logging_wq = create_freezable_workqueue("acpm_debug_logging");
 		if (!debug_logging_wq) {
-			acpm_ipc_ready = false;
+			smp_store_release(&acpm_ipc_ready, false);
 			destroy_workqueue(update_log_wq);
 			return -ENOMEM;
 		}
@@ -941,7 +941,7 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 
 static void acpm_ipc_remove(struct platform_device *pdev)
 {
-	acpm_ipc_ready = false;
+	smp_store_release(&acpm_ipc_ready, false);
 }
 
 static const struct of_device_id acpm_ipc_match[] = {

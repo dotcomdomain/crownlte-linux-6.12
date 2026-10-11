@@ -1,5 +1,6 @@
 #ifndef __ACPM_DVFS_H__
 #define __ACPM_DVFS_H__
+bool exynos_acpm_dvfs_is_ready(void);
 
 #include <linux/of.h>
 

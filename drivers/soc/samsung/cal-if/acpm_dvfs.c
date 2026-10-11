@@ -26,7 +26,7 @@ int exynos_acpm_set_rate(unsigned int id, unsigned long rate)
 	unsigned long long before, after, latency;
 	int ret;
 
-	if (!acpm_dvfs_ready)
+	if (!smp_load_acquire(&acpm_dvfs_ready))
 		return -ENODEV;
 	config.cmd = cmd;
 	config.response = true;
@@ -54,7 +54,7 @@ unsigned long exynos_acpm_get_rate(unsigned int id)
 	unsigned long long before, after, latency;
 	int ret;
 
-	if (!acpm_dvfs_ready)
+	if (!smp_load_acquire(&acpm_dvfs_ready))
 		return 0;
 	config.cmd = cmd;
 	config.response = true;
@@ -87,7 +87,7 @@ int exynos_acpm_set_volt_margin(unsigned int id, int volt)
 	int ret;
 	struct vclk *vclk;
 
-	if (!acpm_dvfs_ready)
+	if (!smp_load_acquire(&acpm_dvfs_ready))
 		return -ENODEV;
 	config.cmd = cmd;
 	config.response = true;
@@ -119,7 +119,7 @@ int exynos_acpm_set_cold_temp(unsigned int id, bool is_cold_temp)
 	unsigned long long before, after, latency;
 	int ret;
 
-	if (!acpm_dvfs_ready)
+	if (!smp_load_acquire(&acpm_dvfs_ready))
 		return -ENODEV;
 	config.cmd = cmd;
 	config.response = true;
@@ -242,6 +242,11 @@ static void acpm_dvfs_get_gpu_cold_temp_list(struct device *dev)
 }
 #endif
 
+bool exynos_acpm_dvfs_is_ready(void)
+{
+	return smp_load_acquire(&acpm_dvfs_ready);
+}
+
 static int acpm_dvfs_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -252,13 +257,13 @@ static int acpm_dvfs_probe(struct platform_device *pdev)
 		return ret == -ENODEV ? -EPROBE_DEFER : ret;
 	if (acpm_dvfs.size != 4 * sizeof(u32))
 		return -EPROTO;
-	acpm_dvfs_ready = true;
+	smp_store_release(&acpm_dvfs_ready, true);
 	return 0;
 }
 
 static void acpm_dvfs_remove(struct platform_device *pdev)
 {
-	acpm_dvfs_ready = false;
+	smp_store_release(&acpm_dvfs_ready, false);
 }
 
 static const struct of_device_id acpm_dvfs_match[] = {
