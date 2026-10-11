@@ -713,6 +713,11 @@ static ssize_t scaling_devfreq_min_store(struct device *dev,
 		return ret ? ret : -ERANGE;
 	changed = (s32)value != READ_ONCE(bus->system_min.data.freq.pnode.prio);
 	ret = dev_pm_qos_update_request(&bus->system_min, value);
+	/* System request changes can be hidden by another aggregate MIN. Keep
+	 * reconciliation durable without changing the legacy repeat-write ABI.
+	 */
+	if (ret >= 0 && changed)
+		bus_cap_notify();
 	/* The old INT minimum class uses FORCE_MAX even when this system request
 	 * remains below another minimum. Native device QoS suppresses that event.
 	 * Preserve the old exact-repeat no-op and write-count return behavior.
