@@ -75,6 +75,18 @@ config DEVFREQ_GOV_PASSIVE
 
 comment "DEVFREQ Drivers"
 
+config EXYNOS9810_MIF_BTS
+	bool "Exynos9810 mandatory MIF BTS SNode hardware service"
+	depends on EXYNOS9810_BUS_TABLES && OF
+	help
+	  Map and verify all four original MIF traffic-control register banks.
+	  Expose a mandatory managed supplier with explicit transition errors
+	  and restore register state before dependent devices resume.
+	  The MIF devfreq provider and full BTS bandwidth/scenario support
+	  still need implementation. No enabled hardware node is added.
+
+
+
 config EXYNOS9810_BUS_TABLES
 	bool "Exynos9810 CAL/ECT bus table and FVP protocol component"
 	depends on ARCH_EXYNOS && EXYNOS9810_LEGACY_CAL && EXYNOS_ACPM && ECT
