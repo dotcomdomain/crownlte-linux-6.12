@@ -1046,8 +1046,8 @@ config MEMCG_V1
 
 config CGROUP_SCHEDTUNE
 	bool "Private crownlte legacy schedtune compatibility controller"
-	depends on CGROUPS && SMP
-	select TRACEPOINTS
+	depends on CGROUPS && SMP && TRACING_SUPPORT
+	select TRACING
 	select ANDROID_VENDOR_HOOKS
 	default n
 	help
