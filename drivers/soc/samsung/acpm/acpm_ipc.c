@@ -8,6 +8,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/timekeeping.h>
 #include <linux/kernel.h>
 #include <linux/sched/clock.h>
 #include <linux/init.h>
@@ -499,6 +500,134 @@ static void apm_interrupt_gen(unsigned int id)
 	writel((1 << id) << 16, acpm_ipc->intr + INTGR0);
 }
 
+#if IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART)
+/* Caller pins this exact supplier with a managed device link until unbind. */
+int acpm_ipc_prepare_restart(struct device *supplier,
+			     struct device_node *framework)
+{
+	struct acpm_ipc_info *ipc;
+	struct acpm_ipc_ch *ch;
+	unsigned long flags;
+	u32 id, front, rear, next, rx_front, rx_rear, seq, reply;
+	u32 cmd[4] = { BIT(ACPM_IPC_PROTOCOL_STOP), 0, 0, 0 };
+	u64 started;
+	unsigned int polls = 0;
+	int ret = -ETIMEDOUT;
+
+	if (!supplier || !framework ||
+	    !of_device_is_compatible(framework, "samsung,exynos-acpm") ||
+	    of_property_read_u32(framework, "acpm-ipc-channel", &id))
+		return -EINVAL;
+	if (!smp_load_acquire(&acpm_ipc_ready))
+		return -ENODEV;
+	ipc = dev_get_drvdata(supplier);
+	if (!ipc || ipc != READ_ONCE(acpm_ipc) || ipc->dev != supplier ||
+	    !ipc->channel || !ipc->intr || id >= ipc->num_channels)
+		return -ENODEV;
+	ch = &ipc->channel[id];
+	/* The original crownlte framework uses channel 4 and four-word queues. */
+	if (id != 4 || ch->id != id || ch->type != TYPE_QUEUE ||
+	    ch->rx_ch.size != sizeof(cmd) || ch->tx_ch.size != sizeof(cmd) ||
+	    ch->rx_ch.len < 2 || ch->tx_ch.len < 2 ||
+	    !ch->rx_ch.base || !ch->rx_ch.front || !ch->rx_ch.rear ||
+	    !ch->tx_ch.base || !ch->tx_ch.front || !ch->tx_ch.rear)
+		return -EINVAL;
+
+	local_irq_save(flags);
+	if (!spin_trylock(&ch->ch_lock)) {
+		local_irq_restore(flags);
+		return -EBUSY;
+	}
+	ret = -EBUSY;
+	if (!spin_trylock(&ch->tx_lock))
+		goto unlock_ch;
+	if (!spin_trylock(&ch->rx_lock))
+		goto unlock_tx;
+	if (!ch->polling || !list_empty(&ch->list)) {
+		ret = -EOPNOTSUPP;
+		goto unlock_rx;
+	}
+	/* Refuse stale queued responses; do not consume another client's data. */
+	rx_front = readl(ch->rx_ch.front);
+	rx_rear = readl(ch->rx_ch.rear);
+	if (rx_front >= ch->rx_ch.len || rx_rear >= ch->rx_ch.len ||
+	    rx_front != rx_rear || ch->seq_num > 63) {
+		ret = -EPROTO;
+		goto unlock_rx;
+	}
+	started = ktime_get_mono_fast_ns();
+	ret = -ETIMEDOUT;
+	/* One total time limit and one iteration budget cover both queue waits. */
+	for (;;) {
+		if (++polls > 100000 ||
+		    ktime_get_mono_fast_ns() - started >= IPC_TIMEOUT)
+			goto unlock_rx;
+		front = readl(ch->tx_ch.front);
+		rear = readl(ch->tx_ch.rear);
+		if (front >= ch->tx_ch.len || rear >= ch->tx_ch.len) {
+			ret = -EPROTO;
+			goto unlock_rx;
+		}
+		next = (front + 1) % ch->tx_ch.len;
+		if (next != rear)
+			break;
+		cpu_relax();
+	}
+	if (readl(ch->rx_ch.front) != rx_rear ||
+	    readl(ch->rx_ch.rear) != rx_rear) {
+		ret = -EPROTO;
+		goto unlock_rx;
+	}
+	seq = ch->seq_num % 63 + 1;
+	ch->seq_num = seq;
+	cmd[0] |= seq << ACPM_IPC_PROTOCOL_SEQ_NUM;
+	memcpy_toio(ch->tx_ch.base + front * sizeof(cmd), cmd, sizeof(cmd));
+	/* Ordered queue publication precedes the original mailbox notification. */
+	writel(next, ch->tx_ch.front);
+	writel(BIT(id) << 16, ipc->intr + INTGR0);
+	for (;;) {
+		if (++polls > 100000 ||
+		    ktime_get_mono_fast_ns() - started >= IPC_TIMEOUT)
+			goto unlock_rx;
+		rx_front = readl(ch->rx_ch.front);
+		rx_rear = readl(ch->rx_ch.rear);
+		if (rx_front >= ch->rx_ch.len || rx_rear >= ch->rx_ch.len) {
+			ret = -EPROTO;
+			goto unlock_rx;
+		}
+		if (rx_front == rx_rear) {
+			cpu_relax();
+			continue;
+		}
+		reply = readl(ch->rx_ch.base + rx_rear * sizeof(cmd));
+		if (((reply >> ACPM_IPC_PROTOCOL_SEQ_NUM) & 0x3f) != seq ||
+		    !(reply & BIT(ACPM_IPC_PROTOCOL_STOP)) ||
+		    (reply & (BIT(ACPM_IPC_PROTOCOL_INDIRECTION) |
+			      ACPM_IPC_PROTOCOL_DP_CMD | BIT(ACPM_IPC_PROTOCOL_TEST)))) {
+			ret = -EPROTO;
+			goto unlock_rx;
+		}
+		rx_rear = (rx_rear + 1) % ch->rx_ch.len;
+		writel(rx_rear, ch->rx_ch.rear);
+		if (rx_rear == readl(ch->rx_ch.front)) {
+			writel(BIT(id), ipc->intr + INTCR1);
+			if (rx_rear != readl(ch->rx_ch.front))
+				writel(BIT(id), ipc->intr + INTGR1);
+		}
+		ret = 0;
+		break;
+	}
+unlock_rx:
+	spin_unlock(&ch->rx_lock);
+unlock_tx:
+	spin_unlock(&ch->tx_lock);
+unlock_ch:
+	spin_unlock(&ch->ch_lock);
+	local_irq_restore(flags);
+	return ret;
+}
+#endif
+
 static int enqueue_indirection_cmd(struct acpm_ipc_ch *channel,
 		struct ipc_config *cfg)
 {
@@ -936,12 +1065,15 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 				msecs_to_jiffies(10000));
 	}
 
+	/* Publish instance ownership only after the complete successful probe. */
+	platform_set_drvdata(pdev, acpm_ipc);
 	return ret;
 }
 
 static void acpm_ipc_remove(struct platform_device *pdev)
 {
 	smp_store_release(&acpm_ipc_ready, false);
+	platform_set_drvdata(pdev, NULL);
 }
 
 static const struct of_device_id acpm_ipc_match[] = {

@@ -135,3 +135,13 @@ config CMUCAL_QCH_IGNORE_SUPPORT
 
 config CMU_EWF
 	bool
+
+config EXYNOS9810_DIAGNOSTIC_RESTART
+	bool "Checked crownlte diagnostic restart only"
+	depends on EXYNOS9810_LEGACY_CAL && OF && ARM64
+	help
+	  Experimental no-storage diagnostic return using the original Samsung
+	  normal boot reasons, bounded ACPM STOP and original DFD reset masks.
+	  Only the explicit crownlte diagnostic restart DT compatible activates
+	  this handler. Failed prerequisites refuse reset and require physical
+	  fallback. Hardware reset and bootloader reason handling are unproven.

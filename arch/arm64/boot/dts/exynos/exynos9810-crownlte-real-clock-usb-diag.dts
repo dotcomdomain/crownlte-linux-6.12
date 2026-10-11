@@ -31,3 +31,13 @@
 	clocks = <&legacy_cmu GATE_USB30DRD_USB30DRD_LINK>, <&legacy_cmu USB30DRD>;
 	clock-names = "bus_early", "ref";
 };
+
+/* Diagnostic-only normal Android return, experimentally unvalidated. */
+&{/} {
+	diagnostic-restart@14060000 {
+		compatible = "samsung,exynos9810-crownlte-diagnostic-restart";
+		reg = <0 0x14060000 0x4000>;
+		samsung,acpm-ipc = <&legacy_acpm_ipc>;
+		samsung,acpm-framework = <&legacy_acpm>;
+	};
+};

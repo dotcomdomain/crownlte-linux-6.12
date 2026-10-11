@@ -30,6 +30,12 @@ int acpm_ipc_release_channel(struct device_node *np, unsigned int channel_id);
 int acpm_ipc_send_data(unsigned int channel_id, struct ipc_config *cfg);
 int acpm_ipc_send_data_sync(unsigned int channel_id, struct ipc_config *cfg);
 int acpm_ipc_set_ch_mode(struct device_node *np, bool polling);
+#if IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART)
+struct device;
+/* Requires exact supplier reference and a managed device link for lifetime. */
+int acpm_ipc_prepare_restart(struct device *supplier, struct device_node *framework);
+#endif
+
 void exynos_acpm_reboot(void);
 void acpm_stop_log(void);
 #else
