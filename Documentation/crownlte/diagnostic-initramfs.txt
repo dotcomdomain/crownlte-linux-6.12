@@ -1,0 +1,46 @@
+Diagnostic initramfs and USB variant
+===================================
+
+This is source-only bring-up work, not a usable Android upgrade.
+Default crownlte diagnostic DT and the separate USB diagnostic DT both keep
+UFS disabled. Neither diagnostic invokes Android init, fscrypt key delivery,
+Magisk, recovery formatting, or any block-device operation.
+
+tools/crownlte/diagnostic-init.c is a static ARM64 PID1. It mounts only proc,
+sysfs, devtmpfs and configfs. It records uname, boot command line, RAM and
+iomem into the kernel log, and attempts CDC ACM using configfs. The entire
+initramfs contains only /init; there is no shell, ADB daemon or mount utility.
+Compilation uses -static -Os -Wall -Wextra -Werror, and readelf must show
+AArch64 with no PT_INTERP. Source review, ELF and archive checks do not prove
+that the kernel boots or USB enumerates on the phone.
+
+The USB DT is exynos9810-crownlte-usb-diag.dts. It adds only:
+ - live-verified MAX77705 PMIC bus 0x14360000 and gpm14-0/gpm15-0 pinmux;
+ - vendor Type-C MCU opcode routing D+/D- to the AP at secondary address 0x25;
+ - shared Exynos9810 USB2 PHY reference 26 MHz and clock gate setup;
+ - a dedicated Exynos9810 HSI2C timing compatible, preserving AutoV9 behavior.
+
+CMU base/offset addresses were cross-checked against the actual modified
+crownlte kernel's drivers/soc/samsung/cal-if/exynos9810/cmucal-sfr.c.
+Clock-rate stand-ins for 200 MHz remain unverified. The USB DT logs clock mux
+and divider state to allow that assumption to be checked during bring-up.
+Power, I2C transfers, MUIC opcode response and USB enumeration are untested.
+There is no claim that the S9+ donor board is interchangeable with the Note9.
+
+Pstore uses this phone's captured 0xfed10000/0x8000 window. SBoot may clear it
+on restart; retention has not been demonstrated. USB serial is the intended
+runtime log path when the separate USB variant works. If it does not, the
+default diagnostic has only pstore and the shim's pre-kernel framebuffer;
+the current board DT has no enabled UART or Linux display console.
+
+Isolated uniLoader source: /root/kernel-upgrade/boot-shim/crownlte.
+Kernel relocation 0x92000000 avoids captured SBoot firmware log reservations.
+External initramfs 0x84000000 and loader text 0x87000000 are in actual RAM.
+Actual sizes, DT placement, pixel format and bootloader scanout must be checked
+before making a boot image. No script in this source work writes to the phone.
+
+Donor provenance:
+https://github.com/SheroAbi/galaxy-s9plus-mainline-linux
+bcee6014fc2e44a4c4f1c34bca0a880d4b543ec3
+ACK release android16-6.12-2026-09_r4:
+1dd27fbde73f42a97d467891b3bfce94f4f26dc6, Linux 6.12.92.
