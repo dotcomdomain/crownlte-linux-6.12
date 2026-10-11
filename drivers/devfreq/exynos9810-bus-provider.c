@@ -6,6 +6,8 @@
 #include <linux/devfreq.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
+#include <linux/spinlock.h>
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -23,7 +25,14 @@
 #include "governor.h"
 
 enum bus_pm_phase {
-	BUS_ACTIVE, BUS_ENTERING_SLEEP, BUS_SLEEP, BUS_LEAVING_SLEEP, BUS_PM_FAILED,
+	BUS_ACTIVE, BUS_QUIESCING, BUS_ENTERING_SLEEP, BUS_SLEEP, BUS_LEAVING_SLEEP,
+	BUS_PM_FAILED, BUS_REBOOTING,
+};
+
+struct crownlte_bus;
+struct bus_cap_notification {
+	struct notifier_block notifier;
+	struct crownlte_bus *bus;
 };
 
 struct crownlte_bus {
@@ -39,7 +48,10 @@ struct crownlte_bus {
 	struct exynos9810_legacy_qos_bridge legacy_qos;
 	struct mutex pm_lock;
 	enum bus_pm_phase pm_phase;
-	unsigned long forced_hz;
+	unsigned long forced_hz, private_max_hz;
+	struct bus_cap_notification cap_min, cap_max;
+	bool cap_min_registered, cap_max_registered, cap_notifications_stopping;
+	bool reboot_apply;
 	struct delayed_work boot_work;
 	unsigned long frequencies[EXYNOS9810_BUS_LEVELS];
 	unsigned long boot_expires;
@@ -52,6 +64,13 @@ static struct platform_driver crownlte_bus_driver;
 static DEFINE_MUTEX(bus_registry_lock);
 static struct crownlte_bus *bus_registry[3];
 static u64 bus_generations[3];
+static DEFINE_SPINLOCK(bus_cap_lock);
+static u64 bus_cap_epoch = 1;
+static bool bus_cap_dirty;
+static unsigned int bus_cap_retry;
+static int bus_cap_last_error;
+static void bus_cap_worker(struct work_struct *work);
+static DECLARE_DELAYED_WORK(bus_cap_work, bus_cap_worker);
 
 /* Class references keep provider storage/profile/table alive after withdrawal.
  * Snapshot capture takes only registry_lock; no frequency operation or final
@@ -133,6 +152,257 @@ static int bus_snapshot_update(const struct bus_snapshot *snapshot, unsigned int
 	mutex_unlock(&df->lock);
 	return ret;
 }
+/* One bounded reconciliation pass. No caller holds dev_pm_qos_mtx here. */
+static bool bus_cap_snapshot_live(const struct bus_snapshot *snapshot, unsigned int slot)
+{
+	struct crownlte_bus *bus = snapshot->buses[slot];
+
+	return !READ_ONCE(bus->retired) && bus->df == snapshot->df[slot] &&
+		bus->registration_generation == snapshot->generations[slot] &&
+		bus->pm_phase == BUS_ACTIVE && !bus->pm_frozen;
+}
+
+/* Caller holds this provider's df lock. Zero/unsupported maxima stay unmet. */
+static int bus_cap_ceiling(struct crownlte_bus *bus, unsigned long *ceiling)
+{
+	unsigned long minimum, maximum;
+
+	if (IS_ERR_OR_NULL(bus->df))
+		return -EAGAIN;
+	if (!bus->private_max_hz)
+		return -ERANGE;
+	devfreq_get_freq_range(bus->df, &minimum, &maximum);
+	maximum = min(maximum, bus->private_max_hz);
+	if (!maximum)
+		return -ERANGE;
+	*ceiling = maximum;
+	return 0;
+}
+
+static bool bus_cap_changed(u64 epoch)
+{
+	unsigned long flags;
+	bool changed;
+
+	spin_lock_irqsave(&bus_cap_lock, flags);
+	changed = bus_cap_dirty || bus_cap_epoch != epoch;
+	spin_unlock_irqrestore(&bus_cap_lock, flags);
+	return changed;
+}
+
+/* Work scheduling is IRQ-safe. Keep publication and its chosen delay atomic
+ * with worker completion so a fresh notification cannot lose its wakeup.
+ * Dirty remains authoritative if the diagnostic epoch counter saturates.
+ */
+static void bus_cap_notify(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&bus_cap_lock, flags);
+	if (bus_cap_epoch != U64_MAX)
+		bus_cap_epoch++;
+	bus_cap_dirty = true;
+	bus_cap_retry = 0;
+	mod_delayed_work(system_wq, &bus_cap_work, 1);
+	spin_unlock_irqrestore(&bus_cap_lock, flags);
+}
+
+static int bus_cap_notifier(struct notifier_block *nb, unsigned long value, void *data)
+{
+	struct bus_cap_notification *notification = container_of(nb,
+					struct bus_cap_notification, notifier);
+
+	if (!READ_ONCE(notification->bus->cap_notifications_stopping))
+		bus_cap_notify();
+	return NOTIFY_OK;
+}
+
+static int bus_cap_reconcile(u64 epoch)
+{
+	struct bus_snapshot snapshot;
+	unsigned long ceilings[3], actual[3], derived;
+	unsigned int i;
+	int ret;
+
+	ret = bus_snapshot_capture(7, NULL, &snapshot);
+	if (ret)
+		return ret;
+	for (i = 0; i < 3; i++) {
+		struct crownlte_bus *bus = snapshot.buses[i];
+
+		mutex_lock(&snapshot.df[i]->lock);
+		if (!bus_cap_snapshot_live(&snapshot, i))
+			ret = -EAGAIN;
+		else {
+			ret = bus_cap_ceiling(bus, &ceilings[i]);
+			if (!ret)
+				ret = exynos9810_bus_transition_current(&bus->transition, &actual[i]);
+		}
+		mutex_unlock(&snapshot.df[i]->lock);
+		if (ret)
+			goto out;
+	}
+	ret = exynos9810_bus_reverse_cap(&snapshot.buses[1]->table,
+			EXYNOS9810_FSYS0_CAL_ID, ceilings[2], &derived);
+	if (ret)
+		goto out;
+	ceilings[1] = min(ceilings[1], derived);
+	ret = exynos9810_bus_reverse_cap(&snapshot.buses[0]->table,
+			EXYNOS9810_INT_CAL_ID, ceilings[1], &derived);
+	if (ret)
+		goto out;
+	ceilings[0] = min(ceilings[0], derived);
+	/* Consumer first. Never prelock suppliers; real transitions recurse into
+	 * their df locks via the existing durable guard requests.
+	 */
+	for (i = 0; i < 3; i++) {
+		struct crownlte_bus *bus = snapshot.buses[i];
+		unsigned long fresh;
+
+		if (bus_cap_changed(epoch)) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		mutex_lock(&snapshot.df[i]->lock);
+		if (!bus_cap_snapshot_live(&snapshot, i)) {
+			ret = -EAGAIN;
+			goto unlock;
+		}
+		ret = bus_cap_ceiling(bus, &fresh);
+		if (ret)
+			goto unlock;
+		/* A newly tighter native bound requires new reverse derivation. */
+		if (fresh < ceilings[i]) {
+			ret = -EAGAIN;
+			goto unlock;
+		}
+		ret = exynos9810_bus_transition_current(&bus->transition, &fresh);
+		if (ret)
+			goto unlock;
+		bus->private_max_hz = min(bus->private_max_hz, ceilings[i]);
+		ret = update_devfreq(snapshot.df[i]);
+		if (!ret)
+			ret = exynos9810_bus_transition_current(&bus->transition, &fresh);
+		if (!ret && fresh > bus->private_max_hz)
+			ret = -ERANGE;
+unlock:
+		mutex_unlock(&snapshot.df[i]->lock);
+		if (ret)
+			goto out;
+	}
+out:
+	bus_snapshot_put(&snapshot);
+	return ret;
+}
+
+static void bus_cap_worker(struct work_struct *work)
+{
+	unsigned long flags, delay;
+	u64 epoch;
+	bool changed;
+	int ret;
+
+	spin_lock_irqsave(&bus_cap_lock, flags);
+	epoch = bus_cap_epoch;
+	bus_cap_dirty = false;
+	spin_unlock_irqrestore(&bus_cap_lock, flags);
+	ret = bus_cap_reconcile(epoch);
+	spin_lock_irqsave(&bus_cap_lock, flags);
+	changed = bus_cap_dirty || bus_cap_epoch != epoch;
+	bus_cap_last_error = ret;
+	if (changed || ret) {
+		bus_cap_dirty = true;
+		if (changed) {
+			bus_cap_retry = 0;
+			delay = 1;
+		} else {
+			bus_cap_retry = min(bus_cap_retry + 1, 6U);
+			delay = msecs_to_jiffies(min(100U << bus_cap_retry, 5000U));
+		}
+		mod_delayed_work(system_wq, &bus_cap_work, max(delay, 1UL));
+	} else {
+		bus_cap_retry = 0;
+	}
+	spin_unlock_irqrestore(&bus_cap_lock, flags);
+}
+
+static void bus_cap_stop_notifications(struct crownlte_bus *bus)
+{
+	WRITE_ONCE(bus->cap_notifications_stopping, true);
+	if (bus->cap_max_registered) {
+		dev_pm_qos_remove_notifier(bus->dev, &bus->cap_max.notifier,
+				DEV_PM_QOS_MAX_FREQUENCY);
+		bus->cap_max_registered = false;
+	}
+	if (bus->cap_min_registered) {
+		dev_pm_qos_remove_notifier(bus->dev, &bus->cap_min.notifier,
+				DEV_PM_QOS_MIN_FREQUENCY);
+		bus->cap_min_registered = false;
+	}
+}
+
+static int bus_cap_start_notifications(struct crownlte_bus *bus)
+{
+	int ret;
+
+	bus->cap_min.bus = bus;
+	bus->cap_max.bus = bus;
+	bus->cap_min.notifier.notifier_call = bus_cap_notifier;
+	bus->cap_max.notifier.notifier_call = bus_cap_notifier;
+	ret = dev_pm_qos_add_notifier(bus->dev, &bus->cap_min.notifier,
+			DEV_PM_QOS_MIN_FREQUENCY);
+	if (ret)
+		return ret;
+	bus->cap_min_registered = true;
+	ret = dev_pm_qos_add_notifier(bus->dev, &bus->cap_max.notifier,
+			DEV_PM_QOS_MAX_FREQUENCY);
+	if (ret)
+		return ret;
+	bus->cap_max_registered = true;
+	bus_cap_notify();
+	return 0;
+}
+
+/* Preflight before governor freeze or firmware AP-sleep ownership transfer. */
+static int bus_cap_pm_preflight(struct crownlte_bus *bus)
+{
+	unsigned long ceiling, resume_hz = bus->table.resume_khz * 1000UL;
+	int ret;
+
+	ret = bus_cap_ceiling(bus, &ceiling);
+	if (ret)
+		return ret;
+	return resume_hz > ceiling ? -ERANGE : 0;
+}
+
+static int bus_reboot_update(struct crownlte_bus *bus)
+{
+	struct bus_snapshot snapshot;
+	struct devfreq *df;
+	int ret;
+
+	ret = bus_snapshot_capture(1U << bus->slot, bus, &snapshot);
+	if (ret)
+		return ret;
+	df = snapshot.df[bus->slot];
+	mutex_lock(&df->lock);
+	if (READ_ONCE(bus->retired) || bus->df != df ||
+	    bus->registration_generation != snapshot.generations[bus->slot] ||
+	    bus->pm_phase != BUS_REBOOTING)
+		ret = -ENODEV;
+	else {
+		/* Only visible while this exact df is held; independent callbacks
+		 * cannot acquire it until this explicit reboot update has finished.
+		 */
+		bus->reboot_apply = true;
+		ret = update_devfreq(df);
+		bus->reboot_apply = false;
+	}
+	mutex_unlock(&df->lock);
+	bus_snapshot_put(&snapshot);
+	return ret;
+}
+
 static int bus_update(struct crownlte_bus *bus);
 
 static int bus_slot(unsigned int id)
@@ -246,7 +516,8 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 		return -ENODEV;
 	if (bus->pm_phase == BUS_PM_FAILED)
 		return -EIO;
-	if (bus->pm_phase == BUS_SLEEP)
+	if (bus->pm_phase == BUS_SLEEP || bus->pm_phase == BUS_QUIESCING ||
+	    (bus->pm_phase == BUS_REBOOTING && !bus->reboot_apply))
 		return exynos9810_bus_transition_current(&bus->transition, hz);
 	if (bus->forced_hz) {
 		unsigned long minimum, cap;
@@ -255,6 +526,7 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 		 * path, but cannot override an active maximum/thermal limit.
 		 */
 		devfreq_get_freq_range(bus->df, &minimum, &cap);
+		cap = min(cap, bus->private_max_hz);
 		if (bus->forced_hz > cap)
 			return -ERANGE;
 		*hz = bus->forced_hz;
@@ -266,7 +538,22 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 			return ret;
 		return exynos9810_bus_transition_current(&bus->transition, hz);
 	}
-	opp = devfreq_recommended_opp(dev, hz, flags);
+	{
+		unsigned long ceiling;
+
+		ret = bus_cap_ceiling(bus, &ceiling);
+		if (ret)
+			return ret;
+		if (*hz > ceiling) {
+			*hz = ceiling;
+			flags |= DEVFREQ_FLAG_LEAST_UPPER_BOUND;
+		}
+		opp = devfreq_recommended_opp(dev, hz, flags);
+		if (!IS_ERR(opp) && *hz > ceiling) {
+			dev_pm_opp_put(opp);
+			return -ERANGE;
+		}
+	}
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 	dev_pm_opp_put(opp);
@@ -530,6 +817,7 @@ static void bus_cleanup(void *data)
 		bus->reboot_registered = false;
 	}
 	exynos9810_legacy_qos_stop(&bus->legacy_qos);
+	bus_cap_stop_notifications(bus);
 
 	/* Mark retirement under the captured update's lock, then withdraw while
 	 * still holding it. Capture never takes df->lock under registry_lock.
@@ -548,6 +836,8 @@ static void bus_cleanup(void *data)
 	if (df)
 		mutex_unlock(&df->lock);
 	cancel_delayed_work_sync(&bus->boot_work);
+	/* Static manager stores no queued provider pointer; drain captured pins. */
+	cancel_delayed_work_sync(&bus_cap_work);
 	if (bus->sysfs_ready) {
 		sysfs_remove_group(&df->dev.kobj, &interactive_group);
 		sysfs_remove_group(&df->dev.kobj, &bus_group);
@@ -564,6 +854,7 @@ static void bus_cleanup(void *data)
 	bus_remove_requests(bus);
 	if (dev_get_drvdata(bus->dev) == bus)
 		dev_set_drvdata(bus->dev, NULL);
+	bus_cap_notify();
 }
 
 /* The registry lock protects these short reads against provider withdrawal.
@@ -597,6 +888,7 @@ static int bus_update(struct crownlte_bus *bus)
 	ret = bus_snapshot_capture(1U << bus->slot, bus, &snapshot);
 	if (ret)
 		return ret;
+	bus_cap_notify();
 	ret = bus_snapshot_update(&snapshot, bus->slot);
 	bus_snapshot_put(&snapshot);
 	return ret;
@@ -673,7 +965,16 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 		ret = -EBUSY;
 		goto out;
 	}
+	mutex_lock(&bus->df->lock);
+	ret = bus_cap_pm_preflight(bus);
+	if (!ret)
+		bus->pm_phase = BUS_QUIESCING;
+	mutex_unlock(&bus->df->lock);
+	if (ret)
+		goto out;
 	bus_pause_boot(bus);
+	/* No df/registry/publication lock spans cancellation. */
+	cancel_delayed_work_sync(&bus_cap_work);
 	/* ACK increments suspend_count before invoking its governor, including
 	 * error returns. Balance our contribution during rollback in either case.
 	 */
@@ -681,12 +982,12 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 	ret = devfreq_suspend_device(bus->df);
 	if (ret) {
 		repair = bus_unfreeze(bus);
-		if (repair) {
-			mutex_lock(&bus->df->lock);
-			bus->pm_phase = BUS_PM_FAILED;
-			mutex_unlock(&bus->df->lock);
+		mutex_lock(&bus->df->lock);
+		bus->pm_phase = repair ? BUS_PM_FAILED : BUS_ACTIVE;
+		mutex_unlock(&bus->df->lock);
+		if (repair)
 			dev_err(dev, "governor freeze rollback failed: %d\n", repair);
-		}
+		bus_cap_notify();
 		goto out;
 	}
 	mutex_lock(&bus->df->lock);
@@ -715,6 +1016,7 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 	bus->pm_phase = BUS_SLEEP;
 	mutex_unlock(&bus->df->lock);
 out:
+	bus_cap_notify();
 	mutex_unlock(&bus->pm_lock);
 	return ret;
 }
@@ -754,6 +1056,7 @@ static int __maybe_unused bus_resume_early(struct device *dev)
 	bus->pm_phase = ret ? BUS_PM_FAILED : BUS_ACTIVE;
 	mutex_unlock(&bus->df->lock);
 out:
+	bus_cap_notify();
 	mutex_unlock(&bus->pm_lock);
 	return ret;
 }
@@ -771,12 +1074,16 @@ static int bus_reboot(struct notifier_block *nb, unsigned long action, void *dat
 		ret = -EBUSY;
 		goto out;
 	}
+	mutex_lock(&bus->df->lock);
+	bus->pm_phase = BUS_REBOOTING;
+	mutex_unlock(&bus->df->lock);
 	bus_pause_boot(bus);
+	cancel_delayed_work_sync(&bus_cap_work);
 	ret = dev_pm_qos_update_request(&bus->default_min, khz);
 	if (ret >= 0)
 		ret = dev_pm_qos_update_request(&bus->reboot_max, khz);
 	if (ret >= 0)
-		ret = bus_update(bus);
+		ret = bus_reboot_update(bus);
 	if (!ret) {
 		ret = bus_current(bus->dev, &actual);
 		if (!ret && actual < khz * 1000UL)
@@ -905,6 +1212,7 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 		if (ret)
 			return dev_err_probe(dev, ret, "MIF FVP upload failed\n");
 	}
+	bus->private_max_hz = bus->table.levels[0].hz;
 	ret = exynos9810_bus_transition_init(&bus->transition, dev,
 					&bus->table, dependency, bts);
 	if (ret)
@@ -1001,6 +1309,9 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 	bus_registry[bus->slot] = bus;
 	bus->listed = true;
 	mutex_unlock(&bus_registry_lock);
+	ret = bus_cap_start_notifications(bus);
+	if (ret)
+		return dev_err_probe(dev, ret, "bus cap notifications unavailable\n");
 	mod_delayed_work(system_wq, &bus->boot_work, HZ);
 	dev_info(dev, "calibrated bus registered; bootstrap retained until all buses ready\n");
 	return 0;
