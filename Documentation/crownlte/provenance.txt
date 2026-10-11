@@ -1,0 +1,4 @@
+Backported Exynos9810 pinctrl, chipid and CPU binding from upstream.
+SoC DTS files imported from Linux v6.14.
+Upstream commits: 6d2dbd4cec8939ad2b813b8052eb12406db528d7, fd0b3581666860610ac770d4b582df42e0065c58, 608c8f408dac3d1fd96191494f1a32ba2b1e133d.
+ACK base: android16-6.12-2026-09_r4, 1dd27fbde73f42a97d467891b3bfce94f4f26dc6.
