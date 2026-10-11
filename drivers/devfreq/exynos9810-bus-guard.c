@@ -39,6 +39,24 @@ static struct exynos9810_bus_guard int_guard = {
 	.lock = &int_guard_lock, .expected_id = EXYNOS9810_FSYS0_CAL_ID,
 };
 
+const struct dev_pm_qos_request *
+exynos9810_bus_guard_min_request(struct device *supplier)
+{
+	u32 id;
+
+	if (IS_ERR_OR_NULL(supplier) ||
+	    of_property_read_u32(supplier->of_node, "samsung,cal-id", &id))
+		return NULL;
+	switch (id) {
+	case EXYNOS9810_INT_CAL_ID:
+		return &mif_guard.request;
+	case EXYNOS9810_FSYS0_CAL_ID:
+		return &int_guard.request;
+	default:
+		return NULL;
+	}
+}
+
 static struct exynos9810_bus_guard *guard_for_owner(unsigned int owner)
 {
 	switch (owner) {

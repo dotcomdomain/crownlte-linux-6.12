@@ -141,6 +141,42 @@ s32 dev_pm_qos_read_value(struct device *dev, enum dev_pm_qos_req_type type)
 EXPORT_SYMBOL_GPL(dev_pm_qos_read_value);
 
 /**
+ * dev_pm_qos_read_min_freq_excluding - Read a minimum without an internal vote.
+ * @dev: Device kept registered/alive by the caller.
+ * @exclude: Optional request with caller-owned storage valid until return.
+ *
+ * Serialize request metadata and constraints lifetime with device QoS updates
+ * and destruction, then take the core list lock for a consistent aggregate.
+ * A mismatched device/type or inactive request omits nothing. This function
+ * may sleep and must not be called from a device-QoS notifier, which already
+ * holds dev_pm_qos_mtx. It does not change enforcement or notify observers.
+ */
+s32 dev_pm_qos_read_min_freq_excluding(struct device *dev,
+				     const struct dev_pm_qos_request *exclude)
+{
+	struct dev_pm_qos *qos;
+	const struct freq_qos_request *omitted = NULL;
+	s32 value = PM_QOS_MIN_FREQUENCY_DEFAULT_VALUE;
+
+	if (!dev)
+		return value;
+	mutex_lock(&dev_pm_qos_mtx);
+	qos = dev->power.qos;
+	if (!IS_ERR_OR_NULL(qos)) {
+		if (exclude && exclude->dev == dev &&
+		    exclude->type == DEV_PM_QOS_MIN_FREQUENCY &&
+		    exclude->data.freq.qos == &qos->freq &&
+		    exclude->data.freq.type == FREQ_QOS_MIN)
+			omitted = &exclude->data.freq;
+		value = freq_qos_read_value_excluding(&qos->freq,
+						    FREQ_QOS_MIN, omitted);
+	}
+	mutex_unlock(&dev_pm_qos_mtx);
+	return value;
+}
+EXPORT_SYMBOL_GPL(dev_pm_qos_read_min_freq_excluding);
+
+/**
  * apply_constraint - Add/modify/remove device PM QoS request.
  * @req: Constraint request to apply
  * @action: Action to perform (add/update/remove).

@@ -17,6 +17,7 @@
 #include <linux/uaccess.h>
 #include <soc/samsung/exynos9810-legacy-qos.h>
 #include "exynos9810-bus-tables.h"
+#include "exynos9810-bus-guard.h"
 
 struct legacy_qos_class {
 	const char *name;
@@ -134,14 +135,17 @@ static s32 aggregate_value(struct legacy_qos_class *class)
 
 	if (!bridge)
 		return legacy;
-	/* Include the real system/default/boot/thermal/dependency requests that
-	 * shared this global class in the old kernel. An initial maximum request
-	 * was the provider's supported maximum, not an unlimited native default.
+	/* Keep system/default/boot/thermal and real client votes. Original DM
+	 * guidance floors were internal constraints, not global-class requests;
+	 * omit exactly that incoming guard from MIN readback, never enforcement.
+	 * Original MAX readback and its supported-maximum seed stay unchanged.
 	 */
-	native = dev_pm_qos_read_value(bridge->dev, class->maximum ?
-					DEV_PM_QOS_MAX_FREQUENCY : DEV_PM_QOS_MIN_FREQUENCY);
-	if (class->maximum)
+	if (class->maximum) {
+		native = dev_pm_qos_read_value(bridge->dev, DEV_PM_QOS_MAX_FREQUENCY);
 		return min(legacy, min_t(s32, native, bridge->maximum_khz));
+	}
+	native = dev_pm_qos_read_min_freq_excluding(bridge->dev,
+			exynos9810_bus_guard_min_request(bridge->dev));
 	return max(legacy, native);
 }
 

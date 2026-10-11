@@ -494,6 +494,62 @@ s32 freq_qos_read_value(struct freq_constraints *qos,
 }
 
 /**
+ * freq_qos_read_value_excluding - Read an aggregate without one request.
+ * @qos: Frequency constraints, with storage kept alive by the caller.
+ * @type: Frequency constraint type to read.
+ * @exclude: Optional request whose storage remains valid until return.
+ *
+ * Membership in the selected list is checked under pm_qos_lock. Request
+ * metadata is not read: freq_qos_add/remove_request changes that metadata
+ * outside this lock. A request from another list, an inactive request or NULL
+ * excludes nothing. Equal-priority requests remain independent votes.
+ * The cached effective value and all notifier/hardware behavior are unchanged.
+ */
+s32 freq_qos_read_value_excluding(struct freq_constraints *qos,
+				enum freq_qos_req_type type,
+				const struct freq_qos_request *exclude)
+{
+	struct pm_qos_constraints *c;
+	struct plist_node *node;
+	const struct plist_node *omitted = exclude ? &exclude->pnode : NULL;
+	unsigned long flags;
+	s32 value;
+
+	switch (type) {
+	case FREQ_QOS_MIN:
+		if (IS_ERR_OR_NULL(qos))
+			return FREQ_QOS_MIN_DEFAULT_VALUE;
+		c = &qos->min_freq;
+		break;
+	case FREQ_QOS_MAX:
+		if (IS_ERR_OR_NULL(qos))
+			return FREQ_QOS_MAX_DEFAULT_VALUE;
+		c = &qos->max_freq;
+		break;
+	default:
+		WARN_ON(1);
+		return 0;
+	}
+
+	spin_lock_irqsave(&pm_qos_lock, flags);
+	value = c->no_constraint_value;
+	/* plist nodes are sorted ascending. MIN frequency uses PM_QOS_MAX;
+	 * MAX frequency uses PM_QOS_MIN. Never seed a nonempty aggregate with
+	 * its default: that would discard valid votes below the default.
+	 */
+	plist_for_each(node, &c->list) {
+		if (node == omitted)
+			continue;
+		value = node->prio;
+		if (c->type == PM_QOS_MIN)
+			break;
+	}
+	spin_unlock_irqrestore(&pm_qos_lock, flags);
+	return value;
+}
+EXPORT_SYMBOL_GPL(freq_qos_read_value_excluding);
+
+/**
  * freq_qos_apply - Add/modify/remove frequency QoS request.
  * @req: Constraint request to apply.
  * @action: Action to perform (add/update/remove).

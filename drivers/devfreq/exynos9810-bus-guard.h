@@ -4,6 +4,8 @@
 
 #include <linux/types.h>
 
+struct device;
+struct dev_pm_qos_request;
 struct devfreq;
 struct exynos9810_bus_guard;
 
@@ -28,5 +30,12 @@ int exynos9810_bus_guard_retire(struct exynos9810_bus_lease *lease);
  * the old class permits a later provider registration on that same parent.
  */
 int exynos9810_bus_guard_forget_supplier(struct devfreq *supplier);
+
+/* Stable address only, no mutable guard/request state is inspected. Device
+ * QoS core validates membership/device/type under its locks before exclusion.
+ * Original DM guidance floors were internal, not legacy global-class votes.
+ */
+const struct dev_pm_qos_request *
+exynos9810_bus_guard_min_request(struct device *supplier);
 
 #endif
