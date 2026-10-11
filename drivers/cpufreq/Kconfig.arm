@@ -270,3 +270,13 @@ config ARM_PXA2xx_CPUFREQ
 	  This add the CPUFreq driver support for Intel PXA2xx SOCs.
 
 	  If in doubt, say N.
+
+config ARM_EXYNOS9810_ACPM_CPUFREQ
+	bool "Exynos9810 CAL/ACPM CPUFreq with MIF constraints"
+	depends on ARM64 && EXYNOS9810_LEGACY_CAL && PM_DEVFREQ && CPU_THERMAL
+	select PM_OPP
+	help
+	  Use the existing firmware's calibrated voltage/frequency tables and
+	  enforce CPU-to-MIF constraints through a real devfreq supplier.
+	  The platform node must stay disabled until MIF and thermal suppliers
+	  are implemented and tested. This does not substitute for legacy UFC.
