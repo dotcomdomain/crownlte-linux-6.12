@@ -1,0 +1,27 @@
+Android16 6.12 crownlte port, source-only diagnostic phase
+
+ACK base android16-6.12-2026-09_r4, Linux6.12.92.
+Reference https://github.com/SheroAbi/galaxy-s9plus-mainline-linux
+Reference commit bcee6014fc2e44a4c4f1c34bca0a880d4b543ec3.
+The reference is SM-G965F/S9+ and has not proved Note9 compatibility.
+Original copyrights/licenses are retained in imported driver sources.
+
+No phone writes, boot packaging, or flash scripts belong to this stage.
+The diagnostic board DTS deliberately omits unverified RAM and peripherals.
+Its DTB is a compilation artifact, not a boot-ready board description.
+
+Next device evidence: live FDT RAM map, reserved-memory, boot arguments,
+model revision, UFS/USB clocks and PMIC, panel and touchscreen identities.
+Then add read-only initramfs diagnostics that never mount USERDATA.
+
+Current ROM contracts that need porting before Android boot:
+- F2FS FBEv2 + inlinecrypt_optimized, original UFS FMP key descriptors.
+- Vendor Mali r19p0 ioctl ABI and /dev/mali0, Samsung ION heap ABI.
+- Samsung DECON framebuffer, EXYNOS video/G2D and camera interfaces.
+- MobiCore TrustZone/keymaster and original encryption key derivation.
+- SIPC modem interface, audio/ABOX and power/suspend firmware protocols.
+- SELinux paths, thermal controls, firmware files and USB configfs setup.
+- Rooted baseline ramdisk, existing HID/PTP/container/IPv6/USB behavior.
+
+Build success establishes compiler/API integration only. It does not prove
+boot, encryption, Android vendor ABI compatibility, or hardware operation.

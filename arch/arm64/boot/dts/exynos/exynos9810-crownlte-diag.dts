@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Source-only Note9 diagnostic board skeleton. Not ready to flash.
+ * Exynos9810 SoC definitions: Markuss Broks and Maksym Holovach.
+ * Hardware identity from Samsung Crown rev0.6 downstream board DTS.
+ * Live RAM, firmware reservations and panel handoff are still required.
+ */
+/dts-v1/;
+#include "exynos9810.dtsi"
+
+/ {
+	model = "Samsung Galaxy Note9 crownlte diagnostic skeleton";
+	compatible = "samsung,crownlte", "samsung,exynos9810";
+	chassis-type = "handset";
+	model_info-chip = <9810>;
+	model_info-platform = "android";
+	model_info-subtype = "samsung";
+	model_info-hw_rev = <26>;
+	model_info-hw_rev_end = <255>;
+	chosen {
+		bootargs = "maxcpus=1 panic=30 ro";
+	};
+};
+
+&oscclk { clock-frequency = <26000000>; };

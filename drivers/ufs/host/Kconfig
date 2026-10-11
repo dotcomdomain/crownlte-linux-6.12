@@ -143,3 +143,11 @@ config SCSI_UFS_SPRD
 
 	  Select this if you have UFS controller on Unisoc chipset.
 	  If unsure, say N.
+
+config SCSI_UFS_EXYNOS9810
+	tristate "Exynos9810 diagnostic UFS host"
+	depends on SCSI_UFSHCD_PLATFORM && (ARCH_EXYNOS || COMPILE_TEST)
+	select SCSI_UFS_VARIABLE_SG_ENTRY_SIZE
+	help
+	  Experimental host driver for diagnostic bring-up. Samsung FMP inline
+	  encryption is not implemented. Do not mount Android userdata with it.
