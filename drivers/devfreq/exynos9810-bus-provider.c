@@ -159,19 +159,25 @@ static bool bus_cap_snapshot_live(const struct bus_snapshot *snapshot, unsigned 
 
 	return !READ_ONCE(bus->retired) && bus->df == snapshot->df[slot] &&
 		bus->registration_generation == snapshot->generations[slot] &&
-		bus->pm_phase == BUS_ACTIVE && !bus->pm_frozen;
+		bus->pm_phase == BUS_ACTIVE && !READ_ONCE(bus->pm_frozen);
 }
 
 /* Caller holds this provider's df lock. Zero/unsupported maxima stay unmet. */
 static int bus_cap_ceiling(struct crownlte_bus *bus, unsigned long *ceiling)
 {
 	unsigned long minimum, maximum;
+	struct devfreq *df = READ_ONCE(bus->df);
+	s32 native_max;
 
-	if (IS_ERR_OR_NULL(bus->df))
+	if (IS_ERR_OR_NULL(df))
 		return -EAGAIN;
 	if (!bus->private_max_hz)
 		return -ERANGE;
-	devfreq_get_freq_range(bus->df, &minimum, &maximum);
+	native_max = dev_pm_qos_read_value(bus->dev, DEV_PM_QOS_MAX_FREQUENCY);
+	if (native_max < 0)
+		return -ERANGE;
+	devfreq_get_freq_range(df, &minimum, &maximum);
+	maximum = min(maximum, (unsigned long)native_max * 1000UL);
 	maximum = min(maximum, bus->private_max_hz);
 	if (!maximum)
 		return -ERANGE;
@@ -905,7 +911,7 @@ static int bus_unfreeze(struct crownlte_bus *bus)
 	int ret = 0;
 
 	if (bus->pm_frozen) {
-		bus->pm_frozen = false;
+		WRITE_ONCE(bus->pm_frozen, false);
 		ret = devfreq_resume_device(bus->df);
 	}
 	if (!ret) {
@@ -928,11 +934,11 @@ static int bus_abort_sleep(struct crownlte_bus *bus)
 		ret = exynos9810_bus_set_ap_running(bus->dev->of_node, bus->table.cal_id, 1);
 		if (!ret) {
 			bus->forced_hz = 0;
-			bus->pm_phase = BUS_ACTIVE;
+			WRITE_ONCE(bus->pm_phase, BUS_ACTIVE);
 			ret = update_devfreq(bus->df);
 		}
 		if (ret)
-			bus->pm_phase = BUS_PM_FAILED;
+			WRITE_ONCE(bus->pm_phase, BUS_PM_FAILED);
 		mutex_unlock(&bus->df->lock);
 	} else {
 		/* Updating our own QoS request can synchronously lock df->lock. */
@@ -940,14 +946,14 @@ static int bus_abort_sleep(struct crownlte_bus *bus)
 		if (ret >= 0)
 			ret = bus_update(bus);
 		mutex_lock(&bus->df->lock);
-		bus->pm_phase = ret < 0 ? BUS_PM_FAILED : BUS_ACTIVE;
+		WRITE_ONCE(bus->pm_phase, ret < 0 ? BUS_PM_FAILED : BUS_ACTIVE);
 		mutex_unlock(&bus->df->lock);
 	}
 	if (!ret)
 		ret = bus_unfreeze(bus);
 	if (ret) {
 		mutex_lock(&bus->df->lock);
-		bus->pm_phase = BUS_PM_FAILED;
+		WRITE_ONCE(bus->pm_phase, BUS_PM_FAILED);
 		mutex_unlock(&bus->df->lock);
 	}
 	return ret;
@@ -968,7 +974,7 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 	mutex_lock(&bus->df->lock);
 	ret = bus_cap_pm_preflight(bus);
 	if (!ret)
-		bus->pm_phase = BUS_QUIESCING;
+		WRITE_ONCE(bus->pm_phase, BUS_QUIESCING);
 	mutex_unlock(&bus->df->lock);
 	if (ret)
 		goto out;
@@ -978,12 +984,12 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 	/* ACK increments suspend_count before invoking its governor, including
 	 * error returns. Balance our contribution during rollback in either case.
 	 */
-	bus->pm_frozen = true;
+	WRITE_ONCE(bus->pm_frozen, true);
 	ret = devfreq_suspend_device(bus->df);
 	if (ret) {
 		repair = bus_unfreeze(bus);
 		mutex_lock(&bus->df->lock);
-		bus->pm_phase = repair ? BUS_PM_FAILED : BUS_ACTIVE;
+		WRITE_ONCE(bus->pm_phase, repair ? BUS_PM_FAILED : BUS_ACTIVE);
 		mutex_unlock(&bus->df->lock);
 		if (repair)
 			dev_err(dev, "governor freeze rollback failed: %d\n", repair);
@@ -991,7 +997,7 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 		goto out;
 	}
 	mutex_lock(&bus->df->lock);
-	bus->pm_phase = BUS_ENTERING_SLEEP;
+	WRITE_ONCE(bus->pm_phase, BUS_ENTERING_SLEEP);
 	if (bus->slot < 2) {
 		bus->forced_hz = bus->table.resume_khz * 1000UL;
 		ret = exynos9810_bus_set_ap_running(dev->of_node, bus->table.cal_id, 0);
@@ -1013,7 +1019,7 @@ static int __maybe_unused bus_suspend_late(struct device *dev)
 		goto out;
 	}
 	mutex_lock(&bus->df->lock);
-	bus->pm_phase = BUS_SLEEP;
+	WRITE_ONCE(bus->pm_phase, BUS_SLEEP);
 	mutex_unlock(&bus->df->lock);
 out:
 	bus_cap_notify();
@@ -1034,7 +1040,7 @@ static int __maybe_unused bus_resume_early(struct device *dev)
 		goto out;
 	}
 	mutex_lock(&bus->df->lock);
-	bus->pm_phase = BUS_LEAVING_SLEEP;
+	WRITE_ONCE(bus->pm_phase, BUS_LEAVING_SLEEP);
 	if (bus->slot < 2) {
 		ret = exynos9810_bus_set_ap_running(dev->of_node, bus->table.cal_id, 1);
 		if (!ret) {
@@ -1053,7 +1059,7 @@ static int __maybe_unused bus_resume_early(struct device *dev)
 	if (!ret)
 		ret = bus_unfreeze(bus);
 	mutex_lock(&bus->df->lock);
-	bus->pm_phase = ret ? BUS_PM_FAILED : BUS_ACTIVE;
+	WRITE_ONCE(bus->pm_phase, ret ? BUS_PM_FAILED : BUS_ACTIVE);
 	mutex_unlock(&bus->df->lock);
 out:
 	bus_cap_notify();
@@ -1075,7 +1081,7 @@ static int bus_reboot(struct notifier_block *nb, unsigned long action, void *dat
 		goto out;
 	}
 	mutex_lock(&bus->df->lock);
-	bus->pm_phase = BUS_REBOOTING;
+	WRITE_ONCE(bus->pm_phase, BUS_REBOOTING);
 	mutex_unlock(&bus->df->lock);
 	bus_pause_boot(bus);
 	cancel_delayed_work_sync(&bus_cap_work);
@@ -1271,10 +1277,10 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 	 * A failed registration can still have a delayed release callback, so
 	 * the driver must never infer ownership from the returned error pointer.
 	 */
-	bus->df = devfreq_add_device(dev, &bus->profile, "interactive", &bus->interactive);
+	WRITE_ONCE(bus->df, devfreq_add_device(dev, &bus->profile, "interactive", &bus->interactive));
 	if (IS_ERR(bus->df)) {
 		ret = PTR_ERR(bus->df);
-		bus->df = NULL;
+		WRITE_ONCE(bus->df, NULL);
 		return dev_err_probe(dev, ret, "devfreq class registration failed\n");
 	}
 	mutex_lock(&bus->df->lock);
