@@ -475,17 +475,7 @@ static int exynos_ufs_get_clks(struct exynos9810_ufs *ufs)
  */
 static void s9p_step(u32 colour)
 {
-	size_t off = (size_t)S9P_BLOCK_TOP * S9P_FB_STRIDE;
-	size_t len = (size_t)S9P_BLOCK_ROWS * S9P_FB_STRIDE;
-	void __iomem *p;
-	size_t i;
-
-	p = ioremap_wc(S9P_FB_BASE + off, len);
-	if (!p)
-		return;
-	for (i = 0; i < len; i += 4)
-		writel(colour, p + i);
-	iounmap(p);
+	pr_debug("exynos9810-ufs: diagnostic stage %08x\n", colour);
 }
 
 #define S9P_RED		0xffff0000
@@ -885,14 +875,21 @@ static int exynos_ufs_negotiate_pwr_mode(struct ufs_hba *hba,
 	return 0;
 }
 
+/* ACK6.12 negotiates the target in PRE_CHANGE rather than a separate
+ * negotiate_pwr_mode callback. Keep calibration tied to those final values.
+ */
 static int exynos_ufs_pwr_change_notify(struct ufs_hba *hba,
 					enum ufs_notify_change_status status,
+					struct ufs_pa_layer_attr *desired,
 					struct ufs_pa_layer_attr *final)
 {
 	struct exynos9810_ufs *ufs = to_exynos_ufs(hba);
 
 	switch (status) {
 	case PRE_CHANGE:
+		if (!desired || !final)
+			return -EINVAL;
+		exynos_ufs_negotiate_pwr_mode(hba, desired, final);
 		return exynos_ufs_cal(ufs, ufs_cal_pre_pmc, "pre-pmc");
 	case POST_CHANGE:
 		dev_info(ufs->dev, "power mode: M(%d) G(%d) L(%d) HS-series(%d)\n",
@@ -1150,7 +1147,6 @@ static const struct ufs_hba_variant_ops exynos9810_ufs_ops = {
 	.exit			= exynos_ufs_exit,
 	.hce_enable_notify	= exynos_ufs_hce_enable_notify,
 	.link_startup_notify	= exynos_ufs_link_startup_notify,
-	.negotiate_pwr_mode	= exynos_ufs_negotiate_pwr_mode,
 	.pwr_change_notify	= exynos_ufs_pwr_change_notify,
 	.setup_clocks		= exynos_ufs_setup_clocks,
 	.setup_xfer_req		= exynos_ufs_setup_xfer_req,

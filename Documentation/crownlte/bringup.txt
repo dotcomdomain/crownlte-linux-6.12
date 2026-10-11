@@ -7,11 +7,13 @@ The reference is SM-G965F/S9+ and has not proved Note9 compatibility.
 Original copyrights/licenses are retained in imported driver sources.
 
 No phone writes, boot packaging, or flash scripts belong to this stage.
-The diagnostic board DTS deliberately omits unverified RAM and peripherals.
-Its DTB is a compilation artifact, not a boot-ready board description.
+RAM, fixed firmware reservations and UFS/USB register windows now derive
+from this exact Note9 live DT. Peripheral nodes stay disabled pending clocks
+and power integration. DTB remains a compilation artifact, not boot-ready.
 
-Next device evidence: live FDT RAM map, reserved-memory, boot arguments,
-model revision, UFS/USB clocks and PMIC, panel and touchscreen identities.
+Captured: live FDT RAM map, fixed reservations, boot arguments, model and
+UFS/USB register windows. Remaining: clock providers, PMIC/pad control, panel
+and touchscreen identities, and early bootloader/shim handoff.
 Then add read-only initramfs diagnostics that never mount USERDATA.
 
 Current ROM contracts that need porting before Android boot:

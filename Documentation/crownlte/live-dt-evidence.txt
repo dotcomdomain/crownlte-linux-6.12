@@ -1,0 +1,10 @@
+Live crownlte DT evidence
+Archive SHA256 3c4dd7a8496bec08c1fb47ae3474c18d57ac891b064b21d81187b4b9a527020b
+Model Samsung Crown rev0.6 board based on EXYNOS9810
+Five active RAM nodes describe the connected six-GiB Note9.
+Active fixed firmware regions become no-map diagnostic reservations.
+Disabled RKP/TIMA reservations remain omitted as in the captured baseline.
+S-Boot log and KASLR ranges come from captured /chosen/bootargs.
+Framebuffer address and size are reserved, but no display driver is enabled.
+No S9+ memory or PMIC assumptions were copied.
+No boot image has been packaged and no phone writes are authorized here.
