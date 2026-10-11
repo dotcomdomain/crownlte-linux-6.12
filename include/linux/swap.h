@@ -638,7 +638,7 @@ static inline void swap_free(swp_entry_t entry)
 	swap_free_nr(entry, 1);
 }
 
-#ifdef CONFIG_MEMCG
+#if defined(CONFIG_MEMCG) && !defined(CONFIG_MEMCG_FORCE_USE_VM_SWAPPINESS)
 extern void _trace_android_vh_use_vm_swappiness(bool *use_vm_swappiness);
 
 static inline int mem_cgroup_swappiness(struct mem_cgroup *memcg)

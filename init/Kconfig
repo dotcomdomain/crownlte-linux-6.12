@@ -1044,6 +1044,16 @@ config MEMCG_V1
 
 	  Say N if unsure.
 
+config MEMCG_FORCE_USE_VM_SWAPPINESS
+	bool "Force memory cgroups to use global vm_swappiness"
+	depends on MEMCG && SWAP
+	default y
+	help
+	  Preserve the configured legacy Android policy that ignores per-cgroup
+	  swappiness values and always uses the global vm_swappiness value.
+	  Disable this option to retain the normal ACK cgroup and vendor-hook
+	  decision in mem_cgroup_swappiness().
+
 config BLK_CGROUP
 	bool "IO controller"
 	depends on BLOCK
