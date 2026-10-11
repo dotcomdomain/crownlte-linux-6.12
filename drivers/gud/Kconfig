@@ -1,0 +1,1 @@
+source "drivers/gud/gud-exynos9810/Kconfig"
