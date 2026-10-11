@@ -97,6 +97,10 @@ struct devfreq_dev_status {
  *			from devfreq_remove_device() call. If the user
  *			has registered devfreq->nb at a notifier-head,
  *			this is the time to unregister it.
+ * @release:		Optional final callback after the devfreq class device loses
+ *			its last reference. The callback may release driver-owned
+ *			profile storage. It must not perform frequency operations.
+ *			Pre-registration error paths still belong to the caller.
  * @freq_table:		Optional list of frequencies to support statistics
  *			and freq_table must be generated in ascending order.
  * @max_state:		The size of freq_table.
@@ -124,6 +128,7 @@ struct devfreq_dev_profile {
 
 	bool is_cooling_device;
 	bool legacy_khz_sysfs;
+	void (*release)(struct devfreq *devfreq);
 };
 
 /**

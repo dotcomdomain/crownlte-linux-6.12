@@ -748,6 +748,7 @@ static int qos_max_notifier_call(struct notifier_block *nb,
 static void devfreq_dev_release(struct device *dev)
 {
 	struct devfreq *devfreq = to_devfreq(dev);
+	void (*release)(struct devfreq *) = devfreq->profile->release;
 	int err;
 
 	mutex_lock(&devfreq_list_lock);
@@ -786,6 +787,8 @@ static void devfreq_dev_release(struct device *dev)
 
 	mutex_destroy(&devfreq->lock);
 	srcu_cleanup_notifier_head(&devfreq->transition_notifier_list);
+	if (release)
+		release(devfreq);
 	kfree(devfreq);
 }
 

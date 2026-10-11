@@ -6,6 +6,7 @@
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
 #include "exynos9810-bus-tables.h"
+#include "exynos9810-bus-guard.h"
 
 struct exynos9810_mif_bts;
 
@@ -18,7 +19,7 @@ struct exynos9810_bus_transition {
 	struct device *dev;
 	const struct exynos9810_bus_table *table;
 	struct devfreq *dependency;
-	struct dev_pm_qos_request dependency_request;
+	struct exynos9810_bus_lease dependency_lease;
 	unsigned int dependency_floor;
 	struct exynos9810_mif_bts *bts;
 	struct mutex lock;

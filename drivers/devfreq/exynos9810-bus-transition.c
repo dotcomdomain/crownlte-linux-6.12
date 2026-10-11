@@ -37,35 +37,27 @@ static int actual_level(struct exynos9810_bus_transition *state)
 static int dependency_floor(struct exynos9810_bus_transition *state,
 		unsigned int floor)
 {
-	struct devfreq *df = state->dependency;
-	unsigned long actual = 0;
 	int ret;
 
-	if (!df)
+	if (!state->dependency)
 		return floor ? -EINVAL : 0;
-	ret = dev_pm_qos_update_request(&state->dependency_request, floor);
-	if (ret < 0)
-		return ret;
-	state->dependency_floor = floor;
-	mutex_lock(&df->lock);
-	ret = update_devfreq(df);
-	if (!ret)
-		ret = df->profile->get_cur_freq(df->dev.parent, &actual);
-	mutex_unlock(&df->lock);
-	if (!ret && actual < floor * 1000UL)
-		ret = -ERANGE;
+	ret = exynos9810_bus_guard_update(&state->dependency_lease, floor);
+	state->dependency_floor = state->dependency_lease.requested_khz;
 	return ret;
 }
 
 static void transition_cleanup(void *data)
 {
 	struct exynos9810_bus_transition *state = data;
+	int ret = 0;
 
 	mutex_lock(&state->lock);
 	state->ready = false;
+	if (state->dependency_lease.guard)
+		ret = exynos9810_bus_guard_retire(&state->dependency_lease);
 	mutex_unlock(&state->lock);
-	if (dev_pm_qos_request_active(&state->dependency_request))
-		dev_pm_qos_remove_request(&state->dependency_request);
+	if (ret)
+		dev_err(state->dev, "dependency guard retained; hardware raise failed: %d\n", ret);
 }
 
 int exynos9810_bus_transition_init(struct exynos9810_bus_transition *state,
@@ -131,12 +123,11 @@ int exynos9810_bus_transition_init(struct exynos9810_bus_transition *state,
 	if (level < 0)
 		return level;
 	if (dependency) {
-		ret = dev_pm_qos_add_request(dependency->dev.parent,
-				&state->dependency_request, DEV_PM_QOS_MIN_FREQUENCY,
-				table->levels[level].dependency_khz);
-		if (ret < 0)
+		ret = exynos9810_bus_guard_acquire(table->cal_id, dependency,
+						&state->dependency_lease);
+		if (ret)
 			return ret;
-		state->dependency_floor = table->levels[level].dependency_khz;
+		state->dependency_floor = state->dependency_lease.requested_khz;
 	}
 	ret = devm_add_action_or_reset(dev, transition_cleanup, state);
 	if (ret)

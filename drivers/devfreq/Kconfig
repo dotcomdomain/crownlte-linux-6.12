@@ -86,8 +86,18 @@ config DEVFREQ_GOV_PASSIVE
 
 comment "DEVFREQ Drivers"
 
+config EXYNOS9810_BUS_GUARDS
+	bool "Exynos9810 durable dependency guard ownership"
+	depends on EXYNOS9810_BUS_TABLES
+	help
+	  Own bounded built-in dependency requests independently of consumer
+	  lifetime. Keep a supported maximum floor after failed consumer probe
+	  or removal, and verify actual supplier updates. This cannot bypass a
+	  thermal cap or prove firmware/hardware coordination by itself.
+
 config EXYNOS9810_BUS_TRANSITIONS
 	bool "Exynos9810 shared real bus frequency transitions"
+	select EXYNOS9810_BUS_GUARDS
 	depends on EXYNOS9810_MIF_BTS
 	help
 	  Perform real MIF, INT and FSYS0 CAL rate transitions with verified
