@@ -1695,6 +1695,18 @@ struct cgroup *cgroup_kn_lock_live(struct kernfs_node *kn, bool drain_offline)
 	return NULL;
 }
 
+static bool cgroup_legacy_prefixed_alias(struct cgroup *cgrp,
+					 const struct cftype *cft, char *name)
+{
+	if (cgroup_on_dfl(cgrp) || !cft->ss ||
+	    !(cgrp->root->flags & CGRP_ROOT_NOPREFIX) ||
+	    (cft->flags & CFTYPE_NO_PREFIX))
+		return false;
+	snprintf(name, CGROUP_FILE_NAME_MAX, "%s.%s",
+		 cft->ss->legacy_name, cft->name);
+	return true;
+}
+
 static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)
 {
 	char name[CGROUP_FILE_NAME_MAX];
@@ -1712,6 +1724,8 @@ static void cgroup_rm_file(struct cgroup *cgrp, const struct cftype *cft)
 		del_timer_sync(&cfile->notify_timer);
 	}
 
+	if (cgroup_legacy_prefixed_alias(cgrp, cft, name))
+		kernfs_remove_by_name(cgrp->kn, name);
 	kernfs_remove_by_name(cgrp->kn, cgroup_file_name(cgrp, cft, name));
 }
 
@@ -4337,6 +4351,15 @@ static int cgroup_add_file(struct cgroup_subsys_state *css, struct cgroup *cgrp,
 				  NULL, key);
 	if (IS_ERR(kn))
 		return PTR_ERR(kn);
+
+	if (cgroup_legacy_prefixed_alias(cgrp, cft, name)) {
+		struct kernfs_node *alias = kernfs_create_link(cgrp->kn, name, kn);
+
+		if (IS_ERR(alias)) {
+			kernfs_remove(kn);
+			return PTR_ERR(alias);
+		}
+	}
 
 	if (cft->file_offset) {
 		struct cgroup_file *cfile = (void *)css + cft->file_offset;

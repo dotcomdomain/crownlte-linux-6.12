@@ -1662,6 +1662,11 @@ static int __dwc3_gadget_kick_transfer(struct dwc3_ep *dep)
 	int				ret;
 	u32				cmd;
 
+	/* Do not restart transfers from late completion events after disconnect. */
+	if (!dep->endpoint.desc || !dep->dwc->pullups_connected ||
+	    !dep->dwc->connected)
+		return -ESHUTDOWN;
+
 	/*
 	 * Note that it's normal to have no new TRBs prepared (i.e. ret == 0).
 	 * This happens when we need to stop and restart a transfer such as in

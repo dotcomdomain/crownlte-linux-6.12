@@ -852,6 +852,51 @@ static void hidg_get_report_complete(struct usb_ep *ep, struct usb_request *req)
 {
 }
 
+/* Preserve the crownlte software-backed Precision Touchpad contract. */
+static bool hidg_is_precision_touchpad(struct f_hidg *hidg)
+{
+	static const unsigned char collection[] = {
+		0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01
+	};
+	unsigned int i;
+
+	if (hidg->report_desc_length < sizeof(collection))
+		return false;
+	for (i = 0; i <= hidg->report_desc_length - sizeof(collection); i++)
+		if (!memcmp(hidg->report_desc + i, collection, sizeof(collection)))
+			return true;
+	return false;
+}
+
+static unsigned int hidg_precision_feature_report(void *buffer,
+						 unsigned int length, u8 report_id)
+{
+	u8 *report = buffer;
+
+	length = min_t(unsigned int, length, USB_COMP_EP0_BUFSIZ);
+	memset(report, 0, length);
+	if (length)
+		report[0] = report_id;
+	if (length > 1) {
+		switch (report_id) {
+		case 2: /* Five contacts, non-clickable pad. */
+			report[1] = 0x25;
+			break;
+		case 3: /* Touchpad input mode. */
+		case 5: /* Surface and button reporting enabled. */
+			report[1] = 3;
+			break;
+		}
+	}
+	return length;
+}
+
+static void hidg_precision_set_report_complete(struct usb_ep *ep,
+					       struct usb_request *req)
+{
+	/* Feature settings are advisory for the existing software touchpad. */
+}
+
 static int hidg_setup(struct usb_function *f,
 		const struct usb_ctrlrequest *ctrl)
 {
@@ -873,6 +918,14 @@ static int hidg_setup(struct usb_function *f,
 	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
 		  | HID_REQ_GET_REPORT):
 		VDBG(cdev, "get_report | wLength=%d\n", ctrl->wLength);
+
+		if ((value >> 8) == 3 && hidg_is_precision_touchpad(hidg)) {
+			length = hidg_precision_feature_report(req->buf, length,
+							      value & 0xff);
+			req->complete = hidg_get_report_complete;
+			req->context = hidg;
+			goto respond;
+		}
 
 		/*
 		 * Update GET_REPORT ID so that an ioctl can be used to determine what
@@ -906,6 +959,13 @@ static int hidg_setup(struct usb_function *f,
 	case ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8
 		  | HID_REQ_SET_REPORT):
 		VDBG(cdev, "set_report | wLength=%d\n", ctrl->wLength);
+
+		if ((value >> 8) == 3 && hidg_is_precision_touchpad(hidg)) {
+			length = min_t(unsigned int, length, USB_COMP_EP0_BUFSIZ);
+			req->complete = hidg_precision_set_report_complete;
+			req->context = hidg;
+			goto respond;
+		}
 		if (hidg->use_out_ep)
 			goto stall;
 		req->complete = hidg_ssreport_complete;
