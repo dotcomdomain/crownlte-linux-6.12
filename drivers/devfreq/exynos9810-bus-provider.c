@@ -43,6 +43,7 @@ struct crownlte_bus {
 	struct delayed_work boot_work;
 	unsigned long frequencies[EXYNOS9810_BUS_LEVELS];
 	unsigned long boot_expires;
+	u64 registration_generation;
 	unsigned int freq_info[6], boot_info[2], added_opps, slot;
 	bool retired, listed, sysfs_ready, boot_paused, pm_frozen, reboot_registered;
 };
@@ -50,6 +51,88 @@ struct crownlte_bus {
 static struct platform_driver crownlte_bus_driver;
 static DEFINE_MUTEX(bus_registry_lock);
 static struct crownlte_bus *bus_registry[3];
+static u64 bus_generations[3];
+
+/* Class references keep provider storage/profile/table alive after withdrawal.
+ * Snapshot capture takes only registry_lock; no frequency operation or final
+ * put runs under that lock. Each registration gets a never-reused generation.
+ */
+struct bus_snapshot {
+	struct crownlte_bus *buses[3];
+	struct devfreq *df[3];
+	u64 generations[3];
+	unsigned int mask;
+};
+
+static void bus_snapshot_put(struct bus_snapshot *snapshot)
+{
+	unsigned int i;
+
+	for (i = 0; i < 3; i++) {
+		if (snapshot->mask & (1U << i))
+			put_device(&snapshot->df[i]->dev);
+	}
+	snapshot->mask = 0;
+}
+
+static int bus_snapshot_capture(unsigned int mask, struct crownlte_bus *expected,
+		struct bus_snapshot *snapshot)
+{
+	struct bus_snapshot captured = { .mask = mask };
+	unsigned int i;
+	int ret = -ENODEV;
+
+	if (!mask || mask & ~7U || !snapshot ||
+	    (expected && (expected->slot >= 3 || !(mask & (1U << expected->slot)))))
+		return -EINVAL;
+	mutex_lock(&bus_registry_lock);
+	if (expected && bus_registry[expected->slot] != expected)
+		goto out;
+	/* Validate all slots before taking any reference. */
+	for (i = 0; i < 3; i++) {
+		struct crownlte_bus *bus = bus_registry[i];
+
+		if (!(mask & (1U << i)))
+			continue;
+		if (!bus || !bus->listed || READ_ONCE(bus->retired) ||
+		    !bus->registration_generation || IS_ERR_OR_NULL(bus->df))
+			goto out;
+		captured.buses[i] = bus;
+		captured.df[i] = bus->df;
+		captured.generations[i] = bus->registration_generation;
+	}
+	for (i = 0; i < 3; i++)
+		if (mask & (1U << i))
+			get_device(&captured.df[i]->dev);
+	*snapshot = captured;
+	ret = 0;
+out:
+	mutex_unlock(&bus_registry_lock);
+	return ret;
+}
+
+static int bus_snapshot_update(const struct bus_snapshot *snapshot, unsigned int slot)
+{
+	struct crownlte_bus *bus;
+	struct devfreq *df;
+	int ret;
+
+	if (!snapshot || slot >= 3 || !(snapshot->mask & (1U << slot)))
+		return -EINVAL;
+	bus = snapshot->buses[slot];
+	df = snapshot->df[slot];
+	mutex_lock(&df->lock);
+	/* Retirement and canonical class clearing use this same lock. Never
+	 * relookup a replacement instance after dropping registry_lock.
+	 */
+	if (READ_ONCE(bus->retired) || READ_ONCE(bus->df) != df ||
+	    bus->registration_generation != snapshot->generations[slot])
+		ret = -ENODEV;
+	else
+		ret = update_devfreq(df);
+	mutex_unlock(&df->lock);
+	return ret;
+}
 static int bus_update(struct crownlte_bus *bus);
 
 static int bus_slot(unsigned int id)
@@ -216,26 +299,28 @@ static void bus_boot_work(struct work_struct *work)
 {
 	struct crownlte_bus *bus = container_of(to_delayed_work(work),
 						struct crownlte_bus, boot_work);
+	struct bus_snapshot snapshot;
 	bool ready;
 	unsigned long delay, now = jiffies;
 	int ret;
 
-	mutex_lock(&bus_registry_lock);
-	ready = buses_ready();
-	mutex_unlock(&bus_registry_lock);
+	ready = !bus_snapshot_capture(7, bus, &snapshot);
 	if (READ_ONCE(bus->retired) || READ_ONCE(bus->boot_paused))
-		return;
+		goto out;
 	/* An absent MIF provider may still leave firmware running at a high
 	 * boot rate. Never release a supplier's bootstrap floor in that state.
 	 */
 	if (!ready || time_before(now, bus->boot_expires)) {
 		delay = ready ? bus->boot_expires - now : HZ;
 		mod_delayed_work(system_wq, &bus->boot_work, max(1UL, delay));
-		return;
+		goto out;
 	}
 	ret = dev_pm_qos_update_request(&bus->boot_min, 0);
 	if (ret < 0)
 		dev_err(bus->dev, "cannot release bus bootstrap request: %d\n", ret);
+out:
+	if (ready)
+		bus_snapshot_put(&snapshot);
 }
 
 static void bus_remove_requests(struct crownlte_bus *bus)
@@ -387,6 +472,7 @@ static const struct attribute_group interactive_group = {
 static void bus_cleanup(void *data)
 {
 	struct crownlte_bus *bus = data;
+	struct devfreq *df = bus->df;
 	int ret;
 
 	if (bus->reboot_registered) {
@@ -395,32 +481,34 @@ static void bus_cleanup(void *data)
 	}
 	exynos9810_legacy_qos_stop(&bus->legacy_qos);
 
+	/* Mark retirement under the captured update's lock, then withdraw while
+	 * still holding it. Capture never takes df->lock under registry_lock.
+	 */
+	if (df)
+		mutex_lock(&df->lock);
 	mutex_lock(&bus_registry_lock);
+	WRITE_ONCE(bus->retired, true);
+	WRITE_ONCE(bus->df, NULL);
 	if (bus->listed) {
-		bus_registry[bus->slot] = NULL;
+		if (bus_registry[bus->slot] == bus)
+			bus_registry[bus->slot] = NULL;
 		bus->listed = false;
 	}
 	mutex_unlock(&bus_registry_lock);
+	if (df)
+		mutex_unlock(&df->lock);
 	cancel_delayed_work_sync(&bus->boot_work);
 	if (bus->sysfs_ready) {
-		sysfs_remove_group(&bus->df->dev.kobj, &interactive_group);
-		sysfs_remove_group(&bus->df->dev.kobj, &bus_group);
+		sysfs_remove_group(&df->dev.kobj, &interactive_group);
+		sysfs_remove_group(&df->dev.kobj, &bus_group);
 	}
-	/* Stop local target operations before retiring the outgoing guard.
-	 * Incoming linked consumers have already been unbound by driver core.
-	 */
-	if (bus->df)
-		mutex_lock(&bus->df->lock);
-	WRITE_ONCE(bus->retired, true);
-	if (bus->df)
-		mutex_unlock(&bus->df->lock);
+	/* Incoming linked consumers were unbound before supplier cleanup. */
 	exynos9810_bus_transition_fini(&bus->transition);
-	if (bus->df) {
-		ret = exynos9810_bus_guard_forget_supplier(bus->df);
+	if (df) {
+		ret = exynos9810_bus_guard_forget_supplier(df);
 		if (ret)
 			dev_err(bus->dev, "incoming guard retained: %d\n", ret);
-		devfreq_remove_device(bus->df);
-		bus->df = NULL;
+		devfreq_remove_device(df);
 	}
 	exynos9810_legacy_qos_detach(&bus->legacy_qos);
 	bus_remove_requests(bus);
@@ -451,11 +539,16 @@ static bool bus_pm_order(struct crownlte_bus *bus, bool resume)
 
 static int bus_update(struct crownlte_bus *bus)
 {
+	struct bus_snapshot snapshot;
 	int ret;
 
-	mutex_lock(&bus->df->lock);
-	ret = update_devfreq(bus->df);
-	mutex_unlock(&bus->df->lock);
+	if (!bus || bus->slot >= 3)
+		return -EINVAL;
+	ret = bus_snapshot_capture(1U << bus->slot, bus, &snapshot);
+	if (ret)
+		return ret;
+	ret = bus_snapshot_update(&snapshot, bus->slot);
+	bus_snapshot_put(&snapshot);
 	return ret;
 }
 
@@ -721,11 +814,11 @@ static int bus_legacy_apply(void *context)
 	/* Early requests are retained before the class/governor exists. Its first
 	 * explicit update consumes them once registration has finished.
 	 */
-	if (IS_ERR_OR_NULL(READ_ONCE(bus->df)))
+	int ret = bus_update(bus);
+
+	if (ret == -ENODEV && !READ_ONCE(bus->retired))
 		return 0;
-	if (READ_ONCE(bus->retired))
-		return -ENODEV;
-	return bus_update(bus);
+	return ret;
 }
 
 static int crownlte_bus_probe(struct platform_device *pdev)
@@ -850,6 +943,11 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 		mutex_unlock(&bus_registry_lock);
 		return -EEXIST;
 	}
+	if (bus_generations[bus->slot] == ~(u64)0) {
+		mutex_unlock(&bus_registry_lock);
+		return -EOVERFLOW;
+	}
+	bus->registration_generation = ++bus_generations[bus->slot];
 	bus_registry[bus->slot] = bus;
 	bus->listed = true;
 	mutex_unlock(&bus_registry_lock);
