@@ -814,6 +814,7 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 	bus->profile.freq_table = bus->frequencies;
 	bus->profile.max_state = bus->table.count;
 	bus->profile.legacy_khz_sysfs = true;
+	bus->profile.defer_qos_updates = true;
 	platform_set_drvdata(pdev, bus);
 	/* Core acquires its storage loan exactly when class lifetime starts.
 	 * A failed registration can still have a delayed release callback, so

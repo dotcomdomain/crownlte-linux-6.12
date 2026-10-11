@@ -113,6 +113,10 @@ struct devfreq_dev_status {
  *                     uses kHz, limits and transition stats are read-only,
  *                     and time_in_state is exposed in milliseconds.
  *                     Set before registration; internal frequencies stay Hz.
+ * @defer_qos_updates: Run device QoS updates on work after its global
+ *                     mutex is released. Required for targets that request
+ *                     another device's QoS. Set before registration; explicit
+ *                     update_devfreq callers still update synchronously.
  * @is_cooling_device: A self-explanatory boolean giving the device a
  *                     cooling effect property.
  */
@@ -132,6 +136,7 @@ struct devfreq_dev_profile {
 
 	bool is_cooling_device;
 	bool legacy_khz_sysfs;
+	bool defer_qos_updates;
 	void (*acquire)(struct devfreq *devfreq);
 	void (*release)(struct devfreq *devfreq);
 };
@@ -183,6 +188,9 @@ struct devfreq_stats {
  * @cdev:	Cooling device pointer if the devfreq has cooling property
  * @nb_min:		Notifier block for DEV_PM_QOS_MIN_FREQUENCY
  * @nb_max:		Notifier block for DEV_PM_QOS_MAX_FREQUENCY
+ * @qos_work:          Deferred device-QoS update work for opt-in profiles.
+ * @qos_work_stopping: Readiness/teardown gate; notifier removal drains callers
+ *                     before work cancellation and governor STOP.
  *
  * This structure stores the devfreq information for a given device.
  *
@@ -232,6 +240,8 @@ struct devfreq {
 
 	struct notifier_block nb_min;
 	struct notifier_block nb_max;
+	struct work_struct qos_work;
+	bool qos_work_stopping;
 };
 
 struct devfreq_freqs {

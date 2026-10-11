@@ -696,6 +696,23 @@ out:
 	return NOTIFY_OK;
 }
 
+/* Device QoS notifiers run while dev_pm_qos_mtx is held. A target that
+ * requests a supplier's device QoS must run after that notifier returns.
+ * Teardown unregisters both notifier chains and drains this work before STOP.
+ */
+static void devfreq_qos_work(struct work_struct *work)
+{
+	struct devfreq *devfreq = container_of(work, struct devfreq, qos_work);
+	int err = 0;
+
+	mutex_lock(&devfreq->lock);
+	if (!READ_ONCE(devfreq->qos_work_stopping))
+		err = update_devfreq(devfreq);
+	mutex_unlock(&devfreq->lock);
+	if (err)
+		dev_err(devfreq->dev.parent, "deferred PM QoS update failed: %d\n", err);
+}
+
 /**
  * qos_notifier_call() - Common handler for QoS constraints.
  * @devfreq:    the devfreq instance.
@@ -704,6 +721,11 @@ static int qos_notifier_call(struct devfreq *devfreq)
 {
 	int err;
 
+	if (devfreq->profile->defer_qos_updates) {
+		if (!READ_ONCE(devfreq->qos_work_stopping))
+			schedule_work(&devfreq->qos_work);
+		return NOTIFY_OK;
+	}
 	mutex_lock(&devfreq->lock);
 	err = update_devfreq(devfreq);
 	mutex_unlock(&devfreq->lock);
@@ -739,6 +761,30 @@ static int qos_max_notifier_call(struct notifier_block *nb,
 	return qos_notifier_call(container_of(nb, struct devfreq, nb_max));
 }
 
+static void devfreq_qos_cleanup(struct devfreq *devfreq)
+{
+	int err;
+
+	WRITE_ONCE(devfreq->qos_work_stopping, true);
+	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_max,
+					 DEV_PM_QOS_MAX_FREQUENCY);
+	if (err && err != -ENOENT)
+		dev_warn(devfreq->dev.parent,
+			"Failed to remove max_freq notifier: %d\n", err);
+	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_min,
+					 DEV_PM_QOS_MIN_FREQUENCY);
+	if (err && err != -ENOENT)
+		dev_warn(devfreq->dev.parent,
+			"Failed to remove min_freq notifier: %d\n", err);
+
+	/* Unregistration waits for callbacks that may have observed the old gate
+	 * before it closed. Only then can cancellation exclude a late queue.
+	 * Never hold devfreq->lock while draining a worker that takes that lock.
+	 */
+	if (devfreq->profile->defer_qos_updates)
+		cancel_work_sync(&devfreq->qos_work);
+}
+
 /**
  * devfreq_dev_release() - Callback for struct device to release the device.
  * @dev:	the devfreq device
@@ -755,16 +801,7 @@ static void devfreq_dev_release(struct device *dev)
 	list_del(&devfreq->node);
 	mutex_unlock(&devfreq_list_lock);
 
-	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_max,
-					 DEV_PM_QOS_MAX_FREQUENCY);
-	if (err && err != -ENOENT)
-		dev_warn(dev->parent,
-			"Failed to remove max_freq notifier: %d\n", err);
-	err = dev_pm_qos_remove_notifier(devfreq->dev.parent, &devfreq->nb_min,
-					 DEV_PM_QOS_MIN_FREQUENCY);
-	if (err && err != -ENOENT)
-		dev_warn(dev->parent,
-			"Failed to remove min_freq notifier: %d\n", err);
+	devfreq_qos_cleanup(devfreq);
 
 	if (dev_pm_qos_request_active(&devfreq->user_max_freq_req)) {
 		err = dev_pm_qos_remove_request(&devfreq->user_max_freq_req);
@@ -842,6 +879,8 @@ struct devfreq *devfreq_add_device(struct device *dev,
 	devfreq->dev.release = devfreq_dev_release;
 	INIT_LIST_HEAD(&devfreq->node);
 	devfreq->profile = profile;
+	INIT_WORK(&devfreq->qos_work, devfreq_qos_work);
+	WRITE_ONCE(devfreq->qos_work_stopping, true);
 	devfreq->previous_freq = profile->initial_freq;
 	devfreq->last_status.current_frequency = profile->initial_freq;
 	devfreq->data = data;
@@ -969,6 +1008,10 @@ struct devfreq *devfreq_add_device(struct device *dev,
 			 __func__);
 		goto err_init;
 	}
+	/* START is complete. Consume changes that arrived before readiness. */
+	WRITE_ONCE(devfreq->qos_work_stopping, false);
+	if (devfreq->profile->defer_qos_updates)
+		schedule_work(&devfreq->qos_work);
 	create_sysfs_files(devfreq, devfreq->governor);
 
 	list_add(&devfreq->node, &devfreq_list);
@@ -1006,6 +1049,8 @@ int devfreq_remove_device(struct devfreq *devfreq)
 	if (!devfreq)
 		return -EINVAL;
 
+	if (devfreq->profile->defer_qos_updates)
+		devfreq_qos_cleanup(devfreq);
 	devfreq_cooling_unregister(devfreq->cdev);
 
 	if (devfreq->governor) {
