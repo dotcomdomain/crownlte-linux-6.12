@@ -18,7 +18,7 @@ Then add read-only initramfs diagnostics that never mount USERDATA.
 
 Current ROM contracts that need porting before Android boot:
 - F2FS FBEv2 + inlinecrypt_optimized, original UFS FMP key descriptors.
-- Vendor Mali r19p0 ioctl ABI and /dev/mali0, Samsung ION heap ABI.
+- Vendor Mali Bifrost r38p1 JM API11.35 and Samsung private ioctl ABI and /dev/mali0, Samsung ION heap ABI.
 - Samsung DECON framebuffer, EXYNOS video/G2D and camera interfaces.
 - MobiCore TrustZone/keymaster and original encryption key derivation.
 - SIPC modem interface, audio/ABOX and power/suspend firmware protocols.
@@ -27,3 +27,17 @@ Current ROM contracts that need porting before Android boot:
 
 Build success establishes compiler/API integration only. It does not prove
 boot, encryption, Android vendor ABI compatibility, or hardware operation.
+
+FMP adapter staged from original modified crownlte source and ACK gs101 format.
+FMP=1 enables hardware descriptor3, passthrough standard-key profile, F2FS FBE,
+software blk-crypto fallback, and Android Binder/SELinux/cgroup prerequisites.
+The software fallback algorithm contract matches existing ciphertext. Physical
+encrypted transfers, plain metadata I/O, and userspace key delivery are untested.
+FMP initialization errors stop probe. Encrypted userdata must stay unmounted
+until physical read-only validation on recoverable data copies proves operation.
+The preserved nocrypto diagnostic commit is ac0f47d51.
+
+Resolved-config guard: address widths 48/48 and 4 KiB pages are now required.
+Changing choice symbols with scripts/config also requires clearing the old
+52-bit selections. SELinux requires AUDIT. The build checks actual olddefconfig
+output rather than assuming requested symbols survived dependency resolution.

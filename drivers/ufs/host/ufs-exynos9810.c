@@ -558,43 +558,7 @@ static int exynos_ufs_parse_dt(struct exynos9810_ufs *ufs)
 #define SMU_INIT			0
 #define FMP_SG_ENTRY_SIZE		128
 
-/* -1 leaves the protector alone; 0 or 3 select the descriptor type. */
-static int ufs_fmp_desctype;	/* 0: measured to be the only type that transfers */
-module_param_named(fmp, ufs_fmp_desctype, int, 0444);
-MODULE_PARM_DESC(fmp,
-	"FMP descriptor type: 3 = 128-byte PRDT, 0 = standard, -1 = untouched");
-
-/* Readable from userspace: the 4K pstore tail never keeps the boot lines. */
-static int ufs_fmp_result = -1;
-module_param_named(fmp_result, ufs_fmp_result, int, 0444);
-static int ufs_sg_entry;
-module_param_named(sg_entry, ufs_sg_entry, int, 0444);
-
-static void exynos_ufs_fmp_init(struct ufs_hba *hba)
-{
-	struct arm_smccc_res res;
-
-	if (ufs_fmp_desctype < 0)
-		goto out;
-
-	arm_smccc_smc(SMC_CMD_FMP_SECURITY, 0, SMU_EMBEDDED,
-		      ufs_fmp_desctype, 0, 0, 0, 0, &res);
-	dev_info(hba->dev, "fmp: desctype %d -> %ld\n",
-		 ufs_fmp_desctype, res.a0);
-	ufs_fmp_result = res.a0;
-	if (res.a0)
-		goto out;
-
-	if (ufs_fmp_desctype == 3)
-		ufshcd_set_sg_entry_size(hba, FMP_SG_ENTRY_SIZE);
-
-	arm_smccc_smc(SMC_CMD_SMU, SMU_INIT, SMU_EMBEDDED, 0, 0, 0, 0, 0,
-		      &res);
-	dev_info(hba->dev, "fmp: smu init -> %ld sg_entry=%zu\n", res.a0,
-		 ufshcd_sg_entry_size(hba));
-out:
-	ufs_sg_entry = ufshcd_sg_entry_size(hba);
-}
+#include "ufs-exynos9810-fmp.h"
 
 /*
  * Reads of 4K, 8K and 12K succeed; 16K wedges the doorbell without any
@@ -770,10 +734,12 @@ static int exynos_ufs_init(struct ufs_hba *hba)
 	exynos_ufs_ctrl_phy_pwr(ufs, true);
 	exynos_ufs_config_sysreg(ufs);
 	exynos_ufs_config_smu(ufs);
-	exynos_ufs_fmp_init(hba);
+	ret = exynos9810_fmp_init(hba);
+	if (ret)
+		return ret;
 
 	/* Both still take effect here: scsi_add_host runs later. */
-	if (ufs_max_seg_size) {
+	if (ufs_max_seg_size && !(hba->caps & UFSHCD_CAP_CRYPTO)) {
 		hba->host->max_segment_size = ufs_max_seg_size;
 		dma_set_max_seg_size(hba->dev, ufs_max_seg_size);
 	}
@@ -1016,7 +982,7 @@ static int exynos_ufs_resume(struct ufs_hba *hba, enum ufs_pm_op pm_op)
 	exynos_ufs_config_smu(ufs);
 	exynos_ufs_ctrl_auto_hci_clk(ufs, false);
 
-	return 0;
+	return exynos9810_fmp_resume(hba);
 }
 
 static int exynos_ufs_device_reset(struct ufs_hba *hba)
@@ -1154,6 +1120,7 @@ static const struct ufs_hba_variant_ops exynos9810_ufs_ops = {
 	.hibern8_notify		= exynos_ufs_hibern8_notify,
 	.suspend		= exynos_ufs_suspend,
 	.resume			= exynos_ufs_resume,
+	.fill_crypto_prdt	= exynos9810_fmp_fill_prdt,
 	.set_dma_mask		= exynos_ufs_set_dma_mask,
 	.device_reset		= exynos_ufs_device_reset,
 	.event_notify		= exynos_ufs_event_notify,
