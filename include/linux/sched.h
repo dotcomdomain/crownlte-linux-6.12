@@ -831,6 +831,12 @@ struct task_struct {
 	 * scheduling-critical items should be added above here.
 	 */
 	randomized_struct_fields_start
+#ifdef CONFIG_CGROUP_SCHEDTUNE
+	/* Real rq accounting, independent from current cgroup CSS during attach. */
+	int schedtune_idx;
+	int schedtune_cpu;
+	bool schedtune_accounted;
+#endif
 
 	void				*stack;
 	refcount_t			usage;

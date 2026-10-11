@@ -1044,6 +1044,21 @@ config MEMCG_V1
 
 	  Say N if unsure.
 
+config CGROUP_SCHEDTUNE
+	bool "Private crownlte legacy schedtune compatibility controller"
+	depends on CGROUPS && SMP
+	select TRACEPOINTS
+	select ANDROID_VENDOR_HOOKS
+	default n
+	help
+	  Provide independent legacy schedtune task membership, boost and wake-up
+	  preference settings for the unchanged crownlte Android userspace.
+	  Runnable accounting drives actual schedutil SPC boosting. Idle and
+	  performance preferences select allowed active fitting CPUs using the
+	  ACK scheduler. This does not port Samsung EMS SSE/USS, band, util_est_en,
+	  ontime_en or the old energy/payoff model. Enable only for this private
+	  platform port; runtime scheduling and hotplug validation is still needed.
+
 config MEMCG_FORCE_USE_VM_SWAPPINESS
 	bool "Force memory cgroups to use global vm_swappiness"
 	depends on MEMCG && SWAP
