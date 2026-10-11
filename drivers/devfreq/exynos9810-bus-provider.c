@@ -824,6 +824,12 @@ static void bus_cleanup(void *data)
 	}
 	exynos9810_legacy_qos_stop(&bus->legacy_qos);
 	bus_cap_stop_notifications(bus);
+	/* Reboot publication is drained before this lock: unregister must not
+	 * wait for a callback blocked on pm_lock. Existing PM callers own it
+	 * through their governor/ownership operations, so withdrawal waits.
+	 * Cap workers never acquire pm_lock while holding a df lock.
+	 */
+	mutex_lock(&bus->pm_lock);
 
 	/* Mark retirement under the captured update's lock, then withdraw while
 	 * still holding it. Capture never takes df->lock under registry_lock.
@@ -841,6 +847,7 @@ static void bus_cleanup(void *data)
 	mutex_unlock(&bus_registry_lock);
 	if (df)
 		mutex_unlock(&df->lock);
+	mutex_unlock(&bus->pm_lock);
 	cancel_delayed_work_sync(&bus->boot_work);
 	/* Static manager stores no queued provider pointer; drain captured pins. */
 	cancel_delayed_work_sync(&bus_cap_work);
