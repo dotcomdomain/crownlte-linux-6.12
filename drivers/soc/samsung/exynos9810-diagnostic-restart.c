@@ -17,7 +17,7 @@
 #define NORMAL_INFORM3 0x12345670
 #define SWRESET 0x400
 #define DFD 0x500
-#define DFD_DISABLE_RESET (BIT(9) | BIT(10) | BIT(11))
+#define DFD_DISABLE_RESET (BIT(9) | BIT(10) | BIT(11) | (0xfU << 24))
 #define DFD_CLEAR_COMMAND 0x00f000e1
 
 struct diagnostic_restart {
