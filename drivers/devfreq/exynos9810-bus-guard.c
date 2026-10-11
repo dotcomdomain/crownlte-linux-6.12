@@ -69,7 +69,37 @@ static struct exynos9810_bus_guard *guard_for_owner(unsigned int owner)
 	}
 }
 
-/* Caller holds guard->lock. ACK's QoS notifier can hide target errors. */
+/* Supplier df lock held. Only a fresh supported hardware row can confirm
+ * protection; previous_freq and a successful QoS publication are insufficient.
+ */
+static int supplier_actual(struct exynos9810_bus_guard *guard,
+		unsigned long *actual_hz)
+{
+	struct devfreq *df = guard->supplier;
+	unsigned int i;
+	int ret;
+
+	if (!df->max_state || df->max_state > EXYNOS9810_BUS_LEVELS ||
+	    !df->freq_table)
+		return -EINVAL;
+	ret = df->profile->get_cur_freq(df->dev.parent, actual_hz);
+	if (ret)
+		return ret;
+	if (!*actual_hz || *actual_hz > guard->maximum_khz * 1000UL)
+		return -ERANGE;
+	for (i = 0; i < df->max_state; i++)
+		if (df->freq_table[i] == *actual_hz)
+			return 0;
+	return -ERANGE;
+}
+
+/* Caller holds guard->lock. Publish protection before confirming hardware.
+ * A tighter supplier cap must not prevent a consumer from decreasing merely
+ * because an already satisfied old floor cannot be lowered yet. Keep that
+ * protection vote, confirm its fresh actual row, then let the consumer release
+ * the floor after its own successful decrease. The cap worker handles the
+ * later supplier reduction. A missing floor still requires update/confirmation.
+ */
 static int set_floor(struct exynos9810_bus_guard *guard, unsigned int khz)
 {
 	struct devfreq *df = guard->supplier;
@@ -81,13 +111,15 @@ static int set_floor(struct exynos9810_bus_guard *guard, unsigned int khz)
 		return ret;
 	guard->requested_khz = khz;
 	mutex_lock(&df->lock);
-	ret = update_devfreq(df);
-	if (!ret)
-		ret = df->profile->get_cur_freq(df->dev.parent, &actual_hz);
+	ret = supplier_actual(guard, &actual_hz);
+	if (!ret && actual_hz < khz * 1000UL) {
+		ret = update_devfreq(df);
+		if (!ret)
+			ret = supplier_actual(guard, &actual_hz);
+		if (!ret && actual_hz < khz * 1000UL)
+			ret = -ERANGE;
+	}
 	mutex_unlock(&df->lock);
-	if (!ret && (actual_hz < khz * 1000UL ||
-		     actual_hz > guard->maximum_khz * 1000UL))
-		ret = -ERANGE;
 	return ret;
 }
 
