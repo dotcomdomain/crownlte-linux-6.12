@@ -101,6 +101,10 @@ struct devfreq_dev_status {
  *			and freq_table must be generated in ascending order.
  * @max_state:		The size of freq_table.
  *
+ * @legacy_khz_sysfs: Opt in the original Exynos bus ABI. Frequency sysfs
+ *                     uses kHz, limits and transition stats are read-only,
+ *                     and time_in_state is exposed in milliseconds.
+ *                     Set before registration; internal frequencies stay Hz.
  * @is_cooling_device: A self-explanatory boolean giving the device a
  *                     cooling effect property.
  */
@@ -119,6 +123,7 @@ struct devfreq_dev_profile {
 	unsigned int max_state;
 
 	bool is_cooling_device;
+	bool legacy_khz_sysfs;
 };
 
 /**

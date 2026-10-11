@@ -20,6 +20,7 @@
 #include <linux/stat.h>
 #include <linux/pm_opp.h>
 #include <linux/devfreq.h>
+#include <linux/devfreq-units.h>
 #include <linux/workqueue.h>
 #include <linux/platform_device.h>
 #include <linux/list.h>
@@ -1552,19 +1553,27 @@ static ssize_t available_governors_show(struct device *d,
 static DEVICE_ATTR_RO(available_governors);
 
 static ssize_t cur_freq_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
+                             char *buf)
 {
 	unsigned long freq;
 	struct devfreq *df = to_devfreq(dev);
+	int ret;
 
 	if (!df->profile)
 		return -EINVAL;
-
-	if (df->profile->get_cur_freq &&
-		!df->profile->get_cur_freq(df->dev.parent, &freq))
-		return sprintf(buf, "%lu\n", freq);
-
-	return sprintf(buf, "%lu\n", df->previous_freq);
+	if (df->profile->get_cur_freq) {
+		ret = df->profile->get_cur_freq(df->dev.parent, &freq);
+		if (!ret)
+			return sprintf(buf, "%lu\n",
+				devfreq_sysfs_freq(df->profile->legacy_khz_sysfs, freq));
+		if (df->profile->legacy_khz_sysfs)
+			return ret;
+	} else if (df->profile->legacy_khz_sysfs) {
+		return -EOPNOTSUPP;
+	}
+	return sprintf(buf, "%lu\n",
+		       devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+					  df->previous_freq));
 }
 static DEVICE_ATTR_RO(cur_freq);
 
@@ -1573,7 +1582,9 @@ static ssize_t target_freq_show(struct device *dev,
 {
 	struct devfreq *df = to_devfreq(dev);
 
-	return sprintf(buf, "%lu\n", df->previous_freq);
+	return sprintf(buf, "%lu\n",
+		       devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+					  df->previous_freq));
 }
 static DEVICE_ATTR_RO(target_freq);
 
@@ -1583,6 +1594,9 @@ static ssize_t min_freq_store(struct device *dev, struct device_attribute *attr,
 	struct devfreq *df = to_devfreq(dev);
 	unsigned long value;
 	int ret;
+
+	if (df->profile->legacy_khz_sysfs)
+		return -EACCES;
 
 	/*
 	 * Protect against theoretical sysfs writes between
@@ -1611,10 +1625,17 @@ static ssize_t min_freq_show(struct device *dev, struct device_attribute *attr,
 	unsigned long min_freq, max_freq;
 
 	mutex_lock(&df->lock);
-	devfreq_get_freq_range(df, &min_freq, &max_freq);
+	if (df->profile->legacy_khz_sysfs) {
+		min_freq = df->scaling_min_freq;
+		max_freq = df->scaling_max_freq;
+	} else {
+		devfreq_get_freq_range(df, &min_freq, &max_freq);
+	}
 	mutex_unlock(&df->lock);
 
-	return sprintf(buf, "%lu\n", min_freq);
+	return sprintf(buf, "%lu\n",
+		       devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+					  min_freq));
 }
 static DEVICE_ATTR_RW(min_freq);
 
@@ -1624,6 +1645,9 @@ static ssize_t max_freq_store(struct device *dev, struct device_attribute *attr,
 	struct devfreq *df = to_devfreq(dev);
 	unsigned long value;
 	int ret;
+
+	if (df->profile->legacy_khz_sysfs)
+		return -EACCES;
 
 	/*
 	 * Protect against theoretical sysfs writes between
@@ -1665,10 +1689,17 @@ static ssize_t max_freq_show(struct device *dev, struct device_attribute *attr,
 	unsigned long min_freq, max_freq;
 
 	mutex_lock(&df->lock);
-	devfreq_get_freq_range(df, &min_freq, &max_freq);
+	if (df->profile->legacy_khz_sysfs) {
+		min_freq = df->scaling_min_freq;
+		max_freq = df->scaling_max_freq;
+	} else {
+		devfreq_get_freq_range(df, &min_freq, &max_freq);
+	}
 	mutex_unlock(&df->lock);
 
-	return sprintf(buf, "%lu\n", max_freq);
+	return sprintf(buf, "%lu\n",
+		       devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+					  max_freq));
 }
 static DEVICE_ATTR_RW(max_freq);
 
@@ -1687,7 +1718,8 @@ static ssize_t available_frequencies_show(struct device *d,
 
 	for (i = 0; i < df->max_state; i++)
 		count += scnprintf(&buf[count], (PAGE_SIZE - count - 2),
-				"%lu ", df->freq_table[i]);
+				"%lu ", devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+						  df->freq_table[i]));
 
 	mutex_unlock(&df->lock);
 	/* Truncate the trailing space */
@@ -1729,7 +1761,8 @@ static ssize_t trans_stat_show(struct device *dev,
 		if (len >= PAGE_SIZE - 1)
 			break;
 		len += sysfs_emit_at(buf, len, "%10lu",
-				     df->freq_table[i]);
+				     devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+							df->freq_table[i]));
 	}
 
 	if (len >= PAGE_SIZE - 1)
@@ -1745,7 +1778,9 @@ static ssize_t trans_stat_show(struct device *dev,
 			len += sysfs_emit_at(buf, len, " ");
 		if (len >= PAGE_SIZE - 1)
 			break;
-		len += sysfs_emit_at(buf, len, "%10lu:", df->freq_table[i]);
+		len += sysfs_emit_at(buf, len, "%10lu:",
+				     devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+							df->freq_table[i]));
 		for (j = 0; j < max_state; j++) {
 			if (len >= PAGE_SIZE - 1)
 				break;
@@ -1779,6 +1814,9 @@ static ssize_t trans_stat_store(struct device *dev,
 	if (!df->profile)
 		return -EINVAL;
 
+	if (df->profile->legacy_khz_sysfs)
+		return -EACCES;
+
 	if (df->max_state == 0)
 		return count;
 
@@ -1800,6 +1838,29 @@ static ssize_t trans_stat_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(trans_stat);
 
+static ssize_t time_in_state_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct devfreq *df = to_devfreq(dev);
+	ssize_t len = 0;
+	unsigned int i;
+	int ret;
+
+	mutex_lock(&df->lock);
+	ret = devfreq_update_status(df, df->previous_freq);
+	if (ret)
+		goto out;
+	for (i = 0; i < df->max_state && len < PAGE_SIZE - 1; i++)
+		len += sysfs_emit_at(buf, len, "%8lu%10llu\n",
+			devfreq_sysfs_freq(df->profile->legacy_khz_sysfs,
+					  df->freq_table[i]),
+			(u64)jiffies64_to_msecs(df->stats.time_in_state[i]));
+out:
+	mutex_unlock(&df->lock);
+	return ret ? ret : len;
+}
+static DEVICE_ATTR_RO(time_in_state);
+
 static struct attribute *devfreq_attrs[] = {
 	&dev_attr_name.attr,
 	&dev_attr_governor.attr,
@@ -1810,9 +1871,33 @@ static struct attribute *devfreq_attrs[] = {
 	&dev_attr_min_freq.attr,
 	&dev_attr_max_freq.attr,
 	&dev_attr_trans_stat.attr,
+	&dev_attr_time_in_state.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(devfreq);
+static umode_t devfreq_attr_is_visible(struct kobject *kobj,
+				       struct attribute *attr, int index)
+{
+	struct devfreq *df = to_devfreq(kobj_to_dev(kobj));
+	bool legacy = df->profile->legacy_khz_sysfs;
+
+	if (attr == &dev_attr_time_in_state.attr)
+		return legacy ? 0444 : 0;
+	if (legacy && (attr == &dev_attr_min_freq.attr ||
+		       attr == &dev_attr_max_freq.attr ||
+		       attr == &dev_attr_trans_stat.attr))
+		return 0444;
+	return attr->mode;
+}
+
+static const struct attribute_group devfreq_group = {
+	.attrs = devfreq_attrs,
+	.is_visible = devfreq_attr_is_visible,
+};
+
+static const struct attribute_group *devfreq_groups[] = {
+	&devfreq_group,
+	NULL,
+};
 
 static ssize_t polling_interval_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)

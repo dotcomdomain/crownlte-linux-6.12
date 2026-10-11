@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/devfreq.h>
+#include <linux/devfreq-units.h>
 #include <linux/kstrtox.h>
 #include <linux/pm.h>
 #include <linux/mutex.h>
@@ -43,6 +44,10 @@ static ssize_t set_freq_store(struct device *dev, struct device_attribute *attr,
 	err = kstrtoul(buf, 0, &wanted);
 	if (err)
 		return err;
+	err = devfreq_sysfs_to_hz(devfreq->profile->legacy_khz_sysfs,
+				   wanted, &wanted);
+	if (err)
+		return err;
 
 	mutex_lock(&devfreq->lock);
 	data = devfreq->governor_data;
@@ -67,7 +72,9 @@ static ssize_t set_freq_show(struct device *dev,
 	data = devfreq->governor_data;
 
 	if (data->valid)
-		err = sprintf(buf, "%lu\n", data->user_frequency);
+		err = sprintf(buf, "%lu\n",
+			      devfreq_sysfs_freq(devfreq->profile->legacy_khz_sysfs,
+						 data->user_frequency));
 	else
 		err = sprintf(buf, "undefined\n");
 	mutex_unlock(&devfreq->lock);
