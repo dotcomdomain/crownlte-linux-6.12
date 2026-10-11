@@ -46,9 +46,8 @@ static int dependency_floor(struct exynos9810_bus_transition *state,
 	return ret;
 }
 
-static void transition_cleanup(void *data)
+void exynos9810_bus_transition_fini(struct exynos9810_bus_transition *state)
 {
-	struct exynos9810_bus_transition *state = data;
 	int ret = 0;
 
 	mutex_lock(&state->lock);
@@ -58,6 +57,11 @@ static void transition_cleanup(void *data)
 	mutex_unlock(&state->lock);
 	if (ret)
 		dev_err(state->dev, "dependency guard retained; hardware raise failed: %d\n", ret);
+}
+
+static void transition_cleanup(void *data)
+{
+	exynos9810_bus_transition_fini(data);
 }
 
 int exynos9810_bus_transition_init(struct exynos9810_bus_transition *state,

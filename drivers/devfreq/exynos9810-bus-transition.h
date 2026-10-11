@@ -34,5 +34,6 @@ int exynos9810_bus_transition_rate(struct exynos9810_bus_transition *state,
 		unsigned long requested_hz);
 int exynos9810_bus_transition_current(struct exynos9810_bus_transition *state,
 		unsigned long *actual_hz);
+void exynos9810_bus_transition_fini(struct exynos9810_bus_transition *state);
 
 #endif

@@ -814,7 +814,7 @@ struct devfreq *devfreq_add_device(struct device *dev,
 	unsigned long min_freq, max_freq;
 	int err = 0;
 
-	if (!dev || !profile || !governor_name) {
+	if (!dev || !profile || !governor_name || (profile->acquire && !profile->release)) {
 		dev_err(dev, "%s: Invalid parameters.\n", __func__);
 		return ERR_PTR(-EINVAL);
 	}
@@ -888,6 +888,12 @@ struct devfreq *devfreq_add_device(struct device *dev,
 
 	atomic_set(&devfreq->suspend_count, 0);
 
+	/* device_register failure and subsequent allocation failures can run
+	 * the final release callback. Its SRCU cleanup must already be valid.
+	 */
+	srcu_init_notifier_head(&devfreq->transition_notifier_list);
+	if (devfreq->profile->acquire)
+		devfreq->profile->acquire(devfreq);
 	dev_set_name(&devfreq->dev, "%s", dev_name(dev));
 	err = device_register(&devfreq->dev);
 	if (err) {
@@ -919,8 +925,6 @@ struct devfreq *devfreq_add_device(struct device *dev,
 
 	devfreq->stats.total_trans = 0;
 	devfreq->stats.last_update = get_jiffies_64();
-
-	srcu_init_notifier_head(&devfreq->transition_notifier_list);
 
 	mutex_unlock(&devfreq->lock);
 

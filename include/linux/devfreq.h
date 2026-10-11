@@ -97,6 +97,10 @@ struct devfreq_dev_status {
  *			from devfreq_remove_device() call. If the user
  *			has registered devfreq->nb at a notifier-head,
  *			this is the time to unregister it.
+ * @acquire:		Optional callback immediately before class registration takes
+ *			ownership of the devfreq object. Pair with release to pin
+ *			driver-owned profile storage without guessing which error
+ *			paths have started the asynchronous device lifetime.
  * @release:		Optional final callback after the devfreq class device loses
  *			its last reference. The callback may release driver-owned
  *			profile storage. It must not perform frequency operations.
@@ -128,6 +132,7 @@ struct devfreq_dev_profile {
 
 	bool is_cooling_device;
 	bool legacy_khz_sysfs;
+	void (*acquire)(struct devfreq *devfreq);
 	void (*release)(struct devfreq *devfreq);
 };
 

@@ -28,3 +28,5 @@ obj-$(CONFIG_EXYNOS9810_BUS_TRANSITIONS) += exynos9810-bus-transition.o
 obj-$(CONFIG_DEVFREQ_GOV_EXYNOS9810_INTERACTIVE) += governor_exynos9810_interactive.o
 
 obj-$(CONFIG_EXYNOS9810_BUS_GUARDS) += exynos9810-bus-guard.o
+
+obj-$(CONFIG_EXYNOS9810_BUS_PROVIDERS) += exynos9810-bus-provider.o

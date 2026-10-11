@@ -120,6 +120,16 @@ config EXYNOS9810_MIF_BTS
 
 
 
+config EXYNOS9810_BUS_PROVIDERS
+	bool "Exynos9810 calibrated MIF/INT/FSYS0 devfreq providers"
+	depends on EXYNOS9810_BUS_TRANSITIONS && EXYNOS9810_MIF_BTS
+	select DEVFREQ_GOV_EXYNOS9810_INTERACTIVE
+	help
+	  Register real calibrated bus providers, supplier links and original
+	  kHz sysfs controls. Retain bootstrap requests until all buses bind.
+	  Board nodes remain disabled pending complete PM, thermal and BTS
+	  validation. This option alone does not enable hardware nodes.
+
 config EXYNOS9810_BUS_TABLES
 	bool "Exynos9810 CAL/ECT bus table and FVP protocol component"
 	depends on ARCH_EXYNOS && EXYNOS9810_LEGACY_CAL && EXYNOS_ACPM && ECT
