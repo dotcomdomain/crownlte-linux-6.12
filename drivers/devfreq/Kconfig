@@ -124,6 +124,7 @@ config EXYNOS9810_BUS_PROVIDERS
 	bool "Exynos9810 calibrated MIF/INT/FSYS0 devfreq providers"
 	depends on EXYNOS9810_BUS_TRANSITIONS && EXYNOS9810_MIF_BTS
 	select DEVFREQ_GOV_EXYNOS9810_INTERACTIVE
+	select EXYNOS9810_LEGACY_BUS_QOS
 	help
 	  Register real calibrated bus providers, supplier links and original
 	  kHz sysfs controls. Retain bootstrap requests until all buses bind.
@@ -138,6 +139,15 @@ config EXYNOS9810_BUS_TABLES
 	  prepare the original response-enabled MIF constraint protocol.
 	  This does not register a bus devfreq provider or enable hardware nodes.
 	  Real BTS, thermal and supplier transitions remain required.
+
+config EXYNOS9810_LEGACY_BUS_QOS
+	bool "Exynos9810 original MIF/INT/FSYS0 QoS character ABI"
+	depends on EXYNOS9810_BUS_TABLES && PM
+	help
+	  Preserve the original six bus minimum/maximum character interfaces,
+	  binary and hexadecimal input, signed aggregate kHz reads and early
+	  requests. Bridge them to real registered devfreq providers.
+	  Other QoS domains and full thermal coordination remain required.
 
 
 

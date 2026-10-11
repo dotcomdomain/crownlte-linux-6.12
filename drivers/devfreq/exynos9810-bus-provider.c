@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <soc/samsung/exynos9810-mif-bts.h>
+#include <soc/samsung/exynos9810-legacy-qos.h>
 #include "exynos9810-bus-transition.h"
 #include "exynos9810-interactive.h"
 #include "governor.h"
@@ -35,6 +36,7 @@ struct crownlte_bus {
 	struct exynos9810_interactive_config interactive;
 	struct dev_pm_qos_request default_min, system_min, boot_min, reboot_max;
 	struct notifier_block reboot_notifier;
+	struct exynos9810_legacy_qos_bridge legacy_qos;
 	struct mutex pm_lock;
 	enum bus_pm_phase pm_phase;
 	unsigned long forced_hz;
@@ -48,6 +50,7 @@ struct crownlte_bus {
 static struct platform_driver crownlte_bus_driver;
 static DEFINE_MUTEX(bus_registry_lock);
 static struct crownlte_bus *bus_registry[3];
+static int bus_update(struct crownlte_bus *bus);
 
 static int bus_slot(unsigned int id)
 {
@@ -274,11 +277,23 @@ static ssize_t scaling_devfreq_min_store(struct device *dev,
 	struct crownlte_bus *bus = class_bus(dev);
 	u32 value;
 	int ret;
+	bool changed;
 
 	ret = kstrtou32(buf, 0, &value);
 	if (ret || value > INT_MAX)
 		return ret ? ret : -ERANGE;
+	changed = (s32)value != READ_ONCE(bus->system_min.data.freq.pnode.prio);
 	ret = dev_pm_qos_update_request(&bus->system_min, value);
+	/* The old INT minimum class uses FORCE_MAX even when this system request
+	 * remains below another minimum. Native device QoS suppresses that event.
+	 * Preserve the old exact-repeat no-op and write-count return behavior.
+	 */
+	if (ret >= 0 && changed && bus->slot == 1) {
+		int apply_ret = bus_update(bus);
+
+		if (apply_ret)
+			dev_err(bus->dev, "INT system request retained; apply failed: %d\n", apply_ret);
+	}
 	return ret < 0 ? ret : count;
 }
 static DEVICE_ATTR(scaling_devfreq_min, 0640,
@@ -378,6 +393,7 @@ static void bus_cleanup(void *data)
 		unregister_reboot_notifier(&bus->reboot_notifier);
 		bus->reboot_registered = false;
 	}
+	exynos9810_legacy_qos_stop(&bus->legacy_qos);
 
 	mutex_lock(&bus_registry_lock);
 	if (bus->listed) {
@@ -406,6 +422,7 @@ static void bus_cleanup(void *data)
 		devfreq_remove_device(bus->df);
 		bus->df = NULL;
 	}
+	exynos9810_legacy_qos_detach(&bus->legacy_qos);
 	bus_remove_requests(bus);
 	if (dev_get_drvdata(bus->dev) == bus)
 		dev_set_drvdata(bus->dev, NULL);
@@ -697,6 +714,20 @@ static int bus_read_binding(struct crownlte_bus *bus)
 	return exynos9810_interactive_validate(&bus->interactive);
 }
 
+static int bus_legacy_apply(void *context)
+{
+	struct crownlte_bus *bus = context;
+
+	/* Early requests are retained before the class/governor exists. Its first
+	 * explicit update consumes them once registration has finished.
+	 */
+	if (IS_ERR_OR_NULL(READ_ONCE(bus->df)))
+		return 0;
+	if (READ_ONCE(bus->retired))
+		return -ENODEV;
+	return bus_update(bus);
+}
+
 static int crownlte_bus_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -767,6 +798,10 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 				    DEV_PM_QOS_MAX_FREQUENCY, PM_QOS_MAX_FREQUENCY_DEFAULT_VALUE);
 	if (ret < 0)
 		return ret;
+	ret = exynos9810_legacy_qos_attach(&bus->legacy_qos, dev, maximum,
+					 bus_legacy_apply, bus);
+	if (ret)
+		return dev_err_probe(dev, ret, "legacy bus QoS bridge unavailable\n");
 	bus->boot_expires = jiffies + bus->boot_info[0] * HZ;
 	ret = exynos9810_bus_transition_current(&bus->transition, &actual);
 	if (ret)
