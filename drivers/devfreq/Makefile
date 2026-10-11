@@ -32,3 +32,5 @@ obj-$(CONFIG_EXYNOS9810_BUS_GUARDS) += exynos9810-bus-guard.o
 obj-$(CONFIG_EXYNOS9810_BUS_PROVIDERS) += exynos9810-bus-provider.o
 
 obj-$(CONFIG_EXYNOS9810_LEGACY_BUS_QOS) += exynos9810-legacy-qos.o
+
+obj-$(CONFIG_EXYNOS9810_BUS_TABLES) += exynos9810-bus-cap-plan.o
