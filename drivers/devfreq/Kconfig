@@ -31,6 +31,17 @@ if PM_DEVFREQ
 
 comment "DEVFREQ Governors"
 
+config DEVFREQ_GOV_EXYNOS9810_INTERACTIVE
+	bool "Exynos9810 QoS-only Interactive"
+	depends on EXYNOS9810_BUS_TABLES
+	help
+	  Preserve the original QoS-only bus policy and delayed decreases with
+	  immediate maximum-cap override. Use actual current-rate callbacks and
+	  response-verified providers. This component performs no load polling
+	  and does not register a bus provider or enable hardware nodes.
+
+
+
 config DEVFREQ_GOV_SIMPLE_ONDEMAND
 	tristate "Simple Ondemand"
 	help
