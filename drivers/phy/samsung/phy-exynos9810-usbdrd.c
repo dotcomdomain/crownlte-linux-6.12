@@ -170,14 +170,15 @@ static void s9p_usbphy_dump(struct s9p_usbphy *p, const char *when)
 		 buf);
 }
 
-static void s9p_usbphy_pmu(struct s9p_usbphy *p, bool on)
+static int s9p_usbphy_pmu(struct s9p_usbphy *p, bool on)
 {
-	if (!p->pmu)
-		return;
-	regmap_update_bits(p->pmu, PMU_USB20_PHY_CTRL, PMU_PHY_ENABLE,
-			   on ? PMU_PHY_ENABLE : 0);
-	regmap_update_bits(p->pmu, PMU_USB3DP_PHY_CTRL, PMU_PHY_ENABLE,
-			   on ? PMU_PHY_ENABLE : 0);
+	int ret;
+	ret = regmap_update_bits(p->pmu, PMU_USB20_PHY_CTRL, PMU_PHY_ENABLE,
+				on ? PMU_PHY_ENABLE : 0);
+	if (ret)
+		return ret;
+	return regmap_update_bits(p->pmu, PMU_USB3DP_PHY_CTRL, PMU_PHY_ENABLE,
+				 on ? PMU_PHY_ENABLE : 0);
 }
 
 /* exynos_cal_usbphy_q_ch(): force the Q-channel active, with its delays */
@@ -228,14 +229,20 @@ static int s9p_usbphy_init(struct phy *phy)
 	if (ret)
 		return ret;
 
-	s9p_usbphy_dump(p, "before init");
+	if (clk_get_rate(p->clks[0].clk) != 26000000) {
+		ret = -EINVAL;
+		goto disable_clocks;
+	}
 
 	/*
 	 * The vendor releases the PMU isolation in power_on, which its glue
 	 * calls before init. dwc3 calls init first, so release it here too;
 	 * it is idempotent.
 	 */
-	s9p_usbphy_pmu(p, true);
+	ret = s9p_usbphy_pmu(p, true);
+	if (ret)
+		goto disable_clocks;
+	s9p_usbphy_dump(p, "before init");
 
 	/* --- phy_exynos_usb_v3p1_enable(), VER_03_0_0 branch --- */
 	s9p_usbphy_q_ch(p, true);
@@ -287,6 +294,9 @@ static int s9p_usbphy_init(struct phy *phy)
 
 	s9p_usbphy_dump(p, "after init");
 	return 0;
+disable_clocks:
+	clk_bulk_disable_unprepare(p->nclks, p->clks);
+	return ret;
 }
 
 static int s9p_usbphy_exit(struct phy *phy)
@@ -307,7 +317,9 @@ static int s9p_usbphy_power_on(struct phy *phy)
 {
 	struct s9p_usbphy *p = phy_get_drvdata(phy);
 
-	s9p_usbphy_pmu(p, true);
+	int ret = s9p_usbphy_pmu(p, true);
+	if (ret)
+		return ret;
 	s9p_usbphy_dump(p, "power_on");
 	return 0;
 }
@@ -316,8 +328,7 @@ static int s9p_usbphy_power_off(struct phy *phy)
 {
 	struct s9p_usbphy *p = phy_get_drvdata(phy);
 
-	s9p_usbphy_pmu(p, false);
-	return 0;
+	return s9p_usbphy_pmu(p, false);
 }
 
 static const struct phy_ops s9p_usbphy_ops = {
@@ -357,16 +368,13 @@ static int s9p_usbphy_probe(struct platform_device *pdev)
 
 	p->pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
 						 "samsung,pmu-syscon");
-	if (IS_ERR(p->pmu)) {
-		dev_warn(dev, "no PMU syscon (%ld), isolation left as is\n",
-			 PTR_ERR(p->pmu));
-		p->pmu = NULL;
-	}
+	if (IS_ERR(p->pmu))
+		return dev_err_probe(dev, PTR_ERR(p->pmu), "PMU syscon required\n");
 
 	p->clks[0].id = "ref";
 	p->clks[1].id = "phy";
 	p->nclks = 2;
-	ret = devm_clk_bulk_get_optional(dev, p->nclks, p->clks);
+	ret = devm_clk_bulk_get(dev, p->nclks, p->clks);
 	if (ret)
 		return dev_err_probe(dev, ret, "clocks\n");
 
@@ -380,8 +388,7 @@ static int s9p_usbphy_probe(struct platform_device *pdev)
 	if (IS_ERR(provider))
 		return PTR_ERR(provider);
 
-	dev_info(dev, "Exynos 9810 USB 2.0 PHY, USBCON version %08x\n",
-		 readl(p->regs + USBCON_CTRL_VER));
+	dev_info(dev, "Exynos9810 USB2 PHY resources bound; MMIO waits for clocks\n");
 	return 0;
 }
 

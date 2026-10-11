@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Source-only real-clock USB diagnostic. UFS is still disabled. */
+#include "exynos9810-crownlte-usb-diag.dts"
+#include <dt-bindings/clock/exynos9810.h>
+
+&{/} {
+	model = "Samsung Galaxy Note9 crownlte real-clock USB diagnostic (unvalidated)";
+	/delete-node/ clock-usb-ref;
+	/delete-node/ clock-usb-bus-stub;
+	/delete-node/ clock-gates;
+};
+&legacy_cmu { status = "okay"; };
+&legacy_cmu_ewf { status = "okay"; };
+&legacy_acpm { status = "okay"; };
+&legacy_acpm_ipc { status = "okay"; };
+&legacy_acpm_dvfs { status = "okay"; };
+&legacy_acpm_pmic { status = "okay"; };
+
+&hsi2c_pmic {
+	/* Original live DT rate114 and gate110, in ACK driver clock order. */
+	clocks = <&legacy_cmu USI_CMGP03>, <&legacy_cmu GATE_USI_CMGP03>;
+	clock-names = "hsi2c", "hsi2c_pclk";
+};
+&usbdrd_phy {
+	/* Original live DT oscillator1 and USB link gate704. */
+	clocks = <&legacy_cmu OSCCLK>, <&legacy_cmu GATE_USB30DRD_USB30DRD_LINK>;
+	clock-names = "ref", "phy";
+};
+&{/soc@0/usb@10c00000} {
+	/* Original live DT aclk704 and sclk711; ACK DWC3 names map these. */
+	clocks = <&legacy_cmu GATE_USB30DRD_USB30DRD_LINK>, <&legacy_cmu USB30DRD>;
+	clock-names = "bus_early", "ref";
+};
