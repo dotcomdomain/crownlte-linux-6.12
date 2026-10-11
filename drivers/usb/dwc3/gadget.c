@@ -1720,9 +1720,12 @@ static int __dwc3_gadget_kick_transfer(struct dwc3_ep *dep)
 		list_for_each_entry_safe(req, tmp, &dep->started_list, list)
 			dwc3_gadget_move_cancelled_request(req, DWC3_REQUEST_STATUS_DEQUEUED);
 
-		/* If ep isn't started, then there's no end transfer pending */
-		if (!(dep->flags & DWC3_EP_END_TRANSFER_PENDING))
-			dwc3_gadget_ep_cleanup_cancelled_requests(dep);
+		/* Queue callers must not invoke completion from their own stack.
+		 * Defer failed-start giveback; command-complete IRQs handle requests
+		 * still waiting for END_TRANSFER or a delayed stop.
+		 */
+		if (!(dep->flags & (DWC3_EP_END_TRANSFER_PENDING | DWC3_EP_DELAY_STOP)))
+			tasklet_schedule(&dep->cancelled_tasklet);
 
 		return ret;
 	}
@@ -2026,8 +2029,10 @@ static int __dwc3_gadget_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
 	 */
 	if (usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
 		if (!(dep->flags & DWC3_EP_TRANSFER_STARTED)) {
-			if ((dep->flags & DWC3_EP_PENDING_REQUEST))
-				return __dwc3_gadget_start_isoc(dep);
+			if (dep->flags & DWC3_EP_PENDING_REQUEST)
+				__dwc3_gadget_start_isoc(dep);
+
+			/* The pending list owns this request, including start errors. */
 
 			return 0;
 		}
@@ -2115,6 +2120,18 @@ static void dwc3_gadget_ep_cleanup_cancelled_requests(struct dwc3_ep *dep)
 		if (!dep->endpoint.desc)
 			break;
 	}
+}
+
+static void dwc3_gadget_cancelled_tasklet(struct tasklet_struct *tasklet)
+{
+	struct dwc3_ep *dep = from_tasklet(dep, tasklet, cancelled_tasklet);
+	struct dwc3 *dwc = dep->dwc;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dwc->lock, flags);
+	if (!(dep->flags & (DWC3_EP_END_TRANSFER_PENDING | DWC3_EP_DELAY_STOP)))
+		dwc3_gadget_ep_cleanup_cancelled_requests(dep);
+	spin_unlock_irqrestore(&dwc->lock, flags);
 }
 
 static int dwc3_gadget_ep_dequeue(struct usb_ep *ep,
@@ -3328,6 +3345,7 @@ static int dwc3_gadget_init_endpoint(struct dwc3 *dwc, u8 epnum)
 		return -ENOMEM;
 
 	dep->dwc = dwc;
+	tasklet_setup(&dep->cancelled_tasklet, dwc3_gadget_cancelled_tasklet);
 	dep->number = epnum;
 	dep->direction = direction;
 	dep->regs = dwc->regs + DWC3_DEP_BASE(epnum);
@@ -3393,6 +3411,7 @@ static void dwc3_gadget_free_endpoints(struct dwc3 *dwc)
 		dep = dwc->eps[epnum];
 		if (!dep)
 			continue;
+		tasklet_kill(&dep->cancelled_tasklet);
 		/*
 		 * Physical endpoints 0 and 1 are special; they form the
 		 * bi-directional USB endpoint 0.

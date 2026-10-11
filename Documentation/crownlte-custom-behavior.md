@@ -31,18 +31,24 @@ The new kernel port reconciles them individually in the isolated
 - `c34ea358`, accepted USB request ownership: modern bulk/interrupt queueing
   adds requests to pending_list and returns0 after the transfer kick. Modern
   zero-length transfers are represented in TRBs instead of the old separate
-  ZLP request allocation. An old diff cannot be replayed on those structures.
-  Error cancellation can still call completion from the transfer kick when
-  END_TRANSFER is not pending, which needs review against the documented
-  no-synchronous-completion rule before adding locks around USB queue calls.
+  ZLP request allocation. Accepted isochronous requests now also return0 after
+  start attempts. Failed-start cancellation defers giveback to a per-endpoint
+  tasklet when no END_TRANSFER or delayed stop is pending. Its initialization
+  and teardown follow endpoint lifetime. Completion no longer runs from the
+  transfer kick's queue stack, following the documented gadget contract.
   See the [kernel USB gadget contract](https://www.kernel.org/doc/html/latest/driver-api/usb/gadget.html).
 - `8665533d`, disconnect handling: the modern queue path already rejects a
   disconnected device, and modern gether_disconnect clears port_usb before
   disabling endpoints. The isolated patch additionally rejects late IRQ
-  transfer kicks when the endpoint/device is disconnected. The final
-  gether RX allocation-to-queue race still needs explicit reconciliation.
-  The old lock-around-queue diff is not installed until modern cancellation
-  callback ordering is checked. Stress tests remain outstanding.
+  transfer kicks when the endpoint/device is disconnected. RX pool ownership
+  captures endpoint and link generation under the link/pool locks. Submission
+  checks both before allocation and again under the link lock when queueing
+  with GFP_ATOMIC. Requests held privately across teardown are freed through
+  their original endpoint instead of returning to a drained pool. Completion
+  carries its entry generation through resubmission and reclamation. Tests of
+  the actual queue and RX submission functions pass3245 fault and flag cases
+  under ASAN/UBSAN. Source review covers tasklet, TRB and endpoint lifetime;
+  hardware disconnect/IRQ stress testing remains outstanding.
 
 No6.12 custom behavior has been exercised on the phone or flashed. Compilation
 and helper tests do not establish USB, IPv6 or Droidspaces runtime behavior.

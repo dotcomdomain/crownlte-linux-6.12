@@ -22,6 +22,7 @@
 #include <linux/debugfs.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <linux/interrupt.h>
 #include <linux/android_kabi.h>
 
 #include <linux/usb/ch9.h>
@@ -733,6 +734,7 @@ struct dwc3_event_buffer {
  * @number: endpoint number (1 - 15)
  * @type: set to bmAttributes & USB_ENDPOINT_XFERTYPE_MASK
  * @resource_index: Resource transfer index
+ * @cancelled_tasklet: completes failed transfers outside queue callbacks
  * @frame_number: set to the frame number we want this transfer to start (ISOC)
  * @interval: the interval on which the ISOC transfer is started
  * @name: a human readable name e.g. ep1out-bulk
@@ -748,6 +750,7 @@ struct dwc3_ep {
 	struct list_head	cancelled_list;
 	struct list_head	pending_list;
 	struct list_head	started_list;
+	struct tasklet_struct	cancelled_tasklet;
 
 	void __iomem		*regs;
 

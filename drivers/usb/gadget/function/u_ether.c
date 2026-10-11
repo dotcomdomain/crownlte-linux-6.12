@@ -57,6 +57,7 @@ struct eth_dev {
 	 */
 	spinlock_t		lock;
 	struct gether		*port_usb;
+	u64			rx_link_generation; /* guarded by lock */
 
 	struct net_device	*net;
 	struct usb_gadget	*gadget;
@@ -141,11 +142,34 @@ static void defer_kevent(struct eth_dev *dev, int flag)
 
 static void rx_complete(struct usb_ep *ep, struct usb_request *req);
 
+/* Return only current-link requests to the pool. A submitter may have held
+ * its request privately while disconnect drained that pool.
+ */
+static void rx_reclaim(struct eth_dev *dev, struct usb_request *req,
+		       struct usb_ep *owner, u64 generation)
+{
+	unsigned long flags;
+	bool active_link;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	active_link = dev->port_usb && generation == dev->rx_link_generation &&
+		  dev->port_usb->out_ep == owner;
+	if (active_link) {
+		spin_lock(&dev->req_lock);
+		list_add(&req->list, &dev->rx_reqs);
+		spin_unlock(&dev->req_lock);
+	}
+	spin_unlock_irqrestore(&dev->lock, flags);
+	if (!active_link)
+		usb_ep_free_request(owner, req);
+}
+
 static int
-rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
+rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags,
+	  struct usb_ep *owner, u64 generation)
 {
 	struct usb_gadget *g = dev->gadget;
-	struct sk_buff	*skb;
+	struct sk_buff	*skb = NULL;
 	int		retval = -ENOMEM;
 	size_t		size = 0;
 	struct usb_ep	*out;
@@ -157,10 +181,11 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	else
 		out = NULL;
 
-	if (!out)
+	if (!out || out != owner || generation != dev->rx_link_generation)
 	{
 		spin_unlock_irqrestore(&dev->lock, flags);
-		return -ENOTCONN;
+		retval = -ENOTCONN;
+		goto reclaim;
 	}
 
 	/* Padding up to RX_EXTRA handles minor disagreements with host.
@@ -205,17 +230,26 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	req->complete = rx_complete;
 	req->context = skb;
 
-	retval = usb_ep_queue(out, req, gfp_flags);
+	/* Allocation may sleep. Serialize the final decision against link
+	 * teardown and reject a disconnect/reconnect using the same endpoint.
+	 * Gadget queue completion must run outside the queue call itself.
+	 */
+	spin_lock_irqsave(&dev->lock, flags);
+	if (!dev->port_usb || generation != dev->rx_link_generation ||
+	    dev->port_usb->out_ep != out)
+		retval = -ENOTCONN;
+	else
+		retval = usb_ep_queue(out, req, GFP_ATOMIC);
+	spin_unlock_irqrestore(&dev->lock, flags);
 	if (retval == -ENOMEM)
 enomem:
 		defer_kevent(dev, WORK_RX_MEMORY);
+reclaim:
 	if (retval) {
 		DBG(dev, "rx submit --> %d\n", retval);
 		if (skb)
 			dev_kfree_skb_any(skb);
-		spin_lock_irqsave(&dev->req_lock, flags);
-		list_add(&req->list, &dev->rx_reqs);
-		spin_unlock_irqrestore(&dev->req_lock, flags);
+		rx_reclaim(dev, req, owner, generation);
 	}
 	return retval;
 }
@@ -225,6 +259,12 @@ static void rx_complete(struct usb_ep *ep, struct usb_request *req)
 	struct sk_buff	*skb = req->context, *skb2;
 	struct eth_dev	*dev = ep->driver_data;
 	int		status = req->status;
+	u64 generation;
+	unsigned long generation_flags;
+
+	spin_lock_irqsave(&dev->lock, generation_flags);
+	generation = dev->rx_link_generation;
+	spin_unlock_irqrestore(&dev->lock, generation_flags);
 
 	switch (status) {
 
@@ -303,13 +343,11 @@ quiesce:
 		dev_kfree_skb_any(skb);
 	if (!netif_running(dev->net)) {
 clean:
-		spin_lock(&dev->req_lock);
-		list_add(&req->list, &dev->rx_reqs);
-		spin_unlock(&dev->req_lock);
+		rx_reclaim(dev, req, ep, generation);
 		req = NULL;
 	}
 	if (req)
-		rx_submit(dev, req, GFP_ATOMIC);
+		rx_submit(dev, req, GFP_ATOMIC, ep, generation);
 }
 
 static int prealloc(struct list_head *list, struct usb_ep *ep, unsigned n)
@@ -372,24 +410,39 @@ done:
 
 static void rx_fill(struct eth_dev *dev, gfp_t gfp_flags)
 {
-	struct usb_request	*req;
-	unsigned long		flags;
+	struct usb_request *req;
+	struct usb_ep *owner;
+	u64 generation;
+	unsigned long flags;
+	int result;
 
-	/* fill unused rxq slots with some skb */
-	spin_lock_irqsave(&dev->req_lock, flags);
-	while (!list_empty(&dev->rx_reqs)) {
-		req = list_first_entry(&dev->rx_reqs, struct usb_request, list);
-		list_del_init(&req->list);
-		spin_unlock_irqrestore(&dev->req_lock, flags);
-
-		if (rx_submit(dev, req, gfp_flags) < 0) {
-			defer_kevent(dev, WORK_RX_MEMORY);
+	for (;;) {
+		/* Capture the original endpoint with its privately held request. */
+		spin_lock_irqsave(&dev->lock, flags);
+		if (!dev->port_usb || !dev->port_usb->out_ep) {
+			spin_unlock_irqrestore(&dev->lock, flags);
 			return;
 		}
+		owner = dev->port_usb->out_ep;
+		generation = dev->rx_link_generation;
+		spin_lock(&dev->req_lock);
+		if (list_empty(&dev->rx_reqs)) {
+			spin_unlock(&dev->req_lock);
+			spin_unlock_irqrestore(&dev->lock, flags);
+			return;
+		}
+		req = list_first_entry(&dev->rx_reqs, struct usb_request, list);
+		list_del_init(&req->list);
+		spin_unlock(&dev->req_lock);
+		spin_unlock_irqrestore(&dev->lock, flags);
 
-		spin_lock_irqsave(&dev->req_lock, flags);
+		result = rx_submit(dev, req, gfp_flags, owner, generation);
+		if (result < 0) {
+			if (result == -ENOMEM)
+				defer_kevent(dev, WORK_RX_MEMORY);
+			return;
+		}
 	}
-	spin_unlock_irqrestore(&dev->req_lock, flags);
 }
 
 static void eth_work(struct work_struct *work)
@@ -1173,6 +1226,7 @@ struct net_device *gether_connect(struct gether *link)
 		dev->wrap = link->wrap;
 
 		spin_lock(&dev->lock);
+		dev->rx_link_generation++;
 		dev->port_usb = link;
 		if (netif_running(dev->net)) {
 			if (link->open)
@@ -1225,6 +1279,7 @@ void gether_disconnect(struct gether *link)
 	DBG(dev, "%s\n", __func__);
 
 	spin_lock(&dev->lock);
+	dev->rx_link_generation++;
 	dev->port_usb = NULL;
 	link->is_suspend = false;
 	spin_unlock(&dev->lock);
