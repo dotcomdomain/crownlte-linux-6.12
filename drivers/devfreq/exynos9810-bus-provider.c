@@ -13,11 +13,17 @@
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
+#include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 #include <soc/samsung/exynos9810-mif-bts.h>
 #include "exynos9810-bus-transition.h"
 #include "exynos9810-interactive.h"
+#include "governor.h"
+
+enum bus_pm_phase {
+	BUS_ACTIVE, BUS_ENTERING_SLEEP, BUS_SLEEP, BUS_LEAVING_SLEEP, BUS_PM_FAILED,
+};
 
 struct crownlte_bus {
 	struct kref refs;
@@ -27,12 +33,16 @@ struct crownlte_bus {
 	struct exynos9810_bus_table table;
 	struct exynos9810_bus_transition transition;
 	struct exynos9810_interactive_config interactive;
-	struct dev_pm_qos_request default_min, system_min, boot_min;
+	struct dev_pm_qos_request default_min, system_min, boot_min, reboot_max;
+	struct notifier_block reboot_notifier;
+	struct mutex pm_lock;
+	enum bus_pm_phase pm_phase;
+	unsigned long forced_hz;
 	struct delayed_work boot_work;
 	unsigned long frequencies[EXYNOS9810_BUS_LEVELS];
 	unsigned long boot_expires;
 	unsigned int freq_info[6], boot_info[2], added_opps, slot;
-	bool retired, listed, sysfs_ready;
+	bool retired, listed, sysfs_ready, boot_paused, pm_frozen, reboot_registered;
 };
 
 static struct platform_driver crownlte_bus_driver;
@@ -91,6 +101,8 @@ static int bus_current(struct device *dev, unsigned long *hz)
 
 	if (!bus || READ_ONCE(bus->retired))
 		return -ENODEV;
+	if (READ_ONCE(bus->pm_phase) == BUS_PM_FAILED)
+		return -EIO;
 	return exynos9810_bus_transition_current(&bus->transition, hz);
 }
 
@@ -102,6 +114,25 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 
 	if (!bus || READ_ONCE(bus->retired))
 		return -ENODEV;
+	if (bus->pm_phase == BUS_PM_FAILED)
+		return -EIO;
+	if (bus->pm_phase == BUS_SLEEP)
+		return exynos9810_bus_transition_current(&bus->transition, hz);
+	if (bus->forced_hz) {
+		unsigned long minimum, cap;
+
+		/* Suspend ignores ordinary minimum requests as in the old str_freq
+		 * path, but cannot override an active maximum/thermal limit.
+		 */
+		devfreq_get_freq_range(bus->df, &minimum, &cap);
+		if (bus->forced_hz > cap)
+			return -ERANGE;
+		*hz = bus->forced_hz;
+		ret = exynos9810_bus_transition_rate(&bus->transition, *hz);
+		if (ret)
+			return ret;
+		return exynos9810_bus_transition_current(&bus->transition, hz);
+	}
 	opp = devfreq_recommended_opp(dev, hz, flags);
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
@@ -189,7 +220,7 @@ static void bus_boot_work(struct work_struct *work)
 	mutex_lock(&bus_registry_lock);
 	ready = buses_ready();
 	mutex_unlock(&bus_registry_lock);
-	if (READ_ONCE(bus->retired))
+	if (READ_ONCE(bus->retired) || READ_ONCE(bus->boot_paused))
 		return;
 	/* An absent MIF provider may still leave firmware running at a high
 	 * boot rate. Never release a supplier's bootstrap floor in that state.
@@ -206,6 +237,8 @@ static void bus_boot_work(struct work_struct *work)
 
 static void bus_remove_requests(struct crownlte_bus *bus)
 {
+	if (dev_pm_qos_request_active(&bus->reboot_max))
+		dev_pm_qos_remove_request(&bus->reboot_max);
 	if (dev_pm_qos_request_active(&bus->boot_min))
 		dev_pm_qos_remove_request(&bus->boot_min);
 	if (dev_pm_qos_request_active(&bus->system_min))
@@ -341,6 +374,11 @@ static void bus_cleanup(void *data)
 	struct crownlte_bus *bus = data;
 	int ret;
 
+	if (bus->reboot_registered) {
+		unregister_reboot_notifier(&bus->reboot_notifier);
+		bus->reboot_registered = false;
+	}
+
 	mutex_lock(&bus_registry_lock);
 	if (bus->listed) {
 		bus_registry[bus->slot] = NULL;
@@ -373,11 +411,230 @@ static void bus_cleanup(void *data)
 		dev_set_drvdata(bus->dev, NULL);
 }
 
+/* The registry lock protects these short reads against provider withdrawal.
+ * It never spans IPC, frequency operations or work cancellation.
+ */
+static bool bus_pm_order(struct crownlte_bus *bus, bool resume)
+{
+	bool valid;
+	unsigned int i;
+
+	mutex_lock(&bus_registry_lock);
+	valid = buses_ready();
+	if (valid && resume) {
+		for (i = bus->slot + 1; i < 3; i++)
+			valid &= READ_ONCE(bus_registry[i]->pm_phase) == BUS_ACTIVE;
+	} else if (valid) {
+		for (i = 0; i < bus->slot; i++)
+			valid &= READ_ONCE(bus_registry[i]->pm_phase) == BUS_SLEEP;
+	}
+	mutex_unlock(&bus_registry_lock);
+	return valid;
+}
+
+static int bus_update(struct crownlte_bus *bus)
+{
+	int ret;
+
+	mutex_lock(&bus->df->lock);
+	ret = update_devfreq(bus->df);
+	mutex_unlock(&bus->df->lock);
+	return ret;
+}
+
+static void bus_pause_boot(struct crownlte_bus *bus)
+{
+	WRITE_ONCE(bus->boot_paused, true);
+	cancel_delayed_work_sync(&bus->boot_work);
+}
+
+static int bus_unfreeze(struct crownlte_bus *bus)
+{
+	int ret = 0;
+
+	if (bus->pm_frozen) {
+		bus->pm_frozen = false;
+		ret = devfreq_resume_device(bus->df);
+	}
+	if (!ret) {
+		WRITE_ONCE(bus->boot_paused, false);
+		if (bus->boot_min.data.freq.pnode.prio > 0)
+			mod_delayed_work(system_wq, &bus->boot_work, HZ);
+	}
+	return ret;
+}
+
+static int bus_abort_sleep(struct crownlte_bus *bus)
+{
+	int ret;
+
+	if (bus->slot < 2) {
+		/* Even a failed AP-sleep command may have reached firmware. Restore
+		 * acknowledged AP ownership before any ordinary CAL rate write.
+		 */
+		mutex_lock(&bus->df->lock);
+		ret = exynos9810_bus_set_ap_running(bus->dev->of_node, bus->table.cal_id, 1);
+		if (!ret) {
+			bus->forced_hz = 0;
+			bus->pm_phase = BUS_ACTIVE;
+			ret = update_devfreq(bus->df);
+		}
+		if (ret)
+			bus->pm_phase = BUS_PM_FAILED;
+		mutex_unlock(&bus->df->lock);
+	} else {
+		/* Updating our own QoS request can synchronously lock df->lock. */
+		ret = dev_pm_qos_update_request(&bus->default_min, bus->freq_info[1]);
+		if (ret >= 0)
+			ret = bus_update(bus);
+		mutex_lock(&bus->df->lock);
+		bus->pm_phase = ret < 0 ? BUS_PM_FAILED : BUS_ACTIVE;
+		mutex_unlock(&bus->df->lock);
+	}
+	if (!ret)
+		ret = bus_unfreeze(bus);
+	if (ret) {
+		mutex_lock(&bus->df->lock);
+		bus->pm_phase = BUS_PM_FAILED;
+		mutex_unlock(&bus->df->lock);
+	}
+	return ret;
+}
+
+static int __maybe_unused bus_suspend_late(struct device *dev)
+{
+	struct crownlte_bus *bus = dev_get_drvdata(dev);
+	int ret, repair;
+
+	if (!bus)
+		return -ENODEV;
+	mutex_lock(&bus->pm_lock);
+	if (bus->retired || bus->pm_phase != BUS_ACTIVE || !bus_pm_order(bus, false)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	bus_pause_boot(bus);
+	/* ACK increments suspend_count before invoking its governor, including
+	 * error returns. Balance our contribution during rollback in either case.
+	 */
+	bus->pm_frozen = true;
+	ret = devfreq_suspend_device(bus->df);
+	if (ret) {
+		repair = bus_unfreeze(bus);
+		if (repair) {
+			mutex_lock(&bus->df->lock);
+			bus->pm_phase = BUS_PM_FAILED;
+			mutex_unlock(&bus->df->lock);
+			dev_err(dev, "governor freeze rollback failed: %d\n", repair);
+		}
+		goto out;
+	}
+	mutex_lock(&bus->df->lock);
+	bus->pm_phase = BUS_ENTERING_SLEEP;
+	if (bus->slot < 2) {
+		bus->forced_hz = bus->table.resume_khz * 1000UL;
+		ret = exynos9810_bus_set_ap_running(dev->of_node, bus->table.cal_id, 0);
+		if (!ret)
+			ret = update_devfreq(bus->df);
+	} else {
+		ret = 0;
+	}
+	mutex_unlock(&bus->df->lock);
+	if (bus->slot == 2) {
+		ret = dev_pm_qos_update_request(&bus->default_min, bus->table.resume_khz);
+		if (ret >= 0)
+			ret = bus_update(bus);
+	}
+	if (ret) {
+		repair = bus_abort_sleep(bus);
+		if (repair)
+			dev_err(dev, "sleep rollback failed, retained protective state: %d\n", repair);
+		goto out;
+	}
+	mutex_lock(&bus->df->lock);
+	bus->pm_phase = BUS_SLEEP;
+	mutex_unlock(&bus->df->lock);
+out:
+	mutex_unlock(&bus->pm_lock);
+	return ret;
+}
+
+static int __maybe_unused bus_resume_early(struct device *dev)
+{
+	struct crownlte_bus *bus = dev_get_drvdata(dev);
+	int ret;
+
+	if (!bus)
+		return -ENODEV;
+	mutex_lock(&bus->pm_lock);
+	if (bus->retired || bus->pm_phase != BUS_SLEEP || !bus_pm_order(bus, true)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	mutex_lock(&bus->df->lock);
+	bus->pm_phase = BUS_LEAVING_SLEEP;
+	if (bus->slot < 2) {
+		ret = exynos9810_bus_set_ap_running(dev->of_node, bus->table.cal_id, 1);
+		if (!ret) {
+			bus->forced_hz = 0;
+			ret = update_devfreq(bus->df);
+		}
+	} else {
+		ret = 0;
+	}
+	mutex_unlock(&bus->df->lock);
+	if (bus->slot == 2) {
+		ret = dev_pm_qos_update_request(&bus->default_min, bus->freq_info[1]);
+		if (ret >= 0)
+			ret = bus_update(bus);
+	}
+	if (!ret)
+		ret = bus_unfreeze(bus);
+	mutex_lock(&bus->df->lock);
+	bus->pm_phase = ret ? BUS_PM_FAILED : BUS_ACTIVE;
+	mutex_unlock(&bus->df->lock);
+out:
+	mutex_unlock(&bus->pm_lock);
+	return ret;
+}
+
+static int bus_reboot(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct crownlte_bus *bus = container_of(nb, struct crownlte_bus, reboot_notifier);
+	unsigned int khz = min_t(unsigned int, bus->freq_info[5],
+				bus->frequencies[bus->table.count - 1] / 1000);
+	unsigned long actual;
+	int ret;
+
+	mutex_lock(&bus->pm_lock);
+	if (bus->retired || bus->pm_phase != BUS_ACTIVE) {
+		ret = -EBUSY;
+		goto out;
+	}
+	bus_pause_boot(bus);
+	ret = dev_pm_qos_update_request(&bus->default_min, khz);
+	if (ret >= 0)
+		ret = dev_pm_qos_update_request(&bus->reboot_max, khz);
+	if (ret >= 0)
+		ret = bus_update(bus);
+	if (!ret) {
+		ret = bus_current(bus->dev, &actual);
+		if (!ret && actual < khz * 1000UL)
+			ret = -ERANGE;
+	}
+out:
+	mutex_unlock(&bus->pm_lock);
+	if (ret)
+		dev_err(bus->dev, "reboot bus request failed: %d\n", ret);
+	return ret ? NOTIFY_BAD : NOTIFY_OK;
+}
+
 static int bus_read_binding(struct crownlte_bus *bus)
 {
 	struct device_node *np = bus->dev->of_node;
 	const char *type, *text, *governor;
-	u32 id, original_id, polling;
+	u32 id, original_id, polling, channel;
+	unsigned int i;
 	int ret, slot;
 
 	if (of_property_read_u32(np, "samsung,cal-id", &id) ||
@@ -388,6 +645,13 @@ static int bus_read_binding(struct crownlte_bus *bus)
 	if (slot < 0 || strcmp(type, slot == 0 ? "mif" : slot == 1 ? "int" : "fsys0"))
 		return -EINVAL;
 	bus->slot = slot;
+	if (slot < 2) {
+		if (of_property_read_string(np, "use_acpm", &text) || strcmp(text, "true") ||
+		    of_property_read_u32(np, "acpm-ipc-channel", &channel) || channel != 1)
+			return -EINVAL;
+	} else if (!of_property_read_string(np, "use_acpm", &text) && strcmp(text, "false")) {
+		return -EINVAL;
+	}
 	if (of_property_read_u32_array(np, "freq_info", bus->freq_info, 6) ||
 	    of_property_read_u32_array(np, "boot_info", bus->boot_info, 2) ||
 	    of_property_read_u32(np, "polling_ms", &polling) || polling ||
@@ -414,6 +678,12 @@ static int bus_read_binding(struct crownlte_bus *bus)
 					bus->freq_info[4], &bus->table);
 	if (ret)
 		return ret;
+	/* Forced suspend rates must be exact calibrated rows, never extrapolated. */
+	for (i = 0; i < bus->table.count; i++)
+		if (bus->table.levels[i].hz == bus->table.resume_khz * 1000UL)
+			break;
+	if (i == bus->table.count)
+		return -ERANGE;
 	if (of_property_read_string(np, "use_delay_time", &text))
 		return -EINVAL;
 	if (!strcmp(text, "true"))
@@ -441,6 +711,7 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 	if (!bus)
 		return -ENOMEM;
 	kref_init(&bus->refs);
+	mutex_init(&bus->pm_lock);
 	bus->dev = get_device(dev);
 	INIT_DELAYED_WORK(&bus->boot_work, bus_boot_work);
 	ret = devm_add_action_or_reset(dev, bus_owner_put, bus);
@@ -492,6 +763,10 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 				    DEV_PM_QOS_MIN_FREQUENCY, maximum);
 	if (ret < 0)
 		return ret;
+	ret = dev_pm_qos_add_request(dev, &bus->reboot_max,
+				    DEV_PM_QOS_MAX_FREQUENCY, PM_QOS_MAX_FREQUENCY_DEFAULT_VALUE);
+	if (ret < 0)
+		return ret;
 	bus->boot_expires = jiffies + bus->boot_info[0] * HZ;
 	ret = exynos9810_bus_transition_current(&bus->transition, &actual);
 	if (ret)
@@ -529,6 +804,11 @@ static int crownlte_bus_probe(struct platform_device *pdev)
 		return ret;
 	}
 	bus->sysfs_ready = true;
+	bus->reboot_notifier.notifier_call = bus_reboot;
+	ret = register_reboot_notifier(&bus->reboot_notifier);
+	if (ret)
+		return ret;
+	bus->reboot_registered = true;
 	mutex_lock(&bus_registry_lock);
 	if (bus_registry[bus->slot]) {
 		mutex_unlock(&bus_registry_lock);
@@ -553,12 +833,16 @@ static const struct of_device_id crownlte_bus_match[] = {
 	{ .compatible = "samsung,exynos9810-bus-devfreq" }, {}
 };
 MODULE_DEVICE_TABLE(of, crownlte_bus_match);
+static const struct dev_pm_ops bus_pm_ops = {
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(bus_suspend_late, bus_resume_early)
+};
 static struct platform_driver crownlte_bus_driver = {
 	.probe = crownlte_bus_probe,
 	.remove = crownlte_bus_remove,
 	.driver = {
 		.name = "exynos9810-bus-devfreq",
 		.of_match_table = crownlte_bus_match,
+		.pm = &bus_pm_ops,
 		.suppress_bind_attrs = true,
 	},
 };
