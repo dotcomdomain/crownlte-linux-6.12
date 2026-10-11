@@ -22,3 +22,5 @@ obj-$(CONFIG_PM_DEVFREQ_EVENT)		+= event/
 obj-$(CONFIG_EXYNOS9810_BUS_TABLES) += exynos9810-bus-tables.o
 
 obj-$(CONFIG_EXYNOS9810_MIF_BTS) += exynos9810-mif-bts.o
+
+obj-$(CONFIG_EXYNOS9810_BUS_TRANSITIONS) += exynos9810-bus-transition.o

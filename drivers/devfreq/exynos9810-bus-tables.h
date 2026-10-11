@@ -26,6 +26,33 @@ struct exynos9810_bus_table {
 	unsigned int resume_khz;
 };
 
+/* Original FVP AP-state protocol uses devfreq type0/1, not an arbitrary CAL
+ * domain index. FSYS0 has CAL index6 but does not use this release message.
+ */
+static inline int exynos9810_bus_ap_command(unsigned int cal_id,
+		unsigned int running, unsigned int command[4])
+{
+	unsigned int type;
+
+	if (!command || running > 1)
+		return -EINVAL;
+	switch (cal_id) {
+	case EXYNOS9810_MIF_CAL_ID:
+		type = 0;
+		break;
+	case EXYNOS9810_INT_CAL_ID:
+		type = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+	command[0] = type;
+	command[1] = running;
+	command[2] = 5; /* DATA_INIT */
+	command[3] = 2; /* RELEASE */
+	return 0;
+}
+
 /* Exact matching is intentional. Never extrapolate a missing firmware row. */
 static inline int exynos9810_bus_exact_floor(const unsigned int *pairs,
 		unsigned int count, unsigned int khz, unsigned int *floor)
@@ -100,5 +127,7 @@ int exynos9810_bus_build_table(unsigned int cal_id, unsigned int min_khz,
 		unsigned int max_khz, struct exynos9810_bus_table *table);
 int exynos9810_bus_upload_mif_constraints(struct device_node *node,
 		const struct exynos9810_bus_table *table);
+int exynos9810_bus_set_ap_running(struct device_node *node,
+		unsigned int cal_id, unsigned int running);
 
 #endif

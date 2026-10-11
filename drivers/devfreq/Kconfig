@@ -75,6 +75,18 @@ config DEVFREQ_GOV_PASSIVE
 
 comment "DEVFREQ Drivers"
 
+config EXYNOS9810_BUS_TRANSITIONS
+	bool "Exynos9810 shared real bus frequency transitions"
+	depends on EXYNOS9810_MIF_BTS
+	help
+	  Perform real MIF, INT and FSYS0 CAL rate transitions with verified
+	  mandatory dependency floors and actual BTS writes. Retain protective
+	  requests and report errors when firmware acknowledgments are uncertain.
+	  Provider/governor registration and PM lifecycle handling remain separate
+	  required work. This component does not enable hardware nodes.
+
+
+
 config EXYNOS9810_MIF_BTS
 	bool "Exynos9810 mandatory MIF BTS SNode hardware service"
 	depends on EXYNOS9810_BUS_TABLES && OF

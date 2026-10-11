@@ -146,3 +146,28 @@ int exynos9810_bus_upload_mif_constraints(struct device_node *node,
 	}
 	return 0;
 }
+
+int exynos9810_bus_set_ap_running(struct device_node *node,
+		unsigned int cal_id, unsigned int running)
+{
+	unsigned int channel, size, requested, command[4];
+	struct ipc_config config = {
+		.cmd = command,
+		.response = true,
+		.indirection = false,
+	};
+	int ret;
+
+	ret = exynos9810_bus_ap_command(cal_id, running, command);
+	if (ret)
+		return ret;
+	if (!node || of_property_read_u32(node, "acpm-ipc-channel", &requested) ||
+	    requested != 1)
+		return -EINVAL;
+	ret = acpm_ipc_request_channel(node, NULL, &channel, &size);
+	if (ret)
+		return ret;
+	if (channel != requested || size != sizeof(command))
+		return -EINVAL;
+	return acpm_ipc_send_data(channel, &config);
+}
