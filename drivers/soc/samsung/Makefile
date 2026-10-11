@@ -15,3 +15,5 @@ obj-$(CONFIG_EXYNOS_REGULATOR_COUPLER) += exynos-regulator-coupler.o
 obj-$(CONFIG_SAMSUNG_PM_CHECK)	+= s3c-pm-check.o
 
 obj-$(CONFIG_EXYNOS9810_DIAGNOSTIC) += s9p-clkgate.o
+
+obj-$(CONFIG_EXYNOS9810_DIAGNOSTIC_MUIC) += exynos9810-max77705-muic.o

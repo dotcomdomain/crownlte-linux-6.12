@@ -16,6 +16,7 @@
 	model_info-platform = "android";
 	model_info-subtype = "samsung";
 	model_info-hw_rev = <26>;
+	model_info-system_rev = "028";
 	model_info-hw_rev_end = <255>;
 	chosen {
 		bootargs = "maxcpus=1 panic=30 ro";

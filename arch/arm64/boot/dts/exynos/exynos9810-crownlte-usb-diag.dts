@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Untested USB diagnostic only. UFS remains disabled; no userdata access. */
+#include "exynos9810-crownlte-diag.dts"
+
+&{/} {
+	model = "Samsung Galaxy Note9 crownlte USB diagnostic (unvalidated)";
+	usb_ref_clk: clock-usb-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <26000000>;
+	};
+	usb_bus_clk: clock-usb-bus-stub {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+	};
+	clock-gates {
+		compatible = "s9p,clock-gates";
+		/* Address bases/offsets matched to this modified kernel's cmucal. */
+		s9p,gate-registers = <0x1a242028>, <0x14202014>,
+			<0x142020a8>, <0x142020ac>, <0x1a242064>,
+			<0x1100206c>, <0x11002008>;
+		s9p,pll-enable = <0x1a240220>;
+		s9p,set-registers = <0x14212030 0x4>, <0x143600c4 0>;
+		s9p,or-registers = <0x143600c8 0x2>;
+		/* Read-only clock state to validate the fixed-rate stand-ins. */
+		s9p,dump-registers = <0x1a240220>, <0x1a2418ec>,
+			<0x1a241028>, <0x1a241824>, <0x14201018>,
+			<0x14201814>, <0x110001e0>;
+	};
+};
+
+&pinctrl_cmgp {
+	hsi2c40_bus: hsi2c40-bus-pins {
+		samsung,pins = "gpm14-0", "gpm15-0";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <0>;
+		samsung,pin-drv = <0>;
+	};
+};
+
+&soc {
+	hsi2c_pmic: i2c@14360000 {
+		compatible = "samsung,exynos9810-hsi2c";
+		reg = <0x14360000 0x1000>;
+		interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		clocks = <&usb_bus_clk>, <&usb_bus_clk>;
+		clock-names = "hsi2c", "hsi2c_pclk";
+		clock-frequency = <370000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&hsi2c40_bus>;
+		status = "okay";
+		muic@25 {
+			compatible = "samsung,exynos9810-max77705-muic";
+			reg = <0x25>;
+		};
+	};
+};
+
+&usbdrd_phy {
+	clocks = <&usb_ref_clk>, <&usb_bus_clk>;
+	clock-names = "ref", "phy";
+	status = "okay";
+};
+
+&{/soc@0/usb@10c00000} {
+	snps,dis_u2_susphy_quirk;
+	snps,dis_u3_susphy_quirk;
+	status = "okay";
+};

@@ -210,6 +210,7 @@ struct exynos5_i2c {
  * struct exynos_hsi2c_variant - platform specific HSI2C driver data
  * @fifo_depth: the fifo depth supported by the HSI2C module
  * @hw: the hardware variant of Exynos I2C controller
+ * @exynos9810_timings: program vendor bit-pattern timing fields
  *
  * Specifies platform specific configuration of HSI2C module.
  * Note: A structure for driver specific platform data is used for future
@@ -218,6 +219,7 @@ struct exynos5_i2c {
 struct exynos_hsi2c_variant {
 	unsigned int		fifo_depth;
 	enum i2c_type_exynos	hw;
+	bool			exynos9810_timings;
 };
 
 static const struct exynos_hsi2c_variant exynos5250_hsi2c_data = {
@@ -240,7 +242,17 @@ static const struct exynos_hsi2c_variant exynosautov9_hsi2c_data = {
 	.hw		= I2C_TYPE_EXYNOSAUTOV9,
 };
 
+static const struct exynos_hsi2c_variant exynos9810_hsi2c_data = {
+	.fifo_depth = 64,
+	.hw = I2C_TYPE_EXYNOSAUTOV9,
+	.exynos9810_timings = true,
+};
+
 static const struct of_device_id exynos5_i2c_match[] = {
+	{
+		.compatible = "samsung,exynos9810-hsi2c",
+		.data = &exynos9810_hsi2c_data
+	},
 	{
 		.compatible = "samsung,exynos5-hsi2c",
 		.data = &exynos5250_hsi2c_data
@@ -308,6 +320,34 @@ static int exynos5_i2c_set_timing(struct exynos5_i2c *i2c, bool hs_timings)
 	 * Result of (N + M) is always 8.
 	 * In general case, we don't need to control timing_s1 and timing_s2.
 	 */
+	/* Vendor Exynos9810 fast-mode timing, scoped to its own compatible.
+	 * Source: modified crownlte i2c-exynos5.c, donor adaptation pinned in
+	 * Documentation/crownlte/bringup.txt. Keep AutoV9 behavior unchanged.
+	 */
+	if (i2c->variant->exynos9810_timings) {
+		unsigned int mhz = clkin / 1000000, n, s1, s2, s3;
+		void __iomem *r1 = i2c->regs + (hs_timings ? HSI2C_TIMING_HS1 : HSI2C_TIMING_FS1);
+		void __iomem *r2 = i2c->regs + (hs_timings ? HSI2C_TIMING_HS2 : HSI2C_TIMING_FS2);
+		void __iomem *r3 = i2c->regs + (hs_timings ? HSI2C_TIMING_HS3 : HSI2C_TIMING_FS3);
+
+		if (!op_clk || !clkin)
+			return -EINVAL;
+		div = clkin / (op_clk * 15);
+		if (div > 255)
+			return -EINVAL;
+		n = hs_timings ? (7 * mhz) / ((div + 1) * 100) :
+			(9 * mhz) / ((div + 1) * 10);
+		s2 = ((0xffffffffU >> min(n, 7U)) << min(n, 7U)) & 0xff;
+		n = min(n - 1, 7U);
+		s1 = ((0xffffffffU >> n) << n) & 0xff;
+		s3 = (readl(r3) & ~0x00ff0000) | (div << 16);
+		writel(s3, r3);
+		writel((readl(r2) & ~0xff) | s2, r2);
+		writel((readl(r1) & ~0x00ff0000) | (s1 << 16), r1);
+		dev_info(i2c->dev, "9810 timing: clock=%u bus=%u div=%d SCL=%u\n",
+			 clkin, op_clk, div, clkin / ((div + 1) * 16));
+		return 0;
+	}
 	if (i2c->variant->hw == I2C_TYPE_EXYNOSAUTOV9) {
 		div = ((clkin / (16 * i2c->op_clock)) - 1);
 		i2c_timing_s3 = div << 16;

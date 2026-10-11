@@ -83,3 +83,10 @@ config EXYNOS9810_DIAGNOSTIC
 	help
 	  Optional explicit clock gate MMIO for early bring-up, activated only
 	  when the board supplies a s9p,clock-gates device tree node.
+
+config EXYNOS9810_DIAGNOSTIC_MUIC
+	bool "Exynos9810 diagnostic MAX77705 USB path switch"
+	depends on ARCH_EXYNOS && I2C
+	help
+	  Source-only diagnostic helper for the Note9 MAX77705 Type-C MCU.
+	  Applies the vendor D+/D- path opcode; not the Android MUIC ABI.

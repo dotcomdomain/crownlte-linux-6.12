@@ -30,14 +30,18 @@ There is no claim that the S9+ donor board is interchangeable with the Note9.
 Pstore uses this phone's captured 0xfed10000/0x8000 window. SBoot may clear it
 on restart; retention has not been demonstrated. USB serial is the intended
 runtime log path when the separate USB variant works. If it does not, the
-default diagnostic has only pstore and the shim's pre-kernel framebuffer;
-the current board DT has no enabled UART or Linux display console.
+default diagnostic has only pstore; the current board DT has no enabled UART
+or Linux display console, and the default shim disables framebuffer output.
 
 Isolated uniLoader source: /root/kernel-upgrade/boot-shim/crownlte.
 Kernel relocation 0x92000000 avoids captured SBoot firmware log reservations.
 External initramfs 0x84000000 and loader text 0x87000000 are in actual RAM.
-Actual sizes, DT placement, pixel format and bootloader scanout must be checked
-before making a boot image. No script in this source work writes to the phone.
+The compiled kernel header and DT are checked against exact CPU/RAM/pstore
+values. SBoot static analysis independently shows CPU/DMA/physical framebuffer
+0xcc000000, ARGB8888, 1440x2960 and packed 5760-byte rows; runtime scanout and
+preservation at entry remain unobserved. Display output stays behind a disabled
+flag in the named crownlte shim. No Android boot image has been packed, and
+no script in this source work writes to the phone.
 
 Donor provenance:
 https://github.com/SheroAbi/galaxy-s9plus-mainline-linux
