@@ -526,13 +526,14 @@ static int bus_target(struct device *dev, unsigned long *hz, u32 flags)
 	    (bus->pm_phase == BUS_REBOOTING && !bus->reboot_apply))
 		return exynos9810_bus_transition_current(&bus->transition, hz);
 	if (bus->forced_hz) {
-		unsigned long minimum, cap;
+		unsigned long cap;
 
 		/* Suspend ignores ordinary minimum requests as in the old str_freq
 		 * path, but cannot override an active maximum/thermal limit.
 		 */
-		devfreq_get_freq_range(bus->df, &minimum, &cap);
-		cap = min(cap, bus->private_max_hz);
+		ret = bus_cap_ceiling(bus, &cap);
+		if (ret)
+			return ret;
 		if (bus->forced_hz > cap)
 			return -ERANGE;
 		*hz = bus->forced_hz;
