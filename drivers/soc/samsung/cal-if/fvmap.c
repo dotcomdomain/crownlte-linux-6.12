@@ -207,6 +207,48 @@ static int __init get_vst_margin_volt(char *str)
 early_param("vst_adjust", get_vst_margin_volt);
 #endif
 
+/* Evidence-only validation. No publication, margins, calibration or IO. */
+int fvmap_validate_snapshot(const void *snapshot, size_t bytes)
+{
+	const u8 *base = snapshot;
+	unsigned int count = cmucal_get_list_size(ACPM_VCLK_TYPE);
+	unsigned int i, j;
+
+	if (!snapshot || bytes != FVMAP_SIZE || !count ||
+	    (u64)count * sizeof(struct fvmap_header) > bytes)
+		return -EINVAL;
+	for (i = 0; i < count; i++) {
+		struct fvmap_header header;
+		struct vclk *vclk = cmucal_get_node(ACPM_VCLK_TYPE | i);
+
+		memcpy(&header, base + i * sizeof(header), sizeof(header));
+		if (!vclk || header.num_of_pll > vclk->num_list ||
+		    (header.num_of_lv && !vclk->lut) ||
+		    header.num_of_lv > 48 || header.num_of_pll > header.num_of_members ||
+		    header.num_of_lv != vclk_get_lv_num(ACPM_VCLK_TYPE | i) ||
+		    header.o_ratevolt > bytes ||
+		    (u64)header.num_of_lv * sizeof(struct rate_volt) > bytes - header.o_ratevolt ||
+		    header.o_members > bytes ||
+		    (u64)header.num_of_pll * sizeof(u16) > bytes - header.o_members)
+			return -EINVAL;
+		for (j = 0; j < header.num_of_lv; j++) {
+			struct rate_volt entry;
+
+			memcpy(&entry, base + header.o_ratevolt + j * sizeof(entry), sizeof(entry));
+			if (entry.rate != vclk->lut[j].rate || !entry.volt)
+				return -EPROTO;
+		}
+		for (j = 0; j < header.num_of_pll; j++) {
+			u16 offset;
+
+			memcpy(&offset, base + header.o_members + j * sizeof(offset), sizeof(offset));
+			if (offset > bytes || sizeof(struct pll_header) > bytes - offset)
+				return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 int fvmap_set_raw_voltage_table(unsigned int id, int uV)
 {
 	struct fvmap_header *fvmap_header;
@@ -214,6 +256,10 @@ int fvmap_set_raw_voltage_table(unsigned int id, int uV)
 	int num_of_lv;
 	int idx, i;
 
+	if (!smp_load_acquire(&fvmap_ready) || !sram_fvmap_base)
+		return -ENODEV;
+	if (!IS_ACPM_VCLK(id) || GET_IDX(id) >= cmucal_get_list_size(ACPM_VCLK_TYPE))
+		return -EINVAL;
 	idx = GET_IDX(id);
 
 	fvmap_header = sram_fvmap_base;
@@ -259,6 +305,10 @@ int fvmap_get_raw_voltage_table(unsigned int id)
 	int num_of_lv;
 	unsigned int table[20];
 
+	if (!smp_load_acquire(&fvmap_ready) || !sram_fvmap_base)
+		return -ENODEV;
+	if (!IS_ACPM_VCLK(id) || GET_IDX(id) >= cmucal_get_list_size(ACPM_VCLK_TYPE))
+		return -EINVAL;
 	idx = GET_IDX(id);
 
 	fvmap_header = sram_fvmap_base;

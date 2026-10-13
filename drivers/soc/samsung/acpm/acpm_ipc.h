@@ -3,6 +3,31 @@
 
 #include <soc/samsung/acpm_ipc_ctrl.h>
 
+/* This diagnostic API owns RAM copies and never lends an __iomem pointer. */
+#define ACPM_PLUGIN_NAME_SIZE 50
+/* Explicit allocation/work ceiling, separate from firmware ABI validity. */
+#define ACPM_SNAPSHOT_MAX_PLUGINS 256
+#define ACPM_SNAPSHOT_FVMAP_BYTES (8 * 1024)
+struct acpm_plugin_snapshot {
+	u32 id;
+	u32 base;
+	u32 bytes;
+	bool attached;
+	char name[ACPM_PLUGIN_NAME_SIZE];
+};
+struct acpm_firmware_snapshot {
+	u32 num_plugins;
+	struct acpm_plugin_snapshot *plugins;
+	void *fvmap;
+	u32 fvmap_plugin;
+};
+int acpm_ipc_copy_firmware_snapshot(struct device *framework,
+				   struct acpm_firmware_snapshot *snapshot);
+void acpm_ipc_free_firmware_snapshot(struct acpm_firmware_snapshot *snapshot);
+
+int acpm_ipc_bind_framework(struct device *framework);
+void acpm_ipc_unbind_framework(struct device *framework);
+
 struct buff_info {
 	void __iomem *rear;
 	void __iomem *front;

@@ -8,6 +8,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/firmware.h>
@@ -31,147 +32,39 @@ static unsigned long long ipc_time_start;
 static unsigned long long ipc_time_end;
 
 static struct acpm_info *exynos_acpm;
+/* Always outside the IPC metadata mutex. No IPC callback takes this lock. */
+static DEFINE_MUTEX(acpm_framework_lock);
 
 static int acpm_send_data(struct device_node *node, unsigned int check_id,
 		struct ipc_config *config);
 
-static int handle_dynamic_plugin(struct device_node *node, unsigned int id, unsigned int attach)
+
+
+
+
+
+
+static int plugins_init(struct device *framework)
 {
-	struct ipc_config config;
-	unsigned int cmd[4] = {0, };
-	int ret = 0;
+	struct acpm_firmware_snapshot snapshot;
+	int ret;
 
-	config.cmd = cmd;
-	if (attach)
-		config.cmd[0] = (1 << ACPM_IPC_PROTOCOL_DP_A);
-	else
-		config.cmd[0] = (1 << ACPM_IPC_PROTOCOL_DP_D);
-
-	config.cmd[0] |= id << ACPM_IPC_PROTOCOL_ID;
-
-	config.response = true;
-	config.indirection = false;
-
-	ret = acpm_send_data(node, id, &config);
-
-	config.cmd = NULL;
-
-	if (!ret) {
-		if (attach)
-			pr_info("[ACPM] plugin(id = %d) attach done!\n", id);
+	ret = acpm_ipc_copy_firmware_snapshot(framework, &snapshot);
+	if (ret) {
+		dev_err(framework, "ACPM diagnostic snapshot unavailable: %d\n", ret);
+		return ret;
+	}
+	if (!snapshot.fvmap) {
+		ret = -ENODATA;
+		dev_err(framework, "ACPM diagnostic snapshot has no attached DVFS FVMap\n");
+	} else {
+		ret = fvmap_validate_snapshot(snapshot.fvmap, ACPM_SNAPSHOT_FVMAP_BYTES);
+		if (ret)
+			dev_err(framework, "ACPM owned FVMap validation failed: %d\n", ret);
 		else
-			pr_info("[ACPM] plugin(id = %d) detach done!\n", id);
+			dev_info(framework, "ACPM owned FVMap snapshot validated; voltage tables remain unavailable\n");
 	}
-
-	return ret;
-}
-
-static void firmware_load(void *base, const char *firmware, int size)
-{
-	memcpy(base, firmware, size);
-}
-
-static int firmware_update(struct device *dev, void *fw_base, const char *fw_name)
-{
-	const struct firmware *fw_entry = NULL;
-	int err;
-
-	dev_info(dev, "Loading %s firmware ... ", fw_name);
-	err = request_firmware(&fw_entry, fw_name, dev);
-	if (err || !fw_entry) {
-		dev_err(dev, "firmware request FAIL \n");
-		return err;
-	}
-
-	firmware_load(fw_base, fw_entry->data, fw_entry->size);
-
-	dev_info(dev, "OK \n");
-
-	release_firmware(fw_entry);
-
-	return 0;
-}
-
-static int plugins_init(void)
-{
-	struct plugin *plugins;
-	int i, len, ret = 0;
-	unsigned int plugin_id;
-	char name[50];
-	const char *fw_name = NULL;
-	void __iomem *fw_base_addr;
-	struct device_node *node, *child;
-	const __be32 *prop;
-	unsigned int offset;
-
-	plugins = (struct plugin *)(acpm_srambase + acpm_initdata->plugins);
-
-	for (i = 0; i < acpm_initdata->num_plugins; i++) {
-		if ((plugins[i].is_attached == 0 && plugins[i].stay_attached == 1) ||
-			(plugins[i].is_attached == 1 && plugins[i].stay_attached == 0)) {
-			dev_err(exynos_acpm->dev, "dynamic firmware changes disabled during bring-up\n");
-			return -EOPNOTSUPP;
-
-			if (plugins[i].is_attached == 0 && plugins[i].stay_attached == 1) {
-				fw_name = (const char *)(acpm_srambase + plugins[i].fw_name);
-				if (!plugins[i].fw_name) {
-					dev_err(exynos_acpm->dev, "fw_name missing on plugins %d.\n", plugins[i].id);
-					return -ENOENT;
-				}
-
-				fw_base_addr = acpm_srambase + (plugins[i].base_addr & ~0x1);
-				if (!plugins[i].base_addr) {
-					dev_err(exynos_acpm->dev, "base_addr missing on plugins %d.\n", plugins[i].id);
-					return -ENOENT;
-				}
-
-				/* Override fw_name from acpm firmware if it is described on DT. */
-				node = of_get_child_by_name(exynos_acpm->dev->of_node, "dynamic-plugins");
-				for_each_child_of_node(node, child) {
-					prop = of_get_property(child, "plugin-id", &len);
-					if (!prop)
-						continue;
-					plugin_id = be32_to_cpup(prop);
-
-					if (plugin_id != i)
-						continue;
-
-					if (of_property_read_string(child, "fw-name", &fw_name)) {
-						dev_err(exynos_acpm->dev, "fw name of plugin %d is invalid in DT.\n", i);
-						return -EINVAL;
-					}
-				}
-
-				strncpy(name, fw_name, 50);
-				name[49]= 0;
-
-				firmware_update(exynos_acpm->dev, fw_base_addr, name);
-			}
-
-			ret = handle_dynamic_plugin(exynos_acpm->dev->of_node, plugins[i].id, plugins[i].stay_attached);
-			if (ret < 0)
-				dev_err(exynos_acpm->dev, "plugin attach/detach:%u fail! plugin_id:%d, ret:%d",
-						plugins[i].stay_attached, plugins[i].id, ret);
-
-			if (fw_name && strstr(fw_name, "dvfs"))
-				fvmap_init(fw_base_addr + plugins[i].size);
-
-		} else if (plugins[i].is_attached == 1 && plugins[i].stay_attached == 1) {
-			fw_name = (const char *)(acpm_srambase + plugins[i].fw_name);
-
-			if (plugins[i].fw_name && fw_name &&
-					(strstr(fw_name, "DVFS") || strstr(fw_name, "dvfs"))) {
-
-				fw_base_addr = acpm_srambase + (plugins[i].base_addr & ~0x1);
-				prop = of_get_property(exynos_acpm->dev->of_node, "fvmap_offset", &len);
-				if (prop) {
-					offset = be32_to_cpup(prop);
-					fvmap_init(fw_base_addr + offset);
-				}
-			}
-		}
-	}
-
+	acpm_ipc_free_firmware_snapshot(&snapshot);
 	return ret;
 }
 
@@ -342,7 +235,7 @@ static int acpm_send_data(struct device_node *node, unsigned int check_id,
 	return ret;
 }
 
-static int acpm_probe(struct platform_device *pdev)
+static int acpm_probe_core(struct platform_device *pdev)
 {
 	struct acpm_info *acpm;
 	struct device_node *node = pdev->dev.of_node;
@@ -369,11 +262,15 @@ static int acpm_probe(struct platform_device *pdev)
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "timer_apm");
 	acpm->timer_base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(acpm->timer_base))
-		dev_info(&pdev->dev, "could not find timer base addr \n");
+		return PTR_ERR(acpm->timer_base);
 
-		if (of_property_read_u32(node, "peritimer-cnt", &acpm->timer_cnt))
+	if (of_property_read_u32(node, "peritimer-cnt", &acpm->timer_cnt))
 		pr_warn("No matching property: peritiemr_cnt\n");
 
+	ret = acpm_ipc_bind_framework(&pdev->dev);
+	if (ret)
+		return ret;
+	platform_set_drvdata(pdev, acpm);
 	exynos_acpm = acpm;
 
 	acpm_debugfs_init(acpm);
@@ -382,8 +279,25 @@ static int acpm_probe(struct platform_device *pdev)
 	return ret;
 }
 
+static int acpm_probe(struct platform_device *pdev)
+{
+	int ret;
+
+	mutex_lock(&acpm_framework_lock);
+	ret = exynos_acpm ? -EBUSY : acpm_probe_core(pdev);
+	mutex_unlock(&acpm_framework_lock);
+	return ret;
+}
+
 static void acpm_remove(struct platform_device *pdev)
 {
+	mutex_lock(&acpm_framework_lock);
+	if (exynos_acpm && exynos_acpm == platform_get_drvdata(pdev)) {
+		acpm_ipc_unbind_framework(&pdev->dev);
+		exynos_acpm = NULL;
+		platform_set_drvdata(pdev, NULL);
+	}
+	mutex_unlock(&acpm_framework_lock);
 }
 
 static const struct of_device_id acpm_match[] = {
@@ -409,14 +323,15 @@ arch_initcall_sync(exynos_acpm_init);
 
 static int __init exynos_acpm_binary_update(void)
 {
-	int ret;
+	int ret = -ENODEV;
 
-	acpm_ipc_set_waiting_mode(BUSY_WAIT);
-
-	if (!exynos_acpm || !acpm_initdata || !acpm_srambase)
-		return -ENODEV;
-	ret = plugins_init();
-
+	/* This one-shot diagnostic scan does not enable firmware updates or
+	 * publish voltage tables, and does not pretend to implement deferral.
+	 */
+	mutex_lock(&acpm_framework_lock);
+	if (exynos_acpm)
+		ret = plugins_init(exynos_acpm->dev);
+	mutex_unlock(&acpm_framework_lock);
 	return ret;
 }
 fs_initcall_sync(exynos_acpm_binary_update);

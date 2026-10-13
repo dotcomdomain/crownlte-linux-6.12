@@ -44,9 +44,15 @@ struct dvfs_table {
 };
 
 #ifdef CONFIG_ACPM_DVFS
+int fvmap_validate_snapshot(const void *snapshot, size_t bytes);
 extern int fvmap_init(void __iomem *sram_base);
 extern int fvmap_get_voltage_table(unsigned int id, unsigned int *table);
 #else
+static inline int fvmap_validate_snapshot(const void *snapshot, size_t bytes)
+{
+	return -ENODEV;
+}
+
 static inline int fvmap_init(void __iomem *sram_base)
 {
 	return 0;

@@ -8,6 +8,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/timekeeping.h>
 #include <linux/kernel.h>
 #include <linux/sched/clock.h>
@@ -36,8 +37,11 @@ static struct workqueue_struct *update_log_wq;
 static struct acpm_debug_info *acpm_debug;
 static bool is_acpm_stop_log = false;
 static bool acpm_stop_log_req = false;
-struct acpm_framework *acpm_initdata;
-void __iomem *acpm_srambase;
+/* Metadata readers and supplier retirement share this mutex. */
+static DEFINE_MUTEX(acpm_state_lock);
+static struct device *acpm_framework_device;
+static struct device_node *acpm_framework_supplier;
+static bool acpm_irq_requested;
 struct regulator_ss_info regulator_ss[REGULATOR_SS_MAX];
 char reg_map[0x100] = {0};
 bool is_set_regmap = false;
@@ -56,6 +60,8 @@ void acpm_fw_log_level(unsigned int on)
 
 void acpm_ramdump(void)
 {
+	if (!smp_load_acquire(&acpm_ipc_ready) || !acpm_debug)
+		return;
 #ifdef CONFIG_EXYNOS_SNAPSHOT_ACPM
 	if (acpm_debug->dump_size)
 		memcpy(acpm_debug->dump_dram_base, acpm_debug->dump_base, acpm_debug->dump_size);
@@ -238,8 +244,9 @@ static void acpm_debug_logging(struct work_struct *work)
 	acpm_log_print();
 	timestamp_write();
 
-	queue_delayed_work(debug_logging_wq, &acpm_debug->periodic_work,
-			msecs_to_jiffies(acpm_debug->period));
+	if (smp_load_acquire(&acpm_ipc_ready))
+		queue_delayed_work(debug_logging_wq, &acpm_debug->periodic_work,
+				msecs_to_jiffies(acpm_debug->period));
 }
 
 int acpm_ipc_set_ch_mode(struct device_node *np, bool polling)
@@ -834,7 +841,7 @@ static int log_buffer_init(struct device *dev, struct device_node *node)
 {
 	const __be32 *prop;
 	unsigned int num_timestamps = 0;
-	unsigned int len = 0;
+	int len = 0;
 	unsigned int dump_base = 0;
 	unsigned int dump_size = 0;
 
@@ -846,6 +853,10 @@ static int log_buffer_init(struct device *dev, struct device_node *node)
 	if (!acpm_debug)
 		return -ENOMEM;
 	if (!num_timestamps || num_timestamps > 4096 ||
+	    acpm_ipc->initdata->ktime_index % sizeof(u32) ||
+	    acpm_ipc->initdata->log_buf_rear % sizeof(u32) ||
+	    acpm_ipc->initdata->log_buf_front % sizeof(u32) ||
+	    acpm_ipc->initdata->log_data % sizeof(u32) ||
 	    !acpm_sram_range(acpm_ipc->initdata->ktime_index, sizeof(u32)) ||
 	    !acpm_sram_range(acpm_ipc->initdata->log_buf_rear, sizeof(u32)) ||
 	    !acpm_sram_range(acpm_ipc->initdata->log_buf_front, sizeof(u32)) ||
@@ -905,78 +916,382 @@ static bool acpm_sram_range(u32 offset, u64 bytes)
 	return offset <= acpm_sram_size && bytes <= acpm_sram_size - offset;
 }
 
-static int channel_init(void)
+/* ACPM's original SRAM paths use aligned 32-bit accesses. Preserve that
+ * width and decode little-endian bytes in RAM, including odd name offsets.
+ * The rounded backing-word extent is checked before the first read.
+ */
+static int acpm_sram_copy(struct acpm_ipc_info *ipc, u32 offset,
+			  void *destination, size_t bytes)
 {
-	int i;
-	unsigned int mask = 0;
-	struct ipc_channel *ipc_ch;
+	u8 *out = destination;
+	u64 position = offset;
+	u64 first = position & ~3ULL;
+	u64 end = position + bytes;
+	u64 rounded;
 
-	acpm_ipc->num_channels = acpm_ipc->initdata->ipc_ap_max;
-	if (!acpm_ipc->num_channels || acpm_ipc->num_channels > 32 ||
-	    !acpm_sram_range(acpm_ipc->initdata->ipc_channels,
-		(u64)acpm_ipc->num_channels * sizeof(struct ipc_channel)))
+	if (!bytes)
+		return 0;
+	if (end < position || end > U64_MAX - 3)
 		return -EPROTO;
+	rounded = (end + 3) & ~3ULL;
+	if (!acpm_sram_range(offset, bytes) ||
+	    rounded - first > acpm_sram_size - first)
+		return -EPROTO;
+	while (bytes) {
+		u32 word = readl(ipc->sram_base + (position & ~3ULL));
+		unsigned int start = position & 3;
+		unsigned int take = min_t(size_t, bytes, sizeof(word) - start);
+		unsigned int i;
 
-	acpm_ipc->channel = devm_kzalloc(acpm_ipc->dev,
-			sizeof(struct acpm_ipc_ch) * acpm_ipc->num_channels, GFP_KERNEL);
-	if (!acpm_ipc->channel)
-		return -ENOMEM;
-
-	for (i = 0; i < acpm_ipc->num_channels; i++) {
-		ipc_ch = (struct ipc_channel *)(acpm_ipc->sram_base + acpm_ipc->initdata->ipc_channels);
-		if (ipc_ch[i].id != i ||
-		    (ipc_ch[i].type != TYPE_QUEUE && ipc_ch[i].type != TYPE_BUFFER) ||
-		    (ipc_ch[i].type == TYPE_QUEUE && ipc_ch[i].ch.q_len < 2) ||
-		    !ipc_ch[i].ch.q_elem_size || ipc_ch[i].ch.q_elem_size % 4 ||
-		    !acpm_sram_range(ipc_ch[i].ch.tx_rear, sizeof(u32)) ||
-		    !acpm_sram_range(ipc_ch[i].ch.tx_front, sizeof(u32)) ||
-		    !acpm_sram_range(ipc_ch[i].ch.rx_rear, sizeof(u32)) ||
-		    !acpm_sram_range(ipc_ch[i].ch.rx_front, sizeof(u32)) ||
-		    !acpm_sram_range(ipc_ch[i].ch.tx_base,
-			(u64)max(ipc_ch[i].ch.q_len, 1U) * ipc_ch[i].ch.q_elem_size) ||
-		    !acpm_sram_range(ipc_ch[i].ch.rx_base,
-			(u64)max(ipc_ch[i].ch.q_len, 1U) * ipc_ch[i].ch.q_elem_size) ||
-		    !acpm_sram_range(ipc_ch[i].ch.rx_indr_buf,
-			ipc_ch[i].ch.rx_indr_buf_size))
-			return -EPROTO;
-		acpm_ipc->channel[i].polling = ipc_ch[i].ap_poll;
-		acpm_ipc->channel[i].id = ipc_ch[i].id;
-		acpm_ipc->channel[i].type = ipc_ch[i].type;
-		mask |= acpm_ipc->channel[i].polling << acpm_ipc->channel[i].id;
-
-		/* Channel's RX buffer info */
-		acpm_ipc->channel[i].rx_ch.size = ipc_ch[i].ch.q_elem_size;
-		acpm_ipc->channel[i].rx_ch.len = ipc_ch[i].ch.q_len;
-		acpm_ipc->channel[i].rx_ch.rear = acpm_ipc->sram_base + ipc_ch[i].ch.tx_rear;
-		acpm_ipc->channel[i].rx_ch.front = acpm_ipc->sram_base + ipc_ch[i].ch.tx_front;
-		acpm_ipc->channel[i].rx_ch.base = acpm_ipc->sram_base + ipc_ch[i].ch.tx_base;
-		/* Channel's TX buffer info */
-		acpm_ipc->channel[i].tx_ch.size = ipc_ch[i].ch.q_elem_size;
-		acpm_ipc->channel[i].tx_ch.len = ipc_ch[i].ch.q_len;
-		acpm_ipc->channel[i].tx_ch.rear = acpm_ipc->sram_base + ipc_ch[i].ch.rx_rear;
-		acpm_ipc->channel[i].tx_ch.front = acpm_ipc->sram_base + ipc_ch[i].ch.rx_front;
-		acpm_ipc->channel[i].tx_ch.base = acpm_ipc->sram_base + ipc_ch[i].ch.rx_base;
-		acpm_ipc->channel[i].tx_ch.d_buff_size = ipc_ch[i].ch.rx_indr_buf_size;
-		acpm_ipc->channel[i].tx_ch.direction = acpm_ipc->sram_base + ipc_ch[i].ch.rx_indr_buf;
-
-		acpm_ipc->channel[i].cmd = devm_kzalloc(acpm_ipc->dev,
-				acpm_ipc->channel[i].tx_ch.size, GFP_KERNEL);
-		if (!acpm_ipc->channel[i].cmd)
-			return -ENOMEM;
-
-		init_completion(&acpm_ipc->channel[i].wait);
-		spin_lock_init(&acpm_ipc->channel[i].rx_lock);
-		spin_lock_init(&acpm_ipc->channel[i].tx_lock);
-		spin_lock_init(&acpm_ipc->channel[i].ch_lock);
-		INIT_LIST_HEAD(&acpm_ipc->channel[i].list);
+		for (i = 0; i < take; i++)
+			out[i] = word >> ((start + i) * 8);
+		out += take;
+		position += take;
+		bytes -= take;
 	}
-
-	__raw_writel(mask, acpm_ipc->intr + INTMR1);
-
 	return 0;
 }
 
-static int acpm_ipc_probe(struct platform_device *pdev)
+static int channel_init(void)
+{
+	unsigned int mask = 0;
+	unsigned int i;
+	struct ipc_channel wire;
+	u64 table_bytes;
+	int ret;
+
+	acpm_ipc->num_channels = acpm_ipc->initdata->ipc_ap_max;
+	table_bytes = (u64)acpm_ipc->num_channels * sizeof(wire);
+	if (!acpm_ipc->num_channels || acpm_ipc->num_channels > 32 ||
+	    acpm_ipc->initdata->ipc_channels % sizeof(u32) ||
+	    !acpm_sram_range(acpm_ipc->initdata->ipc_channels, table_bytes)) {
+		dev_err(acpm_ipc->dev, "ACPM channel table rejects count=%u offset=%#x bytes=%llu\n",
+			acpm_ipc->num_channels, acpm_ipc->initdata->ipc_channels,
+			table_bytes);
+		return -EPROTO;
+	}
+	acpm_ipc->channel = devm_kcalloc(acpm_ipc->dev, acpm_ipc->num_channels,
+				       sizeof(*acpm_ipc->channel), GFP_KERNEL);
+	if (!acpm_ipc->channel)
+		return -ENOMEM;
+	for (i = 0; i < acpm_ipc->num_channels; i++) {
+		const char *reason = NULL;
+		struct acpm_ipc_ch *channel = &acpm_ipc->channel[i];
+
+		/* Every validation and pointer below uses this same RAM copy. */
+		ret = acpm_sram_copy(acpm_ipc,
+				     acpm_ipc->initdata->ipc_channels + i * sizeof(wire),
+				     &wire, sizeof(wire));
+		if (ret)
+			return ret;
+		if (wire.id != i)
+			reason = "id-index";
+		else if (wire.type != TYPE_QUEUE && wire.type != TYPE_BUFFER)
+			reason = "type";
+		else if (wire.ap_poll > 1)
+			reason = "polling";
+		else if (wire.type == TYPE_QUEUE && wire.ch.q_len < 2)
+			reason = "queue-length";
+		else if (!wire.ch.q_elem_size || wire.ch.q_elem_size % sizeof(u32))
+			reason = "element-size";
+		else if (wire.ch.tx_rear % sizeof(u32) ||
+			 wire.ch.tx_front % sizeof(u32) ||
+			 wire.ch.rx_rear % sizeof(u32) ||
+			 wire.ch.rx_front % sizeof(u32) ||
+			 wire.ch.tx_base % sizeof(u32) ||
+			 wire.ch.rx_base % sizeof(u32) ||
+			 (wire.ch.rx_indr_buf_size && wire.ch.rx_indr_buf % sizeof(u32)))
+			reason = "word-alignment";
+		else if (!acpm_sram_range(wire.ch.tx_rear, sizeof(u32)))
+			reason = "tx-rear";
+		else if (!acpm_sram_range(wire.ch.tx_front, sizeof(u32)))
+			reason = "tx-front";
+		else if (!acpm_sram_range(wire.ch.rx_rear, sizeof(u32)))
+			reason = "rx-rear";
+		else if (!acpm_sram_range(wire.ch.rx_front, sizeof(u32)))
+			reason = "rx-front";
+		else if (!acpm_sram_range(wire.ch.tx_base,
+			 (u64)max(wire.ch.q_len, 1U) * wire.ch.q_elem_size))
+			reason = "tx-queue";
+		else if (!acpm_sram_range(wire.ch.rx_base,
+			 (u64)max(wire.ch.q_len, 1U) * wire.ch.q_elem_size))
+			reason = "rx-queue";
+		else if (!acpm_sram_range(wire.ch.rx_indr_buf, wire.ch.rx_indr_buf_size))
+			reason = "indirection";
+		if (reason) {
+			dev_err(acpm_ipc->dev,
+				"ACPM channel rejects %s index=%u id=%u type=%u polling=%u length=%u element=%u tx=%#x/%#x/%#x rx=%#x/%#x/%#x indr=%#x/%u\n",
+				reason, i, wire.id, wire.type, wire.ap_poll,
+				wire.ch.q_len, wire.ch.q_elem_size,
+				wire.ch.tx_rear, wire.ch.tx_front, wire.ch.tx_base,
+				wire.ch.rx_rear, wire.ch.rx_front, wire.ch.rx_base,
+				wire.ch.rx_indr_buf, wire.ch.rx_indr_buf_size);
+			return -EPROTO;
+		}
+		channel->polling = wire.ap_poll;
+		channel->id = wire.id;
+		channel->type = wire.type;
+		mask |= (u32)channel->polling << channel->id;
+		channel->rx_ch.size = wire.ch.q_elem_size;
+		channel->rx_ch.len = wire.ch.q_len;
+		channel->rx_ch.rear = acpm_ipc->sram_base + wire.ch.tx_rear;
+		channel->rx_ch.front = acpm_ipc->sram_base + wire.ch.tx_front;
+		channel->rx_ch.base = acpm_ipc->sram_base + wire.ch.tx_base;
+		channel->tx_ch.size = wire.ch.q_elem_size;
+		channel->tx_ch.len = wire.ch.q_len;
+		channel->tx_ch.rear = acpm_ipc->sram_base + wire.ch.rx_rear;
+		channel->tx_ch.front = acpm_ipc->sram_base + wire.ch.rx_front;
+		channel->tx_ch.base = acpm_ipc->sram_base + wire.ch.rx_base;
+		channel->tx_ch.d_buff_size = wire.ch.rx_indr_buf_size;
+		channel->tx_ch.direction = acpm_ipc->sram_base + wire.ch.rx_indr_buf;
+		channel->cmd = devm_kzalloc(acpm_ipc->dev, channel->tx_ch.size, GFP_KERNEL);
+		if (!channel->cmd)
+			return -ENOMEM;
+		init_completion(&channel->wait);
+		spin_lock_init(&channel->rx_lock);
+		spin_lock_init(&channel->tx_lock);
+		spin_lock_init(&channel->ch_lock);
+		INIT_LIST_HEAD(&channel->list);
+	}
+	__raw_writel(mask, acpm_ipc->intr + INTMR1);
+	return 0;
+}
+
+/* Private registration binds the exact framework device to the sole enabled
+ * IPC supplier. No compatible-string-only caller can read metadata.
+ * Framework lifecycle mutex -> acpm_state_lock; never the reverse.
+ */
+int acpm_ipc_bind_framework(struct device *framework)
+{
+	struct device_node *node, *supplier = NULL;
+	unsigned int count = 0;
+	u32 channel;
+	int ret = 0;
+
+	if (!framework || !framework->of_node ||
+	    !of_device_is_compatible(framework->of_node, "samsung,exynos-acpm") ||
+	    !of_device_is_available(framework->of_node) ||
+	    of_property_read_u32(framework->of_node, "acpm-ipc-channel", &channel) ||
+	    channel != 4)
+		return -EINVAL;
+	for_each_compatible_node(node, NULL, "samsung,exynos-acpm-ipc") {
+		if (!of_device_is_available(node))
+			continue;
+		count++;
+		if (!supplier)
+			supplier = of_node_get(node);
+	}
+	if (count != 1) {
+		of_node_put(supplier);
+		return -ENODEV;
+	}
+	mutex_lock(&acpm_state_lock);
+	if (acpm_framework_device ||
+	    (acpm_ipc && acpm_ipc->dev->of_node != supplier)) {
+		ret = -EBUSY;
+	} else {
+		acpm_framework_device = get_device(framework);
+		acpm_framework_supplier = supplier;
+		supplier = NULL;
+	}
+	mutex_unlock(&acpm_state_lock);
+	of_node_put(supplier);
+	return ret;
+}
+
+void acpm_ipc_unbind_framework(struct device *framework)
+{
+	struct device *retired = NULL;
+	struct device_node *supplier = NULL;
+
+	mutex_lock(&acpm_state_lock);
+	if (acpm_framework_device == framework) {
+		retired = acpm_framework_device;
+		supplier = acpm_framework_supplier;
+		acpm_framework_device = NULL;
+		acpm_framework_supplier = NULL;
+	}
+	mutex_unlock(&acpm_state_lock);
+	of_node_put(supplier);
+	put_device(retired);
+}
+
+/* Owned diagnostic metadata only. No SRAM pointer escapes this interface. */
+void acpm_ipc_free_firmware_snapshot(struct acpm_firmware_snapshot *snapshot)
+{
+	if (!snapshot)
+		return;
+	kfree(snapshot->plugins);
+	kfree(snapshot->fvmap);
+	memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int acpm_snapshot_name(struct acpm_ipc_info *ipc, u32 offset,
+			     char name[ACPM_PLUGIN_NAME_SIZE])
+{
+	unsigned int i;
+	int ret;
+
+	memset(name, 0, ACPM_PLUGIN_NAME_SIZE);
+	/* Missing optional names retain the original no-match behavior. */
+	if (!offset)
+		return 0;
+	if (!acpm_sram_range(offset, 1))
+		return -EPROTO;
+	for (i = 0; i < ACPM_PLUGIN_NAME_SIZE; i++) {
+		if (!acpm_sram_range(offset, (u64)i + 1))
+			return -EPROTO;
+		if ((u64)offset + i > U32_MAX)
+			return -EPROTO;
+		ret = acpm_sram_copy(ipc, offset + i, &name[i], 1);
+		if (ret)
+			return ret;
+		if (!name[i])
+			return 0;
+	}
+	return -ENAMETOOLONG;
+}
+
+int acpm_ipc_copy_firmware_snapshot(struct device *framework,
+				   struct acpm_firmware_snapshot *snapshot)
+{
+	struct acpm_framework header, after;
+	struct acpm_ipc_info *ipc;
+	struct plugin descriptor, again;
+	u32 channel, fv_offset = 0;
+	u64 table_bytes;
+	unsigned int i;
+	bool has_fv_offset;
+	int ret = -ENODEV;
+
+	if (!snapshot)
+		return -EINVAL;
+	memset(snapshot, 0, sizeof(*snapshot));
+	if (!framework || !framework->of_node ||
+	    !of_device_is_compatible(framework->of_node, "samsung,exynos-acpm") ||
+	    !of_device_is_available(framework->of_node) ||
+	    of_property_read_u32(framework->of_node, "acpm-ipc-channel", &channel) ||
+	    channel != 4)
+		return -EINVAL;
+	has_fv_offset = !of_property_read_u32(framework->of_node,
+					     "fvmap_offset", &fv_offset);
+
+	/* Mutex spans every MMIO read; remove waits before devres can unmap. */
+	mutex_lock(&acpm_state_lock);
+	ipc = acpm_ipc;
+	if (framework != acpm_framework_device ||
+	    !smp_load_acquire(&acpm_ipc_ready) || !ipc ||
+	    ipc->dev->of_node != acpm_framework_supplier ||
+	    dev_get_drvdata(ipc->dev) != ipc)
+		goto unlock;
+	ret = acpm_sram_copy(ipc, ipc->initdata_base, &header, sizeof(header));
+	if (ret)
+		goto unlock;
+	table_bytes = (u64)header.num_plugins * sizeof(descriptor);
+	if (header.num_plugins > ACPM_SNAPSHOT_MAX_PLUGINS ||
+	    header.plugins % sizeof(u32) ||
+	    !acpm_sram_range(header.plugins, table_bytes)) {
+		dev_err(ipc->dev, "ACPM snapshot rejects plugin table count=%u offset=%#x bytes=%llu\n",
+			header.num_plugins, header.plugins, table_bytes);
+		ret = -EPROTO;
+		goto unlock;
+	}
+	/* Zero plugins is a valid empty snapshot, as in the original loop. */
+	if (header.num_plugins) {
+		snapshot->plugins = kcalloc(header.num_plugins,
+					    sizeof(*snapshot->plugins), GFP_KERNEL);
+		if (!snapshot->plugins) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+	}
+	snapshot->num_plugins = header.num_plugins;
+	for (i = 0; i < header.num_plugins; i++) {
+		struct acpm_plugin_snapshot *entry = &snapshot->plugins[i];
+		u32 descriptor_offset = header.plugins + i * sizeof(descriptor);
+		char name_again[ACPM_PLUGIN_NAME_SIZE];
+		u64 base;
+
+		ret = acpm_sram_copy(ipc, descriptor_offset, &descriptor, sizeof(descriptor));
+		if (ret)
+			goto unlock;
+		if (descriptor.is_attached > 1 || descriptor.stay_attached > 1) {
+			ret = -EPROTO;
+			goto failed_plugin;
+		}
+		if (descriptor.is_attached != descriptor.stay_attached) {
+			ret = -EOPNOTSUPP;
+			goto failed_plugin;
+		}
+		entry->id = descriptor.id;
+		entry->base = descriptor.base_addr & ~1U;
+		entry->bytes = descriptor.size;
+		entry->attached = descriptor.is_attached;
+		ret = acpm_snapshot_name(ipc, descriptor.fw_name, entry->name);
+		if (ret)
+			goto failed_plugin;
+		if (entry->attached &&
+		    !acpm_sram_range(entry->base, entry->bytes)) {
+			ret = -EPROTO;
+			goto failed_plugin;
+		}
+		if (entry->attached && has_fv_offset &&
+		    (strstr(entry->name, "DVFS") || strstr(entry->name, "dvfs"))) {
+			/* Original attached plugins locate FVMap by DT offset; the
+			 * dynamic path appends it AFTER plugin.size. That field is
+			 * not a documented FVMap-containing allocation extent.
+			 */
+			base = (u64)entry->base + fv_offset;
+			if (snapshot->fvmap || base > U32_MAX || base % sizeof(u32) ||
+			    !acpm_sram_range((u32)base, ACPM_SNAPSHOT_FVMAP_BYTES)) {
+				ret = -EPROTO;
+				goto failed_plugin;
+			}
+			snapshot->fvmap = kmalloc(ACPM_SNAPSHOT_FVMAP_BYTES, GFP_KERNEL);
+			if (!snapshot->fvmap) {
+				ret = -ENOMEM;
+				goto failed_plugin;
+			}
+			ret = acpm_sram_copy(ipc, (u32)base, snapshot->fvmap,
+					     ACPM_SNAPSHOT_FVMAP_BYTES);
+			if (ret)
+				goto failed_plugin;
+			snapshot->fvmap_plugin = entry->id;
+		}
+		/* Detect metadata/name changes rather than rescanning without a bound. */
+		ret = acpm_sram_copy(ipc, descriptor_offset, &again, sizeof(again));
+		if (ret)
+			goto failed_plugin;
+		ret = acpm_snapshot_name(ipc, descriptor.fw_name, name_again);
+		if (ret)
+			goto failed_plugin;
+		if (memcmp(&descriptor, &again, sizeof(descriptor)) ||
+		    memcmp(entry->name, name_again, sizeof(name_again))) {
+			ret = -EAGAIN;
+			goto failed_plugin;
+		}
+		continue;
+failed_plugin:
+		dev_err(ipc->dev, "ACPM snapshot rejects plugin index=%u id=%u name_offset=%#x ret=%d\n",
+			i, descriptor.id, descriptor.fw_name, ret);
+		goto unlock;
+	}
+	ret = acpm_sram_copy(ipc, ipc->initdata_base, &after, sizeof(after));
+	if (ret)
+		goto unlock;
+	if (memcmp(&header, &after, sizeof(header))) {
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	ret = 0;
+unlock:
+	mutex_unlock(&acpm_state_lock);
+	if (ret)
+		acpm_ipc_free_firmware_snapshot(snapshot);
+	return ret;
+}
+
+static int acpm_ipc_probe_core(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node;
 	struct resource *res;
@@ -994,7 +1309,6 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 	acpm_ipc = devm_kzalloc(&pdev->dev,
 			sizeof(struct acpm_ipc_info), GFP_KERNEL);
 
-	smp_store_release(&acpm_ipc_ready, false);
 	if (!acpm_ipc)
 		return -ENOMEM;
 
@@ -1007,6 +1321,8 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
 	if (!res)
 		return -ENODEV;
+	if (res->start % sizeof(u32))
+		return -EPROTO;
 	acpm_sram_size = resource_size(res);
 	acpm_ipc->sram_base = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(acpm_ipc->sram_base))
@@ -1019,11 +1335,17 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Parsing initdata_base failed.\n");
 		return -EINVAL;
 	}
-	if (!acpm_sram_range(acpm_ipc->initdata_base, sizeof(struct acpm_framework)))
+	if (acpm_ipc->initdata_base % sizeof(u32) ||
+	    !acpm_sram_range(acpm_ipc->initdata_base, sizeof(struct acpm_framework)))
 		return -EPROTO;
-	acpm_ipc->initdata = (struct acpm_framework *)(acpm_ipc->sram_base + acpm_ipc->initdata_base);
-	acpm_initdata = acpm_ipc->initdata;
-	acpm_srambase = acpm_ipc->sram_base;
+	acpm_ipc->initdata = devm_kzalloc(&pdev->dev,
+				       sizeof(*acpm_ipc->initdata), GFP_KERNEL);
+	if (!acpm_ipc->initdata)
+		return -ENOMEM;
+	ret = acpm_sram_copy(acpm_ipc, acpm_ipc->initdata_base,
+			     acpm_ipc->initdata, sizeof(*acpm_ipc->initdata));
+	if (ret)
+		return ret;
 
 	acpm_ipc->dev = &pdev->dev;
 
@@ -1045,35 +1367,88 @@ static int acpm_ipc_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	acpm_irq_requested = true;
 
 	update_log_wq = create_freezable_workqueue("acpm_update_log");
 	if (!update_log_wq)
 		return -ENOMEM;
 	INIT_WORK(&acpm_debug->update_log_work, acpm_update_log);
-	smp_store_release(&acpm_ipc_ready, true);
 
 	if (acpm_debug->period) {
 		debug_logging_wq = create_freezable_workqueue("acpm_debug_logging");
-		if (!debug_logging_wq) {
-			smp_store_release(&acpm_ipc_ready, false);
-			destroy_workqueue(update_log_wq);
+		if (!debug_logging_wq)
 			return -ENOMEM;
-		}
 		INIT_DELAYED_WORK(&acpm_debug->periodic_work, acpm_debug_logging);
 
-		queue_delayed_work(debug_logging_wq, &acpm_debug->periodic_work,
-				msecs_to_jiffies(10000));
+
 	}
 
 	/* Publish instance ownership only after the complete successful probe. */
 	platform_set_drvdata(pdev, acpm_ipc);
+	smp_store_release(&acpm_ipc_ready, true);
+	if (debug_logging_wq)
+		queue_delayed_work(debug_logging_wq, &acpm_debug->periodic_work,
+				    msecs_to_jiffies(10000));
+	return ret;
+}
+
+/* Called with acpm_state_lock held. Snapshots have completed before entry.
+ * IRQ/work callbacks may have passed ready already: quiesce them before
+ * withdrawing their legacy globals. This does not retrofit lifetime pins
+ * into arbitrary concurrent legacy transport callers.
+ */
+static void acpm_ipc_retire(struct platform_device *pdev)
+{
+	smp_store_release(&acpm_ipc_ready, false);
+	if (acpm_irq_requested) {
+		devm_free_irq(&pdev->dev, acpm_ipc->irq, acpm_ipc);
+		acpm_irq_requested = false;
+	}
+	if (debug_logging_wq) {
+		cancel_delayed_work_sync(&acpm_debug->periodic_work);
+		destroy_workqueue(debug_logging_wq);
+		debug_logging_wq = NULL;
+	}
+	if (update_log_wq) {
+		cancel_work_sync(&acpm_debug->update_log_work);
+		destroy_workqueue(update_log_wq);
+		update_log_wq = NULL;
+	}
+	if (acpm_debug) {
+		if (acpm_debug->dump_base)
+			iounmap(acpm_debug->dump_base);
+		kfree(acpm_debug->dump_dram_base);
+	}
+	platform_set_drvdata(pdev, NULL);
+	acpm_debug = NULL;
+	acpm_ipc = NULL;
+	acpm_sram_size = 0;
+}
+
+static int acpm_ipc_probe(struct platform_device *pdev)
+{
+	int ret;
+
+	mutex_lock(&acpm_state_lock);
+	if (acpm_ipc ||
+	    (acpm_framework_supplier && pdev->dev.of_node != acpm_framework_supplier)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = acpm_ipc_probe_core(pdev);
+	if (ret)
+		acpm_ipc_retire(pdev);
+out:
+	mutex_unlock(&acpm_state_lock);
 	return ret;
 }
 
 static void acpm_ipc_remove(struct platform_device *pdev)
 {
-	smp_store_release(&acpm_ipc_ready, false);
-	platform_set_drvdata(pdev, NULL);
+	mutex_lock(&acpm_state_lock);
+	if (platform_get_drvdata(pdev) == acpm_ipc && acpm_ipc)
+		acpm_ipc_retire(pdev);
+	mutex_unlock(&acpm_state_lock);
 }
 
 static const struct of_device_id acpm_ipc_match[] = {
