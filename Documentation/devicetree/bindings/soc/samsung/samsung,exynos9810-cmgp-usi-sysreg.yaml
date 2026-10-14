@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/samsung/samsung,exynos9810-cmgp-usi-sysreg.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung Exynos9810 CMGP USI protocol selector
+
+maintainers:
+  - Krzysztof Kozlowski <krzk@kernel.org>
+
+description: |
+  The CMGP USI03 SW_CONF register selects I2C, SPI or UART protocol. This
+  narrow syscon maps only the four-byte selector proven by the crownlte
+  firmware device tree. It does not own the full CMGP System Register bank.
+  The USIv2 parent references the selector at offset zero with samsung,sysreg.
+
+properties:
+  compatible:
+    items:
+      - const: samsung,exynos9810-cmgp-usi-sysreg
+      - const: syscon
+
+  reg:
+    items:
+      - items:
+          - const: 0x14212030
+          - const: 0x4
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    syscon@14212030 {
+        compatible = "samsung,exynos9810-cmgp-usi-sysreg", "syscon";
+        reg = <0x14212030 0x4>;
+    };

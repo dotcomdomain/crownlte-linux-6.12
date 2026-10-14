@@ -157,6 +157,8 @@ static int diagnostic_restart_guard(struct notifier_block *nb,
 	if (ctx) {
 		data.cb_data = ctx;
 		ret = diagnostic_restart_final(&data);
+	} else {
+		pr_emerg("Diagnostic restart context unavailable; physical reset required\n");
 	}
 	rcu_read_unlock();
 	return ret;

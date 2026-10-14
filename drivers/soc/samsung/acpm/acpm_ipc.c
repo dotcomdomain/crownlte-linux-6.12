@@ -956,7 +956,7 @@ static int channel_init(void)
 {
 	unsigned int mask = 0;
 	unsigned int i;
-	struct ipc_channel wire;
+	struct ipc_channel wire, *table;
 	u64 table_bytes;
 	int ret;
 
@@ -974,16 +974,34 @@ static int channel_init(void)
 				       sizeof(*acpm_ipc->channel), GFP_KERNEL);
 	if (!acpm_ipc->channel)
 		return -ENOMEM;
+	/* One bounded owned table supplies both evidence and validation.
+	 * Never dereference unvalidated firmware buffer addresses for logging.
+	 */
+	table = devm_kcalloc(acpm_ipc->dev, acpm_ipc->num_channels,
+			     sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+	ret = acpm_sram_copy(acpm_ipc, acpm_ipc->initdata->ipc_channels,
+			     table, table_bytes);
+	if (ret)
+		return ret;
+	for (i = 0; i < acpm_ipc->num_channels; i++) {
+		wire = table[i];
+		dev_info(acpm_ipc->dev,
+			 "ACPM channel snapshot index=%u id=%u type=%u polling=%u length=%u element=%u tx=%#x/%#x/%#x rx=%#x/%#x/%#x indr=%#x/%u mbox=%#x\n",
+			 i, wire.id, wire.type, wire.ap_poll,
+			 wire.ch.q_len, wire.ch.q_elem_size,
+			 wire.ch.tx_rear, wire.ch.tx_front, wire.ch.tx_base,
+			 wire.ch.rx_rear, wire.ch.rx_front, wire.ch.rx_base,
+			 wire.ch.rx_indr_buf, wire.ch.rx_indr_buf_size,
+			 wire.ch.mbox_addr);
+	}
 	for (i = 0; i < acpm_ipc->num_channels; i++) {
 		const char *reason = NULL;
 		struct acpm_ipc_ch *channel = &acpm_ipc->channel[i];
 
-		/* Every validation and pointer below uses this same RAM copy. */
-		ret = acpm_sram_copy(acpm_ipc,
-				     acpm_ipc->initdata->ipc_channels + i * sizeof(wire),
-				     &wire, sizeof(wire));
-		if (ret)
-			return ret;
+		/* Use exactly the owned descriptor reported above. */
+		wire = table[i];
 		if (wire.id != i)
 			reason = "id-index";
 		else if (wire.type != TYPE_QUEUE && wire.type != TYPE_BUFFER)

@@ -2180,6 +2180,8 @@ static int dwc3_probe(struct platform_device *pdev)
 	void __iomem		*regs;
 	struct dwc3		*dwc;
 	int			ret;
+	bool diagnostic = IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART) &&
+			  of_machine_is_compatible("samsung,crownlte");
 
 	dwc = devm_kzalloc(dev, sizeof(*dwc), GFP_KERNEL);
 	if (!dwc)
@@ -2308,7 +2310,11 @@ static int dwc3_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_free_event_buffers;
 
+	if (diagnostic)
+		dev_info(dev, "crownlte diagnostic core initialization begin\n");
 	ret = dwc3_core_init(dwc);
+	if (diagnostic)
+		dev_info(dev, "crownlte diagnostic core initialization end: %d\n", ret);
 	if (ret) {
 		dev_err_probe(dev, ret, "failed to initialize core\n");
 		goto err_free_event_buffers;
@@ -2317,13 +2323,20 @@ static int dwc3_probe(struct platform_device *pdev)
 	dwc3_check_params(dwc);
 	dwc3_debugfs_init(dwc);
 
+	if (diagnostic)
+		dev_info(dev, "crownlte diagnostic mode initialization begin: %u\n",
+			 dwc->dr_mode);
 	ret = dwc3_core_init_mode(dwc);
+	if (diagnostic)
+		dev_info(dev, "crownlte diagnostic mode initialization end: %d\n", ret);
 	if (ret)
 		goto err_exit_debugfs;
 
 	pm_runtime_put(dev);
 
 	dma_set_max_seg_size(dev, UINT_MAX);
+	if (diagnostic)
+		dev_info(dev, "crownlte diagnostic controller probe complete\n");
 
 	return 0;
 

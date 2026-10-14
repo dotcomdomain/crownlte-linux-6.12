@@ -84,7 +84,24 @@ static const struct exynos_usi_variant exynos850_usi_data = {
 	.clk_names	= exynos850_usi_clk_names,
 };
 
+/* Exynos9810 USIv2 has the same wrapper offsets and SW_CONF bits.
+ * Keep its identity separate from Exynos850. The parent owns the wrapper
+ * and configures it before populating the HSI2C child.
+ */
+static const struct exynos_usi_variant exynos9810_usi_data = {
+	.ver		= USI_VER2,
+	.sw_conf_mask	= USI_V2_SW_CONF_MASK,
+	.min_mode	= USI_V2_NONE,
+	.max_mode	= USI_V2_I2C,
+	.num_clks	= ARRAY_SIZE(exynos850_usi_clk_names),
+	.clk_names	= exynos850_usi_clk_names,
+};
+
 static const struct of_device_id exynos_usi_dt_match[] = {
+	{
+		.compatible = "samsung,exynos9810-usi",
+		.data = &exynos9810_usi_data,
+	},
 	{
 		.compatible = "samsung,exynos850-usi",
 		.data = &exynos850_usi_data,
@@ -154,6 +171,30 @@ static int exynos_usi_enable(const struct exynos_usi *usi)
 		val &= ~USI_OPTION_CLKSTOP_ON;
 		val |= USI_OPTION_CLKREQ_ON;
 		writel(val, usi->regs + USI_OPTION);
+	}
+
+	/* The diagnostic must retain the configured wrapper state while its
+	 * clocks are on. Failure here prevents protocol child population.
+	 */
+	if (usi->data == &exynos9810_usi_data) {
+		u32 sw_conf, con, option;
+
+		ret = regmap_read(usi->sysreg, usi->sw_conf, &sw_conf);
+		con = readl(usi->regs + USI_CON);
+		option = readl(usi->regs + USI_OPTION);
+		if (!ret && ((sw_conf & usi->data->sw_conf_mask) !=
+			     exynos_usi_modes[usi->mode].val ||
+			     (con & USI_CON_RESET) ||
+			     (usi->clkreq_on &&
+			      (option & (USI_OPTION_CLKREQ_ON |
+					 USI_OPTION_CLKSTOP_ON)) !=
+			      USI_OPTION_CLKREQ_ON)))
+			ret = -EIO;
+		if (ret)
+			dev_err(usi->dev, "USIv2 configuration readback failed: %d\n", ret);
+		else
+			dev_info(usi->dev, "USIv2 configured: sw_conf=%08x con=%08x option=%08x\n",
+				 sw_conf, con, option);
 	}
 
 	clk_bulk_disable_unprepare(usi->data->num_clks, usi->clks);

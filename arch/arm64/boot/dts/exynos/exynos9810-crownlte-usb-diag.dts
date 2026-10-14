@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Untested USB diagnostic only. UFS remains disabled; no userdata access. */
 #include "exynos9810-crownlte-diag.dts"
+#include <dt-bindings/soc/samsung,exynos-usi.h>
 
 &{/} {
 	model = "Samsung Galaxy Note9 crownlte USB diagnostic (unvalidated)";
@@ -21,8 +22,6 @@
 			<0x142020a8>, <0x142020ac>, <0x1a242064>,
 			<0x1100206c>, <0x11002008>;
 		s9p,pll-enable = <0x1a240220>;
-		s9p,set-registers = <0x14212030 0x4>, <0x143600c4 0>;
-		s9p,or-registers = <0x143600c8 0x2>;
 		/* Read-only clock state to validate the fixed-rate stand-ins. */
 		s9p,dump-registers = <0x1a240220>, <0x1a2418ec>,
 			<0x1a241028>, <0x1a241824>, <0x14201018>,
@@ -40,21 +39,44 @@
 };
 
 &soc {
-	hsi2c_pmic: i2c@14360000 {
-		compatible = "samsung,exynos9810-hsi2c";
-		reg = <0x14360000 0x1000>;
-		interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>;
-		#address-cells = <1>;
-		#size-cells = <0>;
+	/* Only the selector register proven by the original crownlte DT is
+	 * mapped here; the other CMGP SYSREG registers remain untouched.
+	 */
+	usi_cmgp03_sysreg: syscon@14212030 {
+		compatible = "samsung,exynos9810-cmgp-usi-sysreg", "syscon";
+		reg = <0x14212030 0x4>;
+	};
+
+	usi_pmic: usi@143600c0 {
+		compatible = "samsung,exynos9810-usi";
+		/* Wrapper owns +0xc4/+0xc8; HSI2C below owns only [0,0xc0). */
+		reg = <0x143600c0 0x20>;
 		clocks = <&usb_bus_clk>, <&usb_bus_clk>;
-		clock-names = "hsi2c", "hsi2c_pclk";
-		clock-frequency = <370000>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&hsi2c40_bus>;
+		clock-names = "pclk", "ipclk";
+		samsung,sysreg = <&usi_cmgp03_sysreg 0>;
+		samsung,mode = <USI_V2_I2C>;
+		samsung,clkreq-on;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
 		status = "okay";
-		muic@25 {
-			compatible = "samsung,exynos9810-max77705-muic";
-			reg = <0x25>;
+
+		hsi2c_pmic: i2c@14360000 {
+			compatible = "samsung,exynos9810-hsi2c";
+			reg = <0x14360000 0xc0>;
+			interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			clocks = <&usb_bus_clk>, <&usb_bus_clk>;
+			clock-names = "hsi2c", "hsi2c_pclk";
+			clock-frequency = <370000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&hsi2c40_bus>;
+			status = "okay";
+			muic@25 {
+				compatible = "samsung,exynos9810-max77705-muic";
+				reg = <0x25>;
+			};
 		};
 	};
 };

@@ -16,6 +16,11 @@
 &legacy_acpm_dvfs { status = "okay"; };
 &legacy_acpm_pmic { status = "okay"; };
 
+&usi_pmic {
+	/* Match the original crownlte gate110/rate114 clock ownership. */
+	clocks = <&legacy_cmu GATE_USI_CMGP03>, <&legacy_cmu USI_CMGP03>;
+	clock-names = "pclk", "ipclk";
+};
 &hsi2c_pmic {
 	/* Original live DT rate114 and gate110, in ACK driver clock order. */
 	clocks = <&legacy_cmu USI_CMGP03>, <&legacy_cmu GATE_USI_CMGP03>;

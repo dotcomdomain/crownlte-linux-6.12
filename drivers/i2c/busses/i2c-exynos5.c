@@ -834,6 +834,28 @@ static int exynos5_i2c_xfer_msg(struct exynos5_i2c *i2c,
 		ret = exynos5_i2c_wait_bus_idle(i2c);
 
 	if (ret < 0) {
+		/* Snapshot before reset, scoped to the diagnostic 9810 variant.
+		 * TRANS_STATUS can clear completion state, but this transfer has
+		 * already failed. Do not poll or retry a write merely for logging.
+		 * Wrapper +0xc4/+0xc8 belongs to the USI parent, never read it here.
+		 */
+		if (i2c->variant->exynos9810_timings && ret == -ETIMEDOUT)
+			dev_warn(i2c->dev,
+				 "9810 timeout: addr=%02x len=%u read=%u irq=%u ptr=%u done=%d state=%d "
+				 "ctl=%08x inten=%08x intst=%08x fifo=%08x conf=%08x auto=%08x "
+				 "trans=%08x fs=%08x/%08x/%08x\n",
+				 msgs->addr, msgs->len, !!(msgs->flags & I2C_M_RD),
+				 i2c->irq, i2c->msg_ptr, i2c->trans_done, i2c->state,
+				 readl(i2c->regs + HSI2C_CTL),
+				 readl(i2c->regs + HSI2C_INT_ENABLE),
+				 readl(i2c->regs + HSI2C_INT_STATUS),
+				 readl(i2c->regs + HSI2C_FIFO_STATUS),
+				 readl(i2c->regs + HSI2C_CONF),
+				 readl(i2c->regs + HSI2C_AUTO_CONF),
+				 readl(i2c->regs + HSI2C_TRANS_STATUS),
+				 readl(i2c->regs + HSI2C_TIMING_FS1),
+				 readl(i2c->regs + HSI2C_TIMING_FS2),
+				 readl(i2c->regs + HSI2C_TIMING_FS3));
 		exynos5_i2c_reset(i2c);
 		if (ret == -ETIMEDOUT)
 			dev_warn(i2c->dev, "%s timeout\n",
