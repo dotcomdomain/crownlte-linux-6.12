@@ -32,7 +32,10 @@ int acpm_ipc_send_data_sync(unsigned int channel_id, struct ipc_config *cfg);
 int acpm_ipc_set_ch_mode(struct device_node *np, bool polling);
 #if IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART)
 struct device;
-/* Requires exact supplier reference and a managed device link for lifetime. */
+/* Requires the exact supplier reference plus a managed device link, or a
+ * successfully acquired supplier device lock held across the complete call.
+ * A device reference alone does not protect drvdata or supplier devres.
+ */
 int acpm_ipc_prepare_restart(struct device *supplier, struct device_node *framework);
 #endif
 

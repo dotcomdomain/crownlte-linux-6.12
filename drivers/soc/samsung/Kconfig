@@ -145,3 +145,16 @@ config EXYNOS9810_DIAGNOSTIC_RESTART
 	  Only the explicit crownlte diagnostic restart DT compatible activates
 	  this handler. Failed prerequisites refuse reset and require physical
 	  fallback. Hardware reset and bootloader reason handling are unproven.
+
+config EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET
+	bool "Experimental original-style crownlte diagnostic reset"
+	depends on EXYNOS9810_DIAGNOSTIC_RESTART
+	default n
+	help
+	  Diagnostic-only experiment for the explicit crownlte no-storage DT.
+	  Keep checked normal INFORM reasons, CAL revision, topology and DFD
+	  preparation. Attempt bounded ACPM STOP only when its supplier is owned
+	  and ready, then permit checked PMU SWRESET despite unavailable or failed
+	  STOP, matching the original 4.9 best-effort reset policy.
+	  This may fail to reset or return. Manual Download Mode restore and an
+	  available owner are still required. Never enable for Android production.

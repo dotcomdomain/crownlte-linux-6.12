@@ -58,6 +58,40 @@ static bool diagnostic_reasons_valid(struct diagnostic_restart *ctx)
 	       readl(ctx->pmu + INFORM3) == NORMAL_INFORM3;
 }
 
+/* Diagnostic-only original reset policy. An unavailable or failed STOP
+ * remains visible, but does not veto the independently checked PMU sequence.
+ * The supplier reference alone does not own drvdata or devres. device_trylock
+ * excludes probe/remove and their resource retirement across this entire call.
+ * This function runs in the blocking restart-prepare chain, never final reset.
+ */
+static void diagnostic_optional_stop(struct diagnostic_restart *ctx)
+{
+	int ret = -ENODEV;
+	bool available;
+
+	if (!ctx->supplier) {
+		pr_emerg("Experimental diagnostic STOP unavailable: no supplier device; original-style PMU reset remains permitted\n");
+		return;
+	}
+	/* No dependency wait may prevent this best-effort fallback. */
+	if (!device_trylock(ctx->supplier)) {
+		pr_emerg("Experimental diagnostic STOP unavailable: supplier busy; original-style PMU reset remains permitted\n");
+		return;
+	}
+	available = device_is_bound(ctx->supplier) &&
+		    dev_get_drvdata(ctx->supplier);
+	if (available)
+		ret = acpm_ipc_prepare_restart(ctx->supplier, ctx->framework);
+	device_unlock(ctx->supplier);
+	/* Only owned scalar results survive supplier unlock/possible retirement. */
+	if (!available)
+		pr_emerg("Experimental diagnostic STOP unavailable: supplier unbound or unpublished; original-style PMU reset remains permitted\n");
+	else if (ret)
+		pr_emerg("Experimental diagnostic STOP failed: %d; original-style PMU reset remains permitted\n", ret);
+	else
+		pr_emerg("Experimental diagnostic STOP acknowledged\n");
+}
+
 static int diagnostic_prepare(struct sys_off_data *data)
 {
 	struct diagnostic_restart *ctx = data->cb_data;
@@ -78,10 +112,15 @@ static int diagnostic_prepare(struct sys_off_data *data)
 	if (!diagnostic_reasons_valid(ctx))
 		return NOTIFY_DONE;
 	if (ctx->revision >= 1) {
-		ret = acpm_ipc_prepare_restart(ctx->supplier, ctx->framework);
-		if (ret) {
-			pr_emerg("Diagnostic restart STOP refused: %d\n", ret);
-			return NOTIFY_DONE;
+		if (IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET)) {
+			diagnostic_optional_stop(ctx);
+		} else {
+			/* Keep the existing strict policy when the option is disabled. */
+			ret = acpm_ipc_prepare_restart(ctx->supplier, ctx->framework);
+			if (ret) {
+				pr_emerg("Diagnostic restart STOP refused: %d\n", ret);
+				return NOTIFY_DONE;
+			}
 		}
 	}
 	smp_store_release(&ctx->prepared, true);
@@ -264,23 +303,38 @@ static int diagnostic_restart_probe(struct platform_device *pdev)
 	}
 	supplier = of_find_device_by_node(np);
 	of_node_put(np);
-	if (!supplier)
-		return -EPROBE_DEFER;
-	ctx->supplier = &supplier->dev;
-	ret = devm_add_action_or_reset(dev, diagnostic_supplier_put, ctx->supplier);
-	if (ret)
-		return ret;
-	device_lock(ctx->supplier);
-	if (!device_is_bound(ctx->supplier) || !dev_get_drvdata(ctx->supplier))
-		ret = -EPROBE_DEFER;
-	else if (!device_link_add(dev, ctx->supplier, DL_FLAG_AUTOREMOVE_CONSUMER))
-		ret = -EINVAL;
-	else
-		ret = 0;
-	device_unlock(ctx->supplier);
-	if (ret)
-		return ret;
-	/* Devres unregisters callbacks before the supplier ref and MMIO disappear. */
+	if (IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET)) {
+		/* Optional transport must not control the independent PMU context.
+		 * Keep only a device reference here. A dependency link would make
+		 * supplier unbind retire this reset context. Each STOP call instead
+		 * holds the supplier lock until all owned transport access ends.
+		 */
+		if (supplier) {
+			ctx->supplier = &supplier->dev;
+			ret = devm_add_action_or_reset(dev, diagnostic_supplier_put,
+						       ctx->supplier);
+			if (ret)
+				return ret;
+		}
+	} else {
+		if (!supplier)
+			return -EPROBE_DEFER;
+		ctx->supplier = &supplier->dev;
+		ret = devm_add_action_or_reset(dev, diagnostic_supplier_put, ctx->supplier);
+		if (ret)
+			return ret;
+		device_lock(ctx->supplier);
+		if (!device_is_bound(ctx->supplier) || !dev_get_drvdata(ctx->supplier))
+			ret = -EPROBE_DEFER;
+		else if (!device_link_add(dev, ctx->supplier, DL_FLAG_AUTOREMOVE_CONSUMER))
+			ret = -EINVAL;
+		else
+			ret = 0;
+		device_unlock(ctx->supplier);
+		if (ret)
+			return ret;
+	}
+	/* Devres unregisters callbacks before the optional supplier ref and MMIO disappear. */
 	ctx->command_notifier.notifier_call = diagnostic_command;
 	ret = devm_register_reboot_notifier(dev, &ctx->command_notifier);
 	if (ret)
@@ -298,8 +352,12 @@ static int diagnostic_restart_probe(struct platform_device *pdev)
 	else
 		rcu_assign_pointer(diagnostic_context, ctx);
 	mutex_unlock(&diagnostic_context_lock);
-	if (!ret)
-		dev_info(dev, "Experimental checked diagnostic restart ready; guard installed\n");
+	if (!ret) {
+		if (IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET))
+			dev_warn(dev, "Experimental original-style diagnostic reset ready; STOP best-effort, hardware unproven\n");
+		else
+			dev_info(dev, "Experimental checked diagnostic restart ready; guard installed\n");
+	}
 	return ret;
 }
 

@@ -508,7 +508,10 @@ static void apm_interrupt_gen(unsigned int id)
 }
 
 #if IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART)
-/* Caller pins this exact supplier with a managed device link until unbind. */
+/* Caller pins this exact supplier with a managed device link until unbind,
+ * or holds its device_lock across this entire bounded call. A reference alone
+ * does not protect drvdata/devres. Never call after an unowned failed probe.
+ */
 int acpm_ipc_prepare_restart(struct device *supplier,
 			     struct device_node *framework)
 {
