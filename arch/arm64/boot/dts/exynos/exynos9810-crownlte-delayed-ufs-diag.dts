@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0
+/* First-probe gate and SCSI policy are mandatory. No Android init or mounts.
+ * VCC and pad mux are inherited from sboot for this first transport test.
+ * No regulator driver is enabled in the parent diagnostic configuration. */
+#include "exynos9810-crownlte-real-clock-usb-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS transport diagnostic";
+};
+&soc {
+	diag_sysreg_fsys0: syscon@11010000 {
+		compatible = "samsung,exynos9810-sysreg", "syscon";
+		reg = <0x11010000 0x1000>;
+	};
+};
+&{/soc@0/ufs@11120000} {
+	clocks = <&legacy_cmu GATE_UFS_EMBD>, <&legacy_cmu UFS_EMBD>;
+	clock-names = "GATE_UFS_EMBD", "UFS_EMBD";
+	freq-table-hz = <0 0 0 0>;
+	samsung,pmu-syscon = <&pmu_system_controller 0x724>;
+	samsung,sysreg = <&diag_sysreg_fsys0 0x700 0x300 0x300>;
+	dma-coherent;
+	crownlte,read-only-diagnostic;
+	status = "okay";
+};

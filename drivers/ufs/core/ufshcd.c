@@ -36,6 +36,7 @@
 #include "ufs-fault-injection.h"
 #include "ufs_bsg.h"
 #include "ufshcd-crypto.h"
+#include "ufshcd-readonly.h"
 #include <linux/unaligned.h>
 
 #define CREATE_TRACE_POINTS
@@ -3049,6 +3050,20 @@ static int ufshcd_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *cmd)
 	struct ufshcd_lrb *lrbp;
 	int err = 0;
 	struct ufs_hw_queue *hwq = NULL;
+
+	/* Reject host data writes before DMA mapping, keys or submission. */
+	if (IS_ENABLED(CONFIG_SCSI_UFS_CROWNLTE_DIAGNOSTIC_RO) &&
+	    of_device_is_compatible(hba->dev->of_node, "samsung,exynos9810-ufs") &&
+	    of_property_read_bool(hba->dev->of_node, "crownlte,read-only-diagnostic") &&
+	    !ufshcd_read_only_command(cmd->cmnd, cmd->cmd_len,
+		cmd->sc_data_direction == DMA_TO_DEVICE ||
+		cmd->sc_data_direction == DMA_BIDIRECTIONAL)) {
+		dev_warn_ratelimited(hba->dev, "diagnostic rejects SCSI opcode %02x\n",
+				    cmd->cmnd[0]);
+		scsi_build_sense(cmd, 0, DATA_PROTECT, 0x27, 0);
+		scsi_done(cmd);
+		return 0;
+	}
 
 	switch (hba->ufshcd_state) {
 	case UFSHCD_STATE_OPERATIONAL:

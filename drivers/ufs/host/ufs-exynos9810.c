@@ -1126,9 +1126,29 @@ static const struct ufs_hba_variant_ops exynos9810_ufs_ops = {
 	.event_notify		= exynos_ufs_event_notify,
 };
 
+/* Only a DT-marked diagnostic host uses this gate. The first automatic
+ * probe returns before UFS core allocation, clocks, MMIO or secure calls.
+ * Diagnostic PID1 may release it after the serial host is ready, then bind
+ * this one platform device from a child separate from its restart timer. */
+static bool ufs_diagnostic_probe;
+module_param_named(diagnostic_probe, ufs_diagnostic_probe, bool, 0600);
+MODULE_PARM_DESC(diagnostic_probe,
+        "Allow manual first probe of a read-only diagnostic UFS host");
+
 static int exynos9810_ufs_probe(struct platform_device *pdev)
 {
 	int ret;
+
+	if (of_property_read_bool(pdev->dev.of_node,
+				  "crownlte,read-only-diagnostic")) {
+		if (!IS_ENABLED(CONFIG_SCSI_UFS_CROWNLTE_DIAGNOSTIC_RO))
+			return dev_err_probe(&pdev->dev, -EOPNOTSUPP,
+					     "diagnostic command guard absent\n");
+		if (!READ_ONCE(ufs_diagnostic_probe)) {
+			dev_info(&pdev->dev, "diagnostic first probe held for USB host\n");
+			return -ENODEV;
+		}
+	}
 
 	s9p_step(S9P_RED);		/* 1: probe entered */
 

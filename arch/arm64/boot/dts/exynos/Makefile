@@ -15,3 +15,5 @@ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-diag.dtb
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-usb-diag.dtb
 
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-real-clock-usb-diag.dtb
+
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-diag.dtb

@@ -151,3 +151,13 @@ config SCSI_UFS_EXYNOS9810
 	help
 	  Experimental host driver for diagnostic bring-up. Samsung FMP inline
 	  encryption is not implemented. Do not mount Android userdata with it.
+
+config SCSI_UFS_CROWNLTE_DIAGNOSTIC_RO
+	bool "Crownlte guarded delayed UFS diagnostic"
+	depends on SCSI_UFS_EXYNOS9810 && OF
+	help
+	  A DT-marked Exynos9810 host refuses its first probe until explicitly
+	  released through the root-only diagnostic_probe parameter. Its SCSI
+	  queue rejects unknown and mutating commands. This does not prevent
+	  volatile controller setup or UFS initialization queries, and does
+	  not establish that encrypted Android storage is usable.
