@@ -35,7 +35,7 @@
 		compatible = "samsung,exynos-acpm-ipc";
 		reg = <0 0x14100000 0x1000>, <0 0x02039000 0x30000>;
 		interrupt-parent = <&gic>;
-		interrupts = <GIC_SPI 68 IRQ_TYPE_NONE>;
+		interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
 		initdata-base = <0x7f00>;
 		dump-base = <0x0203c000>;
 		dump-size = <0x1d000>;
