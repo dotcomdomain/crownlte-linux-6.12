@@ -20,7 +20,9 @@ struct acpm_firmware_snapshot {
 	struct acpm_plugin_snapshot *plugins;
 	void *fvmap;
 	u32 fvmap_plugin;
+	u32 fvmap_offset;	/* SRAM offset of the copied FVMap */
 };
+void __iomem *acpm_ipc_sram_ptr(u32 offset, u64 bytes);
 int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 				   struct acpm_firmware_snapshot *snapshot);
 void acpm_ipc_free_firmware_snapshot(struct acpm_firmware_snapshot *snapshot);

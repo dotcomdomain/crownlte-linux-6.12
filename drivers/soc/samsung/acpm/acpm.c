@@ -59,10 +59,20 @@ static int plugins_init(struct device *framework)
 		dev_err(framework, "ACPM diagnostic snapshot has no attached DVFS FVMap\n");
 	} else {
 		ret = fvmap_validate_snapshot(snapshot.fvmap, ACPM_SNAPSHOT_FVMAP_BYTES);
-		if (ret)
+		if (ret) {
 			dev_err(framework, "ACPM owned FVMap validation failed: %d\n", ret);
-		else
-			dev_info(framework, "ACPM owned FVMap snapshot validated; voltage tables remain unavailable\n");
+		} else {
+			/* 4.9: fvmap_init(plugin base + fvmap_offset) for the
+			 * attached DVFS plugin. fvmap_init() re-validates the live
+			 * SRAM copy before publishing voltage tables.
+			 */
+			void __iomem *sram = acpm_ipc_sram_ptr(snapshot.fvmap_offset,
+							       ACPM_SNAPSHOT_FVMAP_BYTES);
+
+			ret = sram ? fvmap_init(sram) : -ENODEV;
+			dev_info(framework, "ACPM FVMap plugin=%u offset=%#x validated; fvmap_init=%d\n",
+				 snapshot.fvmap_plugin, snapshot.fvmap_offset, ret);
+		}
 	}
 	acpm_ipc_free_firmware_snapshot(&snapshot);
 	return ret;

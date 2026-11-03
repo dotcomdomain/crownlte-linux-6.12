@@ -18,6 +18,11 @@
 
 void __iomem *fvmap_base;
 static bool fvmap_ready;
+/* Domains whose FVMap entry has no matching ECT level table (4.9 logs
+ * "ECT ... not found" for dvfs_disp_evt1 and dvfs_cp). They keep their copied
+ * rate/voltage rows but publish no voltage table and get no PLL fixups. */
+static unsigned long fvmap_unusable;
+#define FVMAP_MAX_DOMAINS	BITS_PER_LONG
 void __iomem *sram_fvmap_base;
 
 static int init_margin_table[MAX_MARGIN_ID];
@@ -222,6 +227,13 @@ int fvmap_validate_snapshot(const void *snapshot, size_t bytes)
 		struct vclk *vclk = cmucal_get_node(ACPM_VCLK_TYPE | i);
 
 		memcpy(&header, base + i * sizeof(header), sizeof(header));
+		if (i < FVMAP_MAX_DOMAINS && vclk && !vclk_get_lv_num(ACPM_VCLK_TYPE | i) &&
+		    header.num_of_lv <= 48 && header.o_ratevolt <= bytes &&
+		    (u64)header.num_of_lv * sizeof(struct rate_volt) <= bytes - header.o_ratevolt) {
+			pr_warn("fvmap: domain %u %s has %u FVMap levels but no ECT table; voltage unavailable\n",
+				i, vclk->name, header.num_of_lv);
+			continue;
+		}
 		if (!vclk || header.num_of_pll > vclk->num_list ||
 		    (header.num_of_lv && !vclk->lut) ||
 		    header.num_of_lv > 48 || header.num_of_pll > header.num_of_members ||
@@ -229,14 +241,23 @@ int fvmap_validate_snapshot(const void *snapshot, size_t bytes)
 		    header.o_ratevolt > bytes ||
 		    (u64)header.num_of_lv * sizeof(struct rate_volt) > bytes - header.o_ratevolt ||
 		    header.o_members > bytes ||
-		    (u64)header.num_of_pll * sizeof(u16) > bytes - header.o_members)
+		    (u64)header.num_of_pll * sizeof(u16) > bytes - header.o_members) {
+			pr_err("fvmap: snapshot rejects domain %u %s pll=%u/%u lv=%u ect_lv=%u members=%u o_rv=%#x o_mem=%#x\n",
+			       i, vclk ? vclk->name : "?", header.num_of_pll,
+			       vclk ? vclk->num_list : 0, header.num_of_lv,
+			       vclk_get_lv_num(ACPM_VCLK_TYPE | i), header.num_of_members,
+			       header.o_ratevolt, header.o_members);
 			return -EINVAL;
+		}
 		for (j = 0; j < header.num_of_lv; j++) {
 			struct rate_volt entry;
 
 			memcpy(&entry, base + header.o_ratevolt + j * sizeof(entry), sizeof(entry));
-			if (entry.rate != vclk->lut[j].rate || !entry.volt)
+			if (entry.rate != vclk->lut[j].rate || !entry.volt) {
+				pr_err("fvmap: snapshot domain %u %s level %u rate %u/%u volt %u\n",
+				       i, vclk->name, j, entry.rate, vclk->lut[j].rate, entry.volt);
 				return -EPROTO;
+			}
 		}
 		for (j = 0; j < header.num_of_pll; j++) {
 			u16 offset;
@@ -285,6 +306,8 @@ int fvmap_get_voltage_table(unsigned int id, unsigned int *table)
 		return 0;
 
 	idx = GET_IDX(id);
+	if (idx < FVMAP_MAX_DOMAINS && test_bit(idx, &fvmap_unusable))
+		return 0;
 
 	fvmap_header = fvmap_base;
 	fv_table = fvmap_base + fvmap_header[idx].o_ratevolt;
@@ -546,6 +569,10 @@ static void fvmap_copy_from_sram(void __iomem *map_base, void __iomem *sram_base
 
 		check_percent_margin(old, fvmap_header[i].num_of_lv);
 
+		if (i < FVMAP_MAX_DOMAINS && test_bit(i, &fvmap_unusable)) {
+			pr_info("  voltage unavailable: no ECT level table\n");
+			continue;
+		}
 		margin = init_margin_table[vclk->margin_id];
 		if (margin)
 			cal_dfs_set_volt_margin(i | ACPM_VCLK_TYPE, margin);
@@ -583,10 +610,17 @@ static int fvmap_validate(void __iomem *base)
 	unsigned int i, j, count = cmucal_get_list_size(ACPM_VCLK_TYPE);
 	if (!base || count * sizeof(*h) > FVMAP_SIZE)
 		return -EINVAL;
+	fvmap_unusable = 0;
 	for (i = 0; i < count; i++) {
 		struct clocks *clks;
 		struct vclk *vclk = cmucal_get_node(ACPM_VCLK_TYPE | i);
 		struct rate_volt_header *rates;
+		if (i < FVMAP_MAX_DOMAINS && vclk && !vclk_get_lv_num(ACPM_VCLK_TYPE | i) &&
+		    h[i].num_of_lv <= 48 &&
+		    h[i].o_ratevolt + h[i].num_of_lv * sizeof(struct rate_volt) <= FVMAP_SIZE) {
+			__set_bit(i, &fvmap_unusable);
+			continue;
+		}
 		if (!vclk || h[i].num_of_pll > vclk->num_list ||
 		    (h[i].num_of_lv && !vclk->lut))
 			return -EINVAL;

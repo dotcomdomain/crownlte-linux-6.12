@@ -1285,8 +1285,20 @@ int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 			goto failed_plugin;
 		}
 		if (descriptor.is_attached != descriptor.stay_attached) {
-			ret = -EOPNOTSUPP;
-			goto failed_plugin;
+			/* 4.9 treats this as a dynamic plugin (request_firmware +
+			 * DP_A/DP_D IPC). It is never the attached DVFS plugin that
+			 * carries the FVMap, so record it and keep scanning.
+			 */
+			entry->id = descriptor.id;
+			entry->base = descriptor.base_addr & ~1U;
+			entry->bytes = descriptor.size;
+			entry->attached = false;
+			if (acpm_snapshot_name(ipc, descriptor.fw_name, entry->name))
+				entry->name[0] = 0;
+			dev_warn(ipc->dev, "ACPM dynamic plugin not handled index=%u id=%u name=%.*s attached=%u stay=%u\n",
+				 i, descriptor.id, (int)ACPM_PLUGIN_NAME_SIZE, entry->name,
+				 descriptor.is_attached, descriptor.stay_attached);
+			continue;
 		}
 		entry->id = descriptor.id;
 		entry->base = descriptor.base_addr & ~1U;
@@ -1322,6 +1334,7 @@ int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 			if (ret)
 				goto failed_plugin;
 			snapshot->fvmap_plugin = entry->id;
+			snapshot->fvmap_offset = (u32)base;
 		}
 		/* Detect metadata/name changes rather than rescanning without a bound. */
 		ret = acpm_sram_copy(ipc, descriptor_offset, &again, sizeof(again));
@@ -1354,6 +1367,15 @@ unlock:
 	if (ret)
 		acpm_ipc_free_firmware_snapshot(snapshot);
 	return ret;
+}
+
+/* Live SRAM pointer for a validated range; NULL unless IPC is ready. */
+void __iomem *acpm_ipc_sram_ptr(u32 offset, u64 bytes)
+{
+	if (!smp_load_acquire(&acpm_ipc_ready) || !acpm_ipc ||
+	    !acpm_sram_range(offset, bytes))
+		return NULL;
+	return acpm_ipc->sram_base + offset;
 }
 
 static int acpm_ipc_probe_core(struct platform_device *pdev)
