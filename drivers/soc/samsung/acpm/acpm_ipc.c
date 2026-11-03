@@ -265,6 +265,8 @@ int acpm_ipc_set_ch_mode(struct device_node *np, bool polling)
 
 	for(i = 0; i < acpm_ipc->num_channels; i++) {
 		if (acpm_ipc->channel[i].id == req_ch_id) {
+			if (acpm_ipc->channel[i].quarantined)
+				return -ENODEV;
 
 			reg = __raw_readl(acpm_ipc->intr + INTMR1);
 			reg &= ~(1 << acpm_ipc->channel[i].id);
@@ -297,6 +299,12 @@ int acpm_ipc_request_channel(struct device_node *np, ipc_callback handler,
 
 	for(i = 0; i < acpm_ipc->num_channels; i++) {
 		if (acpm_ipc->channel[i].id == req_ch_id) {
+			if (acpm_ipc->channel[i].quarantined) {
+				dev_err(acpm_ipc->dev,
+					"ACPM channel %d is quarantined; refusing request from %pOF\n",
+					req_ch_id, np);
+				return -ENODEV;
+			}
 			*id = acpm_ipc->channel[i].id;
 			*size = acpm_ipc->channel[i].tx_ch.size;
 
@@ -729,6 +737,8 @@ int acpm_ipc_send_data(unsigned int channel_id, struct ipc_config *cfg)
 		return -EIO;
 
 	channel = &acpm_ipc->channel[channel_id];
+	if (channel->quarantined)
+		return -ENODEV;
 	if (channel->type != TYPE_QUEUE)
 		return -EOPNOTSUPP;
 
@@ -958,6 +968,7 @@ static int acpm_sram_copy(struct acpm_ipc_info *ipc, u32 offset,
 static int channel_init(void)
 {
 	unsigned int mask = 0;
+	unsigned int quarantined = 0;
 	unsigned int i;
 	struct ipc_channel wire, *table;
 	u64 table_bytes;
@@ -1039,6 +1050,35 @@ static int channel_init(void)
 			reason = "rx-queue";
 		else if (!acpm_sram_range(wire.ch.rx_indr_buf, wire.ch.rx_indr_buf_size))
 			reason = "indirection";
+		/* An id/index mismatch means the table itself is misread: fail the
+		 * probe. Any other defect is per-channel. Exynos 9810 firmware
+		 * describes channel 3 with mailbox-register addresses (mbox+0x80/0x88)
+		 * and channels 8-10 with 2-byte elements; no AP-side consumer uses
+		 * them (4.9 DT: channels 1,2,4,5,11,12). Leave such a channel masked
+		 * and unusable instead of failing every ACPM consumer (DVFS, devfreq,
+		 * TMU, PMIC, restart).
+		 */
+		if (reason && strcmp(reason, "id-index")) {
+			dev_warn(acpm_ipc->dev,
+				 "ACPM channel quarantined (%s) index=%u id=%u type=%u polling=%u length=%u element=%u tx=%#x/%#x/%#x rx=%#x/%#x/%#x\n",
+				 reason, i, wire.id, wire.type, wire.ap_poll,
+				 wire.ch.q_len, wire.ch.q_elem_size,
+				 wire.ch.tx_rear, wire.ch.tx_front, wire.ch.tx_base,
+				 wire.ch.rx_rear, wire.ch.rx_front, wire.ch.rx_base);
+			channel->id = wire.id;
+			channel->type = wire.type;
+			channel->quarantined = true;
+			/* Polling + masked: IRQ paths skip it; no SRAM pointers set. */
+			channel->polling = true;
+			mask |= 1U << channel->id;
+			init_completion(&channel->wait);
+			spin_lock_init(&channel->rx_lock);
+			spin_lock_init(&channel->tx_lock);
+			spin_lock_init(&channel->ch_lock);
+			INIT_LIST_HEAD(&channel->list);
+			quarantined++;
+			continue;
+		}
 		if (reason) {
 			dev_err(acpm_ipc->dev,
 				"ACPM channel rejects %s index=%u id=%u type=%u polling=%u length=%u element=%u tx=%#x/%#x/%#x rx=%#x/%#x/%#x indr=%#x/%u\n",
@@ -1073,6 +1113,10 @@ static int channel_init(void)
 		spin_lock_init(&channel->tx_lock);
 		spin_lock_init(&channel->ch_lock);
 		INIT_LIST_HEAD(&channel->list);
+	}
+	if (quarantined == acpm_ipc->num_channels) {
+		dev_err(acpm_ipc->dev, "ACPM every channel quarantined\n");
+		return -EPROTO;
 	}
 	__raw_writel(mask, acpm_ipc->intr + INTMR1);
 	return 0;

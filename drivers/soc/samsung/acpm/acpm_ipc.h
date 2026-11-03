@@ -61,6 +61,8 @@ struct acpm_ipc_ch {
 
 	struct completion wait;
 	bool polling;
+	/* Firmware descriptor failed address validation; never touched by AP. */
+	bool quarantined;
 };
 
 struct acpm_ipc_info {
