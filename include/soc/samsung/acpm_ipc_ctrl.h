@@ -30,6 +30,25 @@ int acpm_ipc_release_channel(struct device_node *np, unsigned int channel_id);
 int acpm_ipc_send_data(unsigned int channel_id, struct ipc_config *cfg);
 int acpm_ipc_send_data_sync(unsigned int channel_id, struct ipc_config *cfg);
 int acpm_ipc_set_ch_mode(struct device_node *np, bool polling);
+/* 1 = AP polls (responses copied into cfg->cmd), 0 = interrupt, <0 error. */
+int acpm_ipc_get_ch_mode(unsigned int channel_id);
+
+/* Outcome of the 4.9-style dynamic plugin attach done by plugins_init(). */
+struct exynos_acpm_plugin_status {
+	int result;		/* 0: plugin attached; <0: not usable */
+	bool found;		/* name present in the firmware plugin table */
+	bool loaded;		/* this kernel copied the image and sent DP_A */
+	bool post_attached;	/* descriptor is_attached re-read after DP_A */
+	int attach_ret;		/* DP_A IPC result (only if loaded) */
+	u32 index;
+	u32 id;
+	u32 base;
+	u32 size;		/* declared plugin size */
+	u32 image_bytes;
+	u32 dp_response[4];
+};
+int exynos_acpm_get_plugin_status(const char *fw_name,
+				  struct exynos_acpm_plugin_status *status);
 #if IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART)
 struct device;
 /* Requires the exact supplier reference plus a managed device link, or a
@@ -67,6 +86,18 @@ static inline int acpm_ipc_send_data_sync(unsigned int channel_id, struct ipc_co
 static inline int acpm_ipc_set_ch_mode(struct device_node *np, bool polling)
 {
 	return 0;
+}
+
+static inline int acpm_ipc_get_ch_mode(unsigned int channel_id)
+{
+	return -ENODEV;
+}
+
+struct exynos_acpm_plugin_status;
+static inline int exynos_acpm_get_plugin_status(const char *fw_name,
+		struct exynos_acpm_plugin_status *status)
+{
+	return -ENODEV;
 }
 
 static inline void exynos_acpm_reboot(void)

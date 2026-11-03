@@ -12,7 +12,8 @@ struct acpm_plugin_snapshot {
 	u32 id;
 	u32 base;
 	u32 bytes;
-	bool attached;
+	bool attached;		/* descriptor is_attached */
+	bool stay_attached;	/* descriptor stay_attached */
 	char name[ACPM_PLUGIN_NAME_SIZE];
 };
 struct acpm_firmware_snapshot {
@@ -26,6 +27,9 @@ void __iomem *acpm_ipc_sram_ptr(u32 offset, u64 bytes);
 int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 				   struct acpm_firmware_snapshot *snapshot);
 void acpm_ipc_free_firmware_snapshot(struct acpm_firmware_snapshot *snapshot);
+/* 4.9 firmware_load() for a detached stay_attached plugin, bounded. */
+int acpm_ipc_load_dynamic_plugin(struct device *framework, u32 index, u32 id,
+				 u32 expected_base, const u8 *image, size_t bytes);
 
 int acpm_ipc_bind_framework(struct device *framework);
 void acpm_ipc_unbind_framework(struct device *framework);

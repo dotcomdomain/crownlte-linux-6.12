@@ -38,11 +38,180 @@ static DEFINE_MUTEX(acpm_framework_lock);
 static int acpm_send_data(struct device_node *node, unsigned int check_id,
 		struct ipc_config *config);
 
+/*
+ * Dynamic plugins this kernel may load. Only plugins named in the framework
+ * node's "dynamic-plugins" DT children are ever written to SRAM; 4.9 did
+ * every detached stay_attached plugin, but loaded only images it shipped.
+ */
+#define ACPM_DYNAMIC_PLUGINS_MAX	4
+struct acpm_dynamic_plugin {
+	const char *fw_name;
+	struct exynos_acpm_plugin_status status;
+};
+static struct acpm_dynamic_plugin acpm_dynamic_plugins[ACPM_DYNAMIC_PLUGINS_MAX];
+static unsigned int acpm_dynamic_plugin_count;
+static bool acpm_dynamic_plugins_done;
 
+/* 4.9 handle_dynamic_plugin(), attach only; keeps the reply for logging. */
+static int handle_dynamic_plugin(struct device_node *node, unsigned int id,
+				 u32 response[4])
+{
+	struct ipc_config config;
+	unsigned int cmd[4] = {0, };
+	int ret;
 
+	config.cmd = cmd;
+	config.cmd[0] = (1 << ACPM_IPC_PROTOCOL_DP_A);
+	config.cmd[0] |= id << ACPM_IPC_PROTOCOL_ID;
+	config.response = true;
+	config.indirection = false;
 
+	ret = acpm_send_data(node, id, &config);
+	memcpy(response, cmd, sizeof(cmd));
+	config.cmd = NULL;
+	if (!ret)
+		pr_info("[ACPM] plugin(id = %u) attach done!\n", id);
+	return ret;
+}
 
+static void acpm_attach_dynamic_plugin(struct device *framework,
+				       const struct acpm_firmware_snapshot *snapshot,
+				       struct acpm_dynamic_plugin *plugin,
+				       u32 expected_base)
+{
+	struct exynos_acpm_plugin_status *st = &plugin->status;
+	const struct acpm_plugin_snapshot *entry = NULL;
+	struct acpm_firmware_snapshot after;
+	const struct firmware *fw = NULL;
+	unsigned int i;
+	int ret;
 
+	memset(st, 0, sizeof(*st));
+	st->result = -ENOENT;
+	for (i = 0; i < snapshot->num_plugins; i++) {
+		if (strncmp(snapshot->plugins[i].name, plugin->fw_name,
+			    ACPM_PLUGIN_NAME_SIZE))
+			continue;
+		if (entry) {
+			st->result = -EPROTO;
+			dev_err(framework, "ACPM plugin %s listed twice\n", plugin->fw_name);
+			return;
+		}
+		entry = &snapshot->plugins[i];
+		st->index = i;
+	}
+	if (!entry) {
+		dev_err(framework, "ACPM plugin %s not in firmware table\n", plugin->fw_name);
+		return;
+	}
+	st->found = true;
+	st->id = entry->id;
+	st->base = entry->base;
+	st->size = entry->bytes;
+	if (entry->attached && entry->stay_attached) {
+		st->result = 0;
+		dev_info(framework, "ACPM plugin %s index=%u id=%u already attached; nothing to load\n",
+			 plugin->fw_name, st->index, st->id);
+		return;
+	}
+	if (entry->attached || !entry->stay_attached) {
+		/* 4.9 would DP_D this one; never needed for TMU, so refuse. */
+		st->result = -EOPNOTSUPP;
+		dev_err(framework, "ACPM plugin %s attached=%u stay=%u: not a load+attach case\n",
+			plugin->fw_name, entry->attached, entry->stay_attached);
+		return;
+	}
+	if (entry->id > (ACPM_IPC_PROTOCOL_IDX >> ACPM_IPC_PROTOCOL_ID)) {
+		st->result = -EPROTO;
+		return;
+	}
+	/* Built-in (CONFIG_EXTRA_FIRMWARE) first; no usermode helper fallback. */
+	ret = request_firmware_direct(&fw, plugin->fw_name, framework);
+	if (ret) {
+		st->result = ret;
+		dev_err(framework, "ACPM plugin %s firmware request failed: %d\n",
+			plugin->fw_name, ret);
+		return;
+	}
+	st->image_bytes = fw->size;
+	ret = acpm_ipc_load_dynamic_plugin(framework, st->index, st->id, expected_base,
+					   fw->data, fw->size);
+	release_firmware(fw);
+	if (ret) {
+		st->result = ret;
+		return;
+	}
+	st->loaded = true;
+	ret = handle_dynamic_plugin(framework->of_node, st->id, st->dp_response);
+	st->attach_ret = ret;
+	st->result = ret;
+	if (ret)
+		dev_err(framework, "plugin attach/detach:1 fail! plugin_id:%u, ret:%d\n",
+			st->id, ret);
+
+	if (!acpm_ipc_copy_firmware_snapshot(framework, &after)) {
+		if (st->index < after.num_plugins &&
+		    after.plugins[st->index].id == st->id)
+			st->post_attached = after.plugins[st->index].attached;
+		acpm_ipc_free_firmware_snapshot(&after);
+	}
+	dev_info(framework, "ACPM plugin %s index=%u id=%u DP_A ret=%d reply=%08x %08x %08x %08x is_attached now=%u\n",
+		 plugin->fw_name, st->index, st->id, ret,
+		 st->dp_response[0], st->dp_response[1], st->dp_response[2],
+		 st->dp_response[3], st->post_attached);
+}
+
+static void acpm_dynamic_plugins_init(struct device *framework,
+				      const struct acpm_firmware_snapshot *snapshot)
+{
+	struct device_node *list, *child;
+	struct acpm_dynamic_plugin *plugin;
+	u32 expected_base;
+
+	list = of_get_child_by_name(framework->of_node, "dynamic-plugins");
+	if (!list)
+		return;
+	for_each_available_child_of_node(list, child) {
+		if (acpm_dynamic_plugin_count >= ACPM_DYNAMIC_PLUGINS_MAX) {
+			dev_err(framework, "too many dynamic-plugins entries\n");
+			of_node_put(child);
+			break;
+		}
+		plugin = &acpm_dynamic_plugins[acpm_dynamic_plugin_count];
+		if (of_property_read_string(child, "fw-name", &plugin->fw_name) ||
+		    of_property_read_u32(child, "samsung,load-offset", &expected_base)) {
+			dev_err(framework, "%pOF: needs fw-name and samsung,load-offset\n", child);
+			continue;
+		}
+		acpm_dynamic_plugin_count++;
+		acpm_attach_dynamic_plugin(framework, snapshot, plugin, expected_base);
+	}
+	of_node_put(list);
+}
+
+int exynos_acpm_get_plugin_status(const char *fw_name,
+				  struct exynos_acpm_plugin_status *status)
+{
+	unsigned int i;
+	int ret = -ENOENT;
+
+	if (!fw_name || !status)
+		return -EINVAL;
+	mutex_lock(&acpm_framework_lock);
+	if (!acpm_dynamic_plugins_done) {
+		ret = -EPROBE_DEFER;
+	} else {
+		for (i = 0; i < acpm_dynamic_plugin_count; i++) {
+			if (strcmp(acpm_dynamic_plugins[i].fw_name, fw_name))
+				continue;
+			*status = acpm_dynamic_plugins[i].status;
+			ret = status->result;
+			break;
+		}
+	}
+	mutex_unlock(&acpm_framework_lock);
+	return ret;
+}
 
 static int plugins_init(struct device *framework)
 {
@@ -54,6 +223,7 @@ static int plugins_init(struct device *framework)
 		dev_err(framework, "ACPM diagnostic snapshot unavailable: %d\n", ret);
 		return ret;
 	}
+	acpm_dynamic_plugins_init(framework, &snapshot);
 	if (!snapshot.fvmap) {
 		ret = -ENODATA;
 		dev_err(framework, "ACPM diagnostic snapshot has no attached DVFS FVMap\n");
@@ -335,12 +505,15 @@ static int __init exynos_acpm_binary_update(void)
 {
 	int ret = -ENODEV;
 
-	/* This one-shot diagnostic scan does not enable firmware updates or
-	 * publish voltage tables, and does not pretend to implement deferral.
+	/* One-shot scan: loads+attaches only DT-listed dynamic plugins (4.9
+	 * firmware_update + DP_A), publishes the attached DVFS FVMap, and does
+	 * not pretend to implement deferral.
 	 */
 	mutex_lock(&acpm_framework_lock);
 	if (exynos_acpm)
 		ret = plugins_init(exynos_acpm->dev);
+	/* Consumers stop deferring even when the framework never probed. */
+	acpm_dynamic_plugins_done = true;
 	mutex_unlock(&acpm_framework_lock);
 	return ret;
 }

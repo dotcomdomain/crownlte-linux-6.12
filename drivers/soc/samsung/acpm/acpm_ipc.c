@@ -22,6 +22,7 @@
 #include <linux/list.h>
 #include <linux/wait.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/exynos-ss.h>
 
 #include "acpm.h"
@@ -1292,10 +1293,11 @@ int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 			entry->id = descriptor.id;
 			entry->base = descriptor.base_addr & ~1U;
 			entry->bytes = descriptor.size;
-			entry->attached = false;
+			entry->attached = descriptor.is_attached;
+			entry->stay_attached = descriptor.stay_attached;
 			if (acpm_snapshot_name(ipc, descriptor.fw_name, entry->name))
 				entry->name[0] = 0;
-			dev_warn(ipc->dev, "ACPM dynamic plugin not handled index=%u id=%u name=%.*s attached=%u stay=%u\n",
+			dev_warn(ipc->dev, "ACPM dynamic plugin index=%u id=%u name=%.*s attached=%u stay=%u\n",
 				 i, descriptor.id, (int)ACPM_PLUGIN_NAME_SIZE, entry->name,
 				 descriptor.is_attached, descriptor.stay_attached);
 			continue;
@@ -1304,6 +1306,7 @@ int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 		entry->base = descriptor.base_addr & ~1U;
 		entry->bytes = descriptor.size;
 		entry->attached = descriptor.is_attached;
+		entry->stay_attached = descriptor.stay_attached;
 		ret = acpm_snapshot_name(ipc, descriptor.fw_name, entry->name);
 		if (ret)
 			goto failed_plugin;
@@ -1376,6 +1379,190 @@ void __iomem *acpm_ipc_sram_ptr(u32 offset, u64 bytes)
 	    !acpm_sram_range(offset, bytes))
 		return NULL;
 	return acpm_ipc->sram_base + offset;
+}
+
+static bool acpm_sram_overlap(u64 a, u64 a_bytes, u64 b, u64 b_bytes)
+{
+	return a_bytes && b_bytes && a < b + b_bytes && b < a + a_bytes;
+}
+
+/* Returns the name of the first firmware-owned region the extent overlaps. */
+static const char *acpm_dynamic_plugin_conflict(struct acpm_ipc_info *ipc,
+					       const struct acpm_framework *header,
+					       u32 index, u32 base, u32 bytes)
+{
+	struct ipc_channel wire;
+	struct plugin other;
+	unsigned int i;
+
+	if (acpm_sram_overlap(base, bytes, ipc->initdata_base, sizeof(*header)))
+		return "framework-header";
+	if (acpm_sram_overlap(base, bytes, header->plugins,
+			      (u64)header->num_plugins * sizeof(other)))
+		return "plugin-table";
+	if (acpm_sram_overlap(base, bytes, header->ipc_channels,
+			      (u64)header->ipc_ap_max * sizeof(wire)))
+		return "channel-table";
+	if (acpm_sram_overlap(base, bytes, header->log_data,
+			      (u64)header->log_entry_len * header->log_entry_size) ||
+	    acpm_sram_overlap(base, bytes, header->log_buf_rear, sizeof(u32)) ||
+	    acpm_sram_overlap(base, bytes, header->log_buf_front, sizeof(u32)) ||
+	    acpm_sram_overlap(base, bytes, header->ktime_index, sizeof(u32)))
+		return "log-buffer";
+	if (header->ipc_ap_max > 32 || header->ipc_channels % sizeof(u32) ||
+	    !acpm_sram_range(header->ipc_channels,
+			     (u64)header->ipc_ap_max * sizeof(wire)))
+		return "channel-table-range";
+	for (i = 0; i < header->ipc_ap_max; i++) {
+		u64 queue;
+
+		if (acpm_sram_copy(ipc, header->ipc_channels + i * sizeof(wire),
+				   &wire, sizeof(wire)))
+			return "channel-read";
+		queue = (u64)max(wire.ch.q_len, 1U) * wire.ch.q_elem_size;
+		if (acpm_sram_overlap(base, bytes, wire.ch.tx_base, queue) ||
+		    acpm_sram_overlap(base, bytes, wire.ch.rx_base, queue) ||
+		    acpm_sram_overlap(base, bytes, wire.ch.rx_indr_buf,
+				      wire.ch.rx_indr_buf_size) ||
+		    acpm_sram_overlap(base, bytes, wire.ch.tx_rear, sizeof(u32)) ||
+		    acpm_sram_overlap(base, bytes, wire.ch.tx_front, sizeof(u32)) ||
+		    acpm_sram_overlap(base, bytes, wire.ch.rx_rear, sizeof(u32)) ||
+		    acpm_sram_overlap(base, bytes, wire.ch.rx_front, sizeof(u32)))
+			return "ipc-queue";
+	}
+	for (i = 0; i < header->num_plugins; i++) {
+		if (i == index)
+			continue;
+		if (acpm_sram_copy(ipc, header->plugins + i * sizeof(other),
+				   &other, sizeof(other)))
+			return "plugin-read";
+		/* Detached plugins may share an overlay region; attached ones not. */
+		if (other.is_attached &&
+		    acpm_sram_overlap(base, bytes, other.base_addr & ~1U, other.size))
+			return "attached-plugin";
+	}
+	return NULL;
+}
+
+/*
+ * 4.9 plugins_init()/firmware_load(): copy the image of a plugin whose
+ * descriptor says is_attached=0, stay_attached=1 to SRAM at base_addr & ~1.
+ * Unlike 4.9 (unbounded memcpy), every write is bounded by the descriptor's
+ * declared size, the SRAM resource, and a firmware-owned-region check. The
+ * descriptor is re-read under the metadata mutex so a changed table is
+ * refused. Aligned 32-bit stores, then a full read-back compare. Caller
+ * sends DP_A; nothing here touches the mailbox.
+ */
+int acpm_ipc_load_dynamic_plugin(struct device *framework, u32 index, u32 id,
+				 u32 expected_base, const u8 *image, size_t bytes)
+{
+	struct acpm_framework header;
+	struct acpm_ipc_info *ipc;
+	struct plugin descriptor, again;
+	const char *conflict;
+	u32 channel, base, padded, offset;
+	u64 table_bytes;
+	int ret = -ENODEV;
+
+	if (!image || !bytes || bytes > SZ_1M)
+		return -EINVAL;
+	if (!framework || !framework->of_node ||
+	    !of_device_is_compatible(framework->of_node, "samsung,exynos-acpm") ||
+	    of_property_read_u32(framework->of_node, "acpm-ipc-channel", &channel) ||
+	    channel != 4)
+		return -EINVAL;
+	padded = round_up((u32)bytes, sizeof(u32));
+
+	mutex_lock(&acpm_state_lock);
+	ipc = acpm_ipc;
+	if (framework != acpm_framework_device ||
+	    !smp_load_acquire(&acpm_ipc_ready) || !ipc ||
+	    ipc->dev->of_node != acpm_framework_supplier ||
+	    dev_get_drvdata(ipc->dev) != ipc)
+		goto unlock;
+	ret = acpm_sram_copy(ipc, ipc->initdata_base, &header, sizeof(header));
+	if (ret)
+		goto unlock;
+	table_bytes = (u64)header.num_plugins * sizeof(descriptor);
+	if (header.num_plugins > ACPM_SNAPSHOT_MAX_PLUGINS || index >= header.num_plugins ||
+	    header.plugins % sizeof(u32) || !acpm_sram_range(header.plugins, table_bytes)) {
+		ret = -EPROTO;
+		goto unlock;
+	}
+	offset = header.plugins + index * sizeof(descriptor);
+	ret = acpm_sram_copy(ipc, offset, &descriptor, sizeof(descriptor));
+	if (ret)
+		goto unlock;
+	base = descriptor.base_addr & ~1U;
+	if (descriptor.id != id || descriptor.is_attached != 0 ||
+	    descriptor.stay_attached != 1) {
+		ret = -EBUSY;
+		goto reject;
+	}
+	if (!base || base % sizeof(u32) || base != expected_base ||
+	    !descriptor.size || !acpm_sram_range(base, descriptor.size)) {
+		ret = -EPROTO;
+		goto reject;
+	}
+	if (padded > descriptor.size) {
+		ret = -EFBIG;
+		goto reject;
+	}
+	conflict = acpm_dynamic_plugin_conflict(ipc, &header, index, base,
+						descriptor.size);
+	if (conflict) {
+		dev_err(ipc->dev, "ACPM dynamic plugin index=%u extent %#x+%#x overlaps %s\n",
+			index, base, descriptor.size, conflict);
+		ret = -EPROTO;
+		goto reject;
+	}
+	for (offset = 0; offset < padded; offset += sizeof(u32)) {
+		u32 word = 0;
+		unsigned int i;
+
+		for (i = 0; i < sizeof(u32) && offset + i < bytes; i++)
+			word |= (u32)image[offset + i] << (i * 8);
+		writel_relaxed(word, ipc->sram_base + base + offset);
+	}
+	wmb();
+	for (offset = 0; offset < padded; offset += sizeof(u32)) {
+		u32 word = 0;
+		unsigned int i;
+
+		for (i = 0; i < sizeof(u32) && offset + i < bytes; i++)
+			word |= (u32)image[offset + i] << (i * 8);
+		if (readl(ipc->sram_base + base + offset) != word) {
+			dev_err(ipc->dev, "ACPM dynamic plugin index=%u read-back mismatch at %#x\n",
+				index, base + offset);
+			ret = -EIO;
+			goto unlock;
+		}
+	}
+	ret = acpm_sram_copy(ipc, header.plugins + index * sizeof(again),
+			     &again, sizeof(again));
+	if (!ret && memcmp(&descriptor, &again, sizeof(again)))
+		ret = -EAGAIN;
+	if (!ret)
+		dev_info(ipc->dev, "ACPM dynamic plugin index=%u id=%u loaded %zu bytes at %#x (declared size %#x)\n",
+			 index, id, bytes, base, descriptor.size);
+	goto unlock;
+reject:
+	dev_err(ipc->dev, "ACPM dynamic plugin load refused index=%u id=%u/%u attached=%u stay=%u base=%#x expected=%#x size=%#x image=%zu ret=%d\n",
+		index, descriptor.id, id, descriptor.is_attached,
+		descriptor.stay_attached, base, expected_base, descriptor.size,
+		bytes, ret);
+unlock:
+	mutex_unlock(&acpm_state_lock);
+	return ret;
+}
+
+int acpm_ipc_get_ch_mode(unsigned int channel_id)
+{
+	if (!smp_load_acquire(&acpm_ipc_ready) || channel_id >= acpm_ipc->num_channels)
+		return -ENODEV;
+	if (acpm_ipc->channel[channel_id].quarantined)
+		return -ENODEV;
+	return acpm_ipc->channel[channel_id].polling ? 1 : 0;
 }
 
 static int acpm_ipc_probe_core(struct platform_device *pdev)
