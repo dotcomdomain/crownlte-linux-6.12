@@ -46,7 +46,11 @@
 	};
 	legacy_acpm_dvfs: acpm-dvfs {
 		compatible = "samsung,exynos-acpm-dvfs";
-		acpm-ipc-channel = <5>;
+		acpm-ipc-channel = <5>;	/* firmware MIF-floor notifications */
 		status = "disabled";
+
+		command {
+			acpm-ipc-channel = <0>;	/* FREQ_REQ/FREQ_GET/MARGIN_REQ, as 4.9 */
+		};
 	};
 };

@@ -23,3 +23,5 @@
 	crownlte,read-only-diagnostic;
 	status = "okay";
 };
+
+&legacy_acpm_dvfs { samsung,freq-get-selftest; };

@@ -3,6 +3,10 @@
 #include <linux/platform_device.h>
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
+#include <linux/of.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
+#include <soc/samsung/cal-if.h>
 
 #include <soc/samsung/acpm_ipc_ctrl.h>
 #include <linux/sched/clock.h>
@@ -247,17 +251,96 @@ bool exynos_acpm_dvfs_is_ready(void)
 	return smp_load_acquire(&acpm_dvfs_ready);
 }
 
+#define ACPM_DVFS_SELFTEST_LIT	0x0b040002
+#define ACPM_DVFS_SELFTEST_BIG	0x0b040003
+#define ACPM_DVFS_SELFTEST_KHZ	832000	/* LITTLE ASV step below the 1053000 boot rate */
+
+static struct delayed_work acpm_dvfs_selftest_work;
+
+/*
+ * Diagnostic only, run late so the host log forwarder keeps it. Reads both
+ * CPU domains from CMU registers (the 4.9 read path) and performs one LITTLE
+ * FREQ_REQ round trip through cal_dfs_set_rate(), which only accepts rates in
+ * the domain's ASV table. The firmware selects voltage. BIG is never set.
+ */
+static void acpm_dvfs_selftest(struct work_struct *work)
+{
+	unsigned long lit0, lit1, lit2, big0;
+	int ret1 = -EINVAL, ret2 = -EINVAL;
+
+	pr_info("acpm-dvfs selftest: ready lit=%d big=%d\n",
+		cal_dfs_is_ready(ACPM_DVFS_SELFTEST_LIT),
+		cal_dfs_is_ready(ACPM_DVFS_SELFTEST_BIG));
+	lit0 = cal_dfs_get_rate(ACPM_DVFS_SELFTEST_LIT);
+	big0 = cal_dfs_get_rate(ACPM_DVFS_SELFTEST_BIG);
+	pr_info("acpm-dvfs selftest: cmu lit=%lu big=%lu\n", lit0, big0);
+	if (!cal_dfs_is_ready(ACPM_DVFS_SELFTEST_LIT)) {
+		pr_info("acpm-dvfs selftest: LITTLE not ready; no FREQ_REQ sent\n");
+		return;
+	}
+	ret1 = cal_dfs_set_rate(ACPM_DVFS_SELFTEST_LIT, ACPM_DVFS_SELFTEST_KHZ);
+	lit1 = cal_dfs_get_rate(ACPM_DVFS_SELFTEST_LIT);
+	pr_info("acpm-dvfs selftest: set lit %u ret=%d cmu=%lu\n",
+		ACPM_DVFS_SELFTEST_KHZ, ret1, lit1);
+	if (lit0 && lit0 != ACPM_DVFS_SELFTEST_KHZ) {
+		ret2 = cal_dfs_set_rate(ACPM_DVFS_SELFTEST_LIT, lit0);
+		lit2 = cal_dfs_get_rate(ACPM_DVFS_SELFTEST_LIT);
+		pr_info("acpm-dvfs selftest: restore lit %lu ret=%d cmu=%lu\n",
+			lit0, ret2, lit2);
+	}
+}
+
+/*
+ * Samsung's 4.9 driver sends every DVFS command (FREQ_REQ/FREQ_GET/MARGIN_REQ)
+ * on channel 0: exynos_acpm_dvfs_init() requests a channel for the clock
+ * controller node, which has no acpm-ipc-channel property, so ch_num keeps
+ * its static zero. The acpm-dvfs node's own channel (5, TYPE_BUFFER) is the
+ * firmware's MIF-floor notification channel and is never used for sending.
+ * Describe the command channel explicitly with a "command" child node.
+ */
 static int acpm_dvfs_probe(struct platform_device *pdev)
 {
-	int ret;
+	struct device_node *cmd_np;
+	unsigned int noti_ch, noti_size;
+	static const u32 selftest_ids[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+	int ret, i;
+
 	acpm_dvfs.dev = pdev->dev.of_node;
-	ret = acpm_ipc_request_channel(acpm_dvfs.dev, NULL,
-			&acpm_dvfs.ch_num, &acpm_dvfs.size);
+	/* Notification channel: requested only to prove it exists. */
+	ret = acpm_ipc_request_channel(acpm_dvfs.dev, NULL, &noti_ch, &noti_size);
 	if (ret)
 		return ret == -ENODEV ? -EPROBE_DEFER : ret;
-	if (acpm_dvfs.size != 4 * sizeof(u32))
+
+	cmd_np = of_get_child_by_name(pdev->dev.of_node, "command");
+	if (!cmd_np) {
+		dev_err(&pdev->dev, "missing DVFS command channel node\n");
+		return -EINVAL;
+	}
+	ret = acpm_ipc_request_channel(cmd_np, NULL, &acpm_dvfs.ch_num,
+				       &acpm_dvfs.size);
+	of_node_put(cmd_np);
+	if (ret)
+		return ret == -ENODEV ? -EPROBE_DEFER : ret;
+	if (acpm_dvfs.size != 4 * sizeof(u32)) {
+		dev_err(&pdev->dev, "DVFS command channel %u element %u, want 16\n",
+			acpm_dvfs.ch_num, acpm_dvfs.size);
 		return -EPROTO;
+	}
+	dev_info(&pdev->dev, "DVFS commands on channel %u, notifications on channel %u\n",
+		 acpm_dvfs.ch_num, noti_ch);
 	smp_store_release(&acpm_dvfs_ready, true);
+
+	if (of_property_read_bool(pdev->dev.of_node, "samsung,freq-get-selftest")) {
+		/* Firmware FREQ_GET is unused by 4.9 and answers 0; log once. */
+		for (i = 0; i < ARRAY_SIZE(selftest_ids); i++)
+			dev_info(&pdev->dev, "FREQ_GET id=%u rate=%lu\n",
+				 selftest_ids[i],
+				 exynos_acpm_get_rate(selftest_ids[i]));
+		INIT_DELAYED_WORK(&acpm_dvfs_selftest_work, acpm_dvfs_selftest);
+		schedule_delayed_work(&acpm_dvfs_selftest_work,
+				      msecs_to_jiffies(100000) > jiffies - INITIAL_JIFFIES ?
+				      msecs_to_jiffies(100000) - (jiffies - INITIAL_JIFFIES) : 0);
+	}
 	return 0;
 }
 
