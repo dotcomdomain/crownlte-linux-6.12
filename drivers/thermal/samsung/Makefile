@@ -4,3 +4,4 @@
 #
 obj-$(CONFIG_EXYNOS_THERMAL)			+= exynos_thermal.o
 exynos_thermal-y				:= exynos_tmu.o
+obj-$(CONFIG_EXYNOS9810_ACPM_TMU)		+= exynos9810_acpm_tmu.o

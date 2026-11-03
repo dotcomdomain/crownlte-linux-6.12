@@ -9,3 +9,18 @@ config EXYNOS_THERMAL
 	  the TMU, reports temperature and handles cooling action if defined.
 	  This driver uses the Exynos core thermal APIs and TMU configuration
 	  data from the supported SoCs.
+
+config EXYNOS9810_ACPM_TMU
+	bool "Exynos 9810 TMU temperatures through the ACPM TMU plugin"
+	depends on EXYNOS_ACPM && THERMAL_OF && HAS_IOMEM
+	depends on SOC_EXYNOS9810 || COMPILE_TEST
+	help
+	  Reports Exynos 9810 TMU temperatures as OF thermal sensors by
+	  asking the ACPM TMU plugin (Samsung 4.9 exynos_acpm_tmu protocol,
+	  TMU_IPC_INIT/TMU_IPC_READ_TEMP). It never programs TMU registers;
+	  it logs the bootloader's hardware-trip state at probe.
+
+	  When the boot leaves the plugin detached, the ACPM framework loads
+	  it from a "dynamic-plugins" DT entry; build the image in with
+	  CONFIG_EXTRA_FIRMWARE="exynos9810_acpm_tmu.fw" and
+	  CONFIG_EXTRA_FIRMWARE_DIR="firmware".
