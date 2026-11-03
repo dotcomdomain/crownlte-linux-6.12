@@ -25,3 +25,152 @@
 };
 
 &legacy_acpm_dvfs { samsung,freq-get-selftest; };
+
+/*
+ * ACPM TMU plugin and TMU temperature sensors (4.9 exynos_acpm_tmu +
+ * exynos_tmu, crownlte_eur_open_26 DT). When the boot leaves the TMU plugin
+ * detached (is_attached=0, stay_attached=1), plugins_init() loads the
+ * built-in image at the descriptor's base and sends DP_A on channel 4. The
+ * ihex image is linked at 0xd800; any other descriptor base is refused.
+ */
+&legacy_acpm {
+	dynamic-plugins {
+		tmu {
+			fw-name = "exynos9810_acpm_tmu.fw";
+			samsung,load-offset = <0xd800>;
+		};
+	};
+};
+
+&{/} {
+	acpm_tmu: acpm-tmu {
+		compatible = "samsung,exynos9810-acpm-tmu";
+		acpm-ipc-channel = <12>;
+		samsung,acpm-plugin = "exynos9810_acpm_tmu.fw";
+		samsung,tmu-selftest;
+	};
+
+	/* Register blocks are shared pairwise and only read, never written. */
+	tmu_big: tmu-big@10070000 {
+		compatible = "samsung,exynos9810-tmu";
+		reg = <0 0x10070000 0x700>;
+		tmu_name = "BIG";
+		id = <0>;
+		sensors = <0x5e>;
+		#thermal-sensor-cells = <0>;
+		samsung,tmu_efuse_value = <55>;
+		samsung,tmu_first_point_trim = <25>;
+		samsung,tmu_second_point_trim = <85>;
+	};
+
+	tmu_little: tmu-little@10070000 {
+		compatible = "samsung,exynos9810-tmu";
+		reg = <0 0x10070000 0x700>;
+		tmu_name = "LITTLE";
+		id = <1>;
+		sensors = <0x20>;
+		#thermal-sensor-cells = <0>;
+		samsung,tmu_efuse_value = <55>;
+		samsung,tmu_first_point_trim = <25>;
+		samsung,tmu_second_point_trim = <85>;
+	};
+
+	tmu_g3d: tmu-g3d@10074000 {
+		compatible = "samsung,exynos9810-tmu";
+		reg = <0 0x10074000 0x700>;
+		tmu_name = "G3D";
+		id = <2>;
+		sensors = <0x2>;
+		#thermal-sensor-cells = <0>;
+		samsung,tmu_efuse_value = <55>;
+		samsung,tmu_first_point_trim = <25>;
+		samsung,tmu_second_point_trim = <85>;
+	};
+
+	tmu_isp: tmu-isp@10074000 {
+		compatible = "samsung,exynos9810-tmu";
+		reg = <0 0x10074000 0x700>;
+		tmu_name = "ISP";
+		id = <3>;
+		sensors = <0x4>;
+		#thermal-sensor-cells = <0>;
+		samsung,tmu_efuse_value = <55>;
+		samsung,tmu_first_point_trim = <25>;
+		samsung,tmu_second_point_trim = <85>;
+	};
+
+	/*
+	 * 4.9 passive control temperatures (BIG 83 C, G3D 88 C; LITTLE/ISP had
+	 * none). 4.9's "hot" trip was 115 C and became the TMU rise7/hardware
+	 * trip; the software critical trip sits below it. No cooling maps yet:
+	 * cpufreq/devfreq cooling devices are not registered in this diag.
+	 * 4.9 LITTLE/ISP/G3D relied on TMU interrupts; here everything polls.
+	 */
+	thermal-zones {
+		BIG {
+			polling-delay-passive = <50>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_big>;
+
+			trips {
+				big-control-temp {
+					temperature = <83000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				big-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+		};
+
+		LITTLE {
+			polling-delay-passive = <0>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_little>;
+
+			trips {
+				little-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+		};
+
+		G3D {
+			polling-delay-passive = <100>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_g3d>;
+
+			trips {
+				gpu-control-temp {
+					temperature = <88000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+				gpu-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+		};
+
+		ISP {
+			polling-delay-passive = <0>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tmu_isp>;
+
+			trips {
+				isp-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+		};
+	};
+};
