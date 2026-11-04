@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config FB_EXYNOS9810_DPU
+	bool "Exynos9810 DPU (DECON-F/DPP/DSIM) fbdev driver (work in progress)"
+	depends on FB && OF && ARM64
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Port of the Samsung 4.9 dpu_9810 fbdev driver (DECON, DPP, DSIM)
+	  with the ioctl ABI used by the Exynos vendor HWC. The port is in
+	  progress: at present only the ioctl ABI definitions and their
+	  compile-time checks are built. See
+	  Documentation/crownlte/display-port.md.

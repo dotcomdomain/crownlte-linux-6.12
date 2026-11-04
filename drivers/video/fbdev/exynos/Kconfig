@@ -17,3 +17,5 @@ config FB_EXYNOS9810_DECON_HANDOVER
 	  also draw a delayed on-screen self-test pattern.
 
 	  It never changes clocks, power, panel or timing settings.
+
+source "drivers/video/fbdev/exynos/dpu_9810/Kconfig"
