@@ -266,5 +266,26 @@
 	};
 };
 
+/*
+ * CL0 hardware watchdog, armed at subsys_initcall and pinged by the kernel
+ * (WATCHDOG_HANDLE_BOOT_ENABLED, OPEN_TIMEOUT=0) for as long as no process
+ * opens /dev/watchdog. A hang then ends in a CLUSTER0 watchdog reset; with
+ * the boot shim's normal INFORM2/INFORM3 and SBOOT's upload policy off
+ * (PARAM FORCE_UPLOAD=0, DEBUG_LEVEL low) SBOOT boots the normal BOOT image.
+ * The driver refuses to arm (and logs why) unless INFORM2/3 are normal, DFD
+ * dump-GPR and every WDT reset-disable bit are clear, the counter runs at
+ * OSCCLK/2048 within 10%, and the PMU reset unmask reads back.
+ * Only OSCCLK is claimed: enabling/releasing a PERIS bus vclk would switch
+ * the PERIS user mux (GIC/MCT bus). The bus itself is always on.
+ * The expiry selftest is a separate DTB: exynos9810-crownlte-delayed-ufs-wdt-selftest-diag.
+ */
+&watchdog_cl0 {
+	clocks = <&legacy_cmu OSCCLK>;
+	clock-names = "watchdog";
+	timeout-sec = <30>;
+	samsung,start-at-boot;
+	status = "okay";
+};
+
 /* SMP bring-up test: all eight CPUs */
 &{/chosen} { bootargs = "panic=30 ro"; };

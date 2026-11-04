@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * WATCHDOG EXPIRY SELFTEST - deliberately resets the phone.
+ *
+ * Identical to exynos9810-crownlte-delayed-ufs-diag, except that at 110 s
+ * boot time the kernel stops pinging the CL0 watchdog and shortens its
+ * timeout to 5 s. Expected: a CLUSTER0 watchdog reset at ~115 s, before the
+ * diagnostic's own 120 s restart, and SBOOT boots the normal BOOT image
+ * (Lineage). Proof afterwards in Lineage: /proc/reset_reason and the
+ * sec_debug.rst_stat value in /proc/cmdline carry RST_STAT bit 24
+ * (CLUSTER0_WDTRESET). "watchdog selftest: FAIL" at ~120 s means no reset.
+ * Do not use as the default trial DTB.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + WATCHDOG EXPIRY SELFTEST";
+};
+
+&watchdog_cl0 {
+	samsung,selftest-stop-petting-ms = <110000>;
+};
