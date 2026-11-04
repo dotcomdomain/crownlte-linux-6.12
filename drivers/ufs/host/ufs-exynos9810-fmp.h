@@ -22,11 +22,13 @@
 
 struct exynos9810_fmp_sg_entry {
 	struct ufshcd_sg_entry base;
-	__be64 file_iv[2];
-	__be64 file_enckey[4];
-	__be64 file_twkey[4];
-	__be64 disk_iv[2];
-	__be64 reserved[2];
+	struct_group(fmp,
+		__be64 file_iv[2];
+		__be64 file_enckey[4];
+		__be64 file_twkey[4];
+		__be64 disk_iv[2];
+		__be64 reserved[2];
+	);
 };
 
 #ifdef CONFIG_SCSI_UFS_CRYPTO
@@ -123,7 +125,7 @@ static int exynos9810_fmp_fill_prdt(struct ufs_hba *hba,
 		return -EINVAL;
 	for (i = 0; i < segments; i++, dun++) {
 		/* Zero unused fields; no disk encryption, no stale keys or IVs. */
-		memset(&prdt[i].file_iv, 0, sizeof(prdt[i]) - sizeof(prdt[i].base));
+		memset(&prdt[i].fmp, 0, sizeof(prdt[i].fmp));
 		prdt[i].base.size |= cpu_to_le32(BIT(26) | (2U << 28));
 		prdt[i].file_iv[0] = 0;
 		prdt[i].file_iv[1] = cpu_to_be64(dun);
