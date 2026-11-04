@@ -300,3 +300,15 @@
 	samsung,pmic-selftest;
 	status = "okay";
 };
+
+/*
+ * Display stage 1: simplefb console on SBoot's scanout buffer. The only DPU
+ * register write is the 4.9 decon_reg_set_trigger(HW, ENABLE) RMW of DECON-F
+ * HW_SW_TRIG_CONTROL (set HW_TRIG_EN, clear HW_TRIG_MASK_DECON), done only
+ * after the scanout is verified; restored on shutdown. Self-test pattern at
+ * ~108 s, held 10 s ("display selftest:").
+ */
+&decon_handover {
+	samsung,decon-trigger = "hw-te";
+	samsung,display-selftest;
+};
