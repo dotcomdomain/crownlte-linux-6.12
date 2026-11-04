@@ -393,6 +393,9 @@ CONFIG_WATCHDOG_OPEN_TIMEOUT=0
 CONFIG_WATCHDOG_SYSFS=y
 # CONFIG_WATCHDOG_NOWAYOUT is not set
 CONFIG_S3C2410_WATCHDOG=y
+# MAX77705 read-only battery monitor: battery/ac/usb/wireless power supplies
+# for the health HAL from I2C reads only (never writes charger/fuel gauge).
+CONFIG_BATTERY_MAX77705_RO=y
 # Generic reset/poweroff drivers would take over the syscon-reboot/poweroff
 # nodes from the hardware-verified crownlte diagnostic restart path:
 # CONFIG_POWER_RESET_SYSCON is not set
