@@ -55,8 +55,31 @@ enum mfd_func {
         FUNC_BULK_WRITE,
 };
 
+/*
+ * S2MPS18 slave "types" carried in cmd[0] bits 11:8. 4.9 passed the dummy
+ * I2C client address (s2mps18_core.c I2C_ADDR_TOP/PMIC/RTC/DEBUG).
+ */
+#define ACPM_MFD_TYPE_TOP		0x0
+#define ACPM_MFD_TYPE_PMIC		0x1
+#define ACPM_MFD_TYPE_RTC		0x2
+
+/*
+ * Write policy of the ACPM PMIC transport. Until a policy is sealed every
+ * write/bulk-write/update request is refused with -EPERM. A sealed policy
+ * can only open registers 0..31 of the RTC slave (type 2); writes to TOP,
+ * PMIC (regulators, IRQ masks, power control) and any other type are always
+ * refused, as is FUNC_UPDATE. A write to @update_reg must not set any bit in
+ * @update_forbidden. The policy can be sealed once per boot.
+ */
+struct acpm_mfd_write_policy {
+	u32 rtc_reg_mask;
+	u8 update_reg;
+	u8 update_forbidden;
+};
+
 #ifdef CONFIG_EXYNOS_ACPM
 bool exynos_acpm_mfd_is_ready(void);
+int exynos_acpm_mfd_seal_write_policy(const struct acpm_mfd_write_policy *policy);
 extern int exynos_acpm_read_reg(u16 type, u8 reg, u8 *dest);
 extern int exynos_acpm_bulk_read(u16 type, u8 reg, int count, u8 *buf);
 extern int exynos_acpm_write_reg(u16 type, u8 reg, u8 value);
@@ -64,6 +87,11 @@ extern int exynos_acpm_bulk_write(u16 type, u8 reg, int count, u8 *buf);
 extern int exynos_acpm_update_reg(u16 type, u8 reg, u8 value, u8 mask);
 #else
 static inline bool exynos_acpm_mfd_is_ready(void) { return false; }
+static inline int
+exynos_acpm_mfd_seal_write_policy(const struct acpm_mfd_write_policy *policy)
+{
+	return -ENODEV;
+}
 static inline int exynos_acpm_read_reg(u16 type, u8 reg, u8 *dest)
 {
 	return -ENODEV;
