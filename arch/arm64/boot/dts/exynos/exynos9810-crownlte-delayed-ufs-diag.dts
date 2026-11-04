@@ -222,7 +222,8 @@
 &{/} {
 	cpufreq {
 		compatible = "samsung,exynos9810-acpm-cpufreq";
-		samsung,mif-cal-id = <0x0b040000>;
+		/* CPU levels raise a MIF floor through the MIF devfreq (4.9 mif-perf). */
+		samsung,mif-devfreq = <&legacy_devfreq_mif>;
 		/* Diagnostic: exercise both clusters at ~100 s uptime. */
 		samsung,cpufreq-selftest;
 

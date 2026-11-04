@@ -590,6 +590,18 @@ static int exynos9810_get_mif_supplier(struct exynos9810_cpufreq *state)
 	if (IS_ERR(state->mif)) {
 		ret = PTR_ERR(state->mif);
 		state->mif = NULL;
+		/*
+		 * cpufreq/ links before devfreq/, so an enabled MIF devfreq that
+		 * has not probed yet reads as -ENODEV rather than a deferral.
+		 */
+		if (ret == -ENODEV) {
+			struct device_node *np = of_parse_phandle(dev->of_node,
+								  "samsung,mif-devfreq", 0);
+
+			if (np && of_device_is_available(np))
+				ret = -EPROBE_DEFER;
+			of_node_put(np);
+		}
 		return ret;
 	}
 	if (!state->mif->profile->get_cur_freq) {
