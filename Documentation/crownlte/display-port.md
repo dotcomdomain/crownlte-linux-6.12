@@ -1,12 +1,12 @@
 # crownlte display port (Exynos9810 DPU, S6E3HA8) — status and plan
 
-Branch `crownlte-display`, based on `crownlte-integration` 401c26eaa.
+Branch `crownlte-display` (stage 1, based on 401c26eaa, merged into `crownlte-integration` 31caf697c) and `crownlte-display-s2` (stage 2, based on 31caf697c; section 6).
 Everything below is **build-only and has not run on the phone**.
 
 | Stage | What | State |
 |---|---|---|
 | 1 | simplefb + fbcon on SBoot's scanout buffer, DECON TE trigger, on-screen self-test | built, untested |
-| 2 | dpu_9810 fbdev DECON/DPP/DSIM + S6E3HA8 + backlight "panel", vendor-HWC ABI | step S2-1 of 10 done (ioctl UAPI + checks) |
+| 2 | dpu_9810 fbdev DECON/DPP/DSIM + S6E3HA8 + backlight "panel", vendor-HWC ABI | round 1 built (branch `crownlte-display-s2`, section 6): DECON adopt driver, fb0 + full ioctl set, fences, TE vsync, contiguous-buffer window configs, read-only backlight; untested |
 
 ## 1. Hardware facts used
 
@@ -250,12 +250,12 @@ fallback: the DECON driver takes the aperture over at probe.
 | Step | Content | Hardware test | Panel risk |
 |---|---|---|---|
 | S2-1 ✔ | UAPI header + compile-time ABI checks (cd4f9a72b) | — | none |
-| S2-2 | Import the register layer (`regs-*.h`, `decon_reg.c`, `dpp_reg.c`, `dsim_reg.c`) behind a slim `dpu9810_hw.h`, build-only | — | none |
+| S2-2 partly done (4.9 regs headers + DECON/DPP window code) | Import the register layer (`regs-*.h`, `decon_reg.c`, `dpp_reg.c`, `dsim_reg.c`) behind a slim `dpu9810_hw.h`, build-only | — | none |
 | S2-3 | DSIM driver in **adopt** mode: if PLL locked (4.9 `dsim%d PLL is stabled in bootloader`) skip link/D-PHY init; DCS read of panel ID (0x04/0xDA–0xDC) with the DECON trigger masked | ID logged (expect 0x912047 per 4.9 "id:0x00912047") | low (read commands only) |
-| S2-4 | DECON-F core in adopt mode + fbdev fb0 on 0xcc000000 (takes over from simplefb), frame-done IRQ, `vsync` sysfs, FBIO_WAITFORVSYNC, pan_display with per-frame trigger enable/mask as 4.9 | fbcon via DECON; vsync timestamps at 60 Hz | none (same timing/format) |
-| S2-5 | DPP driver + S3CFB_WIN_CONFIG(_OLD) for contiguous dma-bufs, acquire/release/retire fences | test tool composes 2 windows from `/dev/dma_heap/linux,cma` | none |
+| S2-4 done, round 1 | DECON-F core in adopt mode + fbdev fb0 on 0xcc000000 (takes over from simplefb), frame-done IRQ, `vsync` sysfs, FBIO_WAITFORVSYNC, pan_display with per-frame trigger enable/mask as 4.9 | fbcon via DECON; vsync timestamps at 60 Hz | none (same timing/format) |
+| S2-5 done for unscaled RGB, round 1 | DPP driver + S3CFB_WIN_CONFIG(_OLD) for contiguous dma-bufs, acquire/release/retire fences | test tool composes 2 windows from `/dev/dma_heap/linux,cma` | none |
 | S2-6 | SysMMU v? for DPU (mainline exynos-iommu + DT), fault handler; system-heap buffers | HWC from Lineage reaches first composed frame | none |
-| S2-7 | EXYNOS_DISP_INFO, display/color mode ioctls, HDR caps, cursor; -ENOTTY for unknown nrs | HWC init without errors, SurfaceFlinger boots | none |
+| S2-7 done, round 1 | EXYNOS_DISP_INFO, display/color mode ioctls, HDR caps, cursor; -ENOTTY for unknown nrs | HWC init without errors, SurfaceFlinger boots | none |
 | S2-8 | Panel framework + S6E3HA8 crown_a3_s0 in keep-alive mode (no regulator/reset control): backlight class "panel" (max 44700) through the 4.9 dimming/AOR/gamma tables verbatim, lcd class "panel" sysfs | brightness steps, compare luminance with 4.9 | **medium**: wrong gamma/AOR/ELVSS tables can over-drive the OLED. Use only verbatim 4.9 tables, cap at normal brightness (no HBM) until verified |
 | S2-9 | Blank/unblank: DSIM display off/sleep-in and back, DECON stop/start; then S2DOS05 regulator driver + full 4.9 power sequence; DPU genpd | screen off/on cycles, suspend | **medium-high**: rail order/voltages (vdd1 1.5–1.6 V, vdd2 1.8 V, vdd5 3.0 V, ELVSS) must follow 4.9 exactly; never set voltages outside the 4.9 DT constraints |
 | S2-10 | DISP DVFS/BTS QoS, multi-resolution (DSU, mres 1080/720), doze/AOD, MDNIE/COPR, DP | — | low–medium |
@@ -284,3 +284,124 @@ until luminance has been compared with 4.9.
 4. Are the DPU SysMMUs in bypass, and what VERSION are they? (decides S2-6)
 5. Does FRAME_COUNT advance at ~60/s after the trigger change? (DECON/DSIM/TE path alive)
 6. Is the pixel order a8r8g8b8? (RED/BLU bars)
+
+## 6. Stage 2 round 1 — DECON-F adopt-mode driver (branch `crownlte-display-s2`)
+
+Based on `crownlte-integration` 31caf697c (stage 1 + watchdog + S2MPS18). Build-only,
+**untested on hardware**.
+
+### 6.1 What is built
+
+| Path | Content |
+|---|---|
+| `drivers/video/fbdev/exynos/dpu_9810/decon_drv.c` | platform driver `samsung,exynos9810-decon`: adopt, fb0, ioctls, update worker, fences, TE vsync, sysfs, self-test |
+| `drivers/video/fbdev/exynos/dpu_9810/decon_hw.c` | register layer ported from 4.9 decon_reg.c / dpp_reg.c / helper.c (unscaled RGB only) |
+| `drivers/video/fbdev/exynos/dpu_9810/regs-decon.h`, `regs-dpp.h`, `dpp_coef.h` | 4.9 headers, verbatim (coefficient tables made static) |
+| `drivers/video/fbdev/exynos/dpu_9810/panel_ro.c` | read-only backlight "panel" (`samsung,exynos9810-panel-readonly`) |
+| `arch/arm64/boot/dts/exynos/exynos9810-crownlte-delayed-ufs-display-s2-diag.dts` | trial DTB: root-level `decon_f@16030000`, `panel_drv@001`, `decon-pool` (48 MiB CMA below 4 GiB), stage 1 helper disabled |
+| `arch/arm64/boot/dts/exynos/exynos9810.dtsi` | `sysmmu_dpu0..2`, disabled (see `display-iommu.md`) |
+
+Config: `FB_EXYNOS9810_DPU=y`, `FB_EXYNOS9810_PANEL_RO=y`, `BACKLIGHT_CLASS_DEVICE=y`
+(also in `crownlte_android_defconfig`). Both drivers are inert unless the DT has their
+nodes. The normal delayed-UFS diag DTB gets only the disabled SysMMU nodes.
+
+### 6.2 Register writes, in order
+
+1. Probe (adopt): the same gates as stage 1: PMU 0x14064024 == 0xf, DECON_EN|EN_F,
+   command mode, all DPU SysMMU CTRL bit 0 clear, and an enabled window whose DPP scans
+   the boot fb at offset 0 with 1440x2960 and 5760-byte rows. Then the same single trigger RMW
+   (DECON+0x70: set bit 0, clear bit 4) if it is not already set.
+2. TE IRQ request: pinctrl writes for gpd0-0, i.e. CON = EINT function 0xf (the value
+   SBoot/4.9 `hw_te_on` already uses), EINT_CON rising edge, EINT mask cleared. This is
+   identical to what 4.9 does.
+3. fb takeover (`samsung,fb-takeover`), as a normal commit:
+   - **DPP of SBoot's window:** IDMA SRC_OFFSET/SRC_SIZE/IMG_SIZE, IN_CON rotation 0,
+     block off, format BGRA8888 (3); DPP IMG_SIZE, IN_CON alpha-sel per-pixel, format
+     ARGB8888; scale ratio 1<<20 and the 8:8 coefficient set (4.9 writes these every frame);
+     IN_BASE_ADDR_Y/C = 0xcc000000.
+   - **DECON:** WIN_CONTROL_0/1 (COPY), WIN_START/END_POSITION full screen,
+     WIN_START_TIME 0, DATA_PATH_CONTROL_0/1 (all other windows disabled, chmap), then
+     SHADOW_REG_UPDATE_REQ global bit 31, with the trigger masked around the programming
+     and unmasked again.
+4. A DPP used for the first time gets the 4.9 `dpp_reg_init` values: IRQs masked
+   (4.9 unmasks them; we have no DPP IRQ handler), clock-gate enables 0, DMA common QoS
+   LUTs 0x44444444, dynamic gating 0, frame alpha 0xff.
+5. Not written: DECON INTERRUPT_ENABLE (completion is polled through
+   SHADOW_REG_UPDATE_REQ, as in 4.9 `decon_reg_wait_for_update_timeout`), blender
+   background, data path / DSC / splitter, DSIM, PHY, PMU, CMU, the SysMMUs.
+
+Why IDMA format 3 for fb0: 4.9 sets up its own fb0 window as DPP `BGRA_8888`, and its fb0
+var is red@16/green@8/blue@0/alpha@24 (Linux ARGB8888, recovery capture). So the IDMA
+format names follow memory byte order, which makes SBoot's format 0 most likely bytes
+A,R,G,B. The stage 1 simplefb `a8r8g8b8` guess may therefore show wrong colours in q25.
+The stage 2 takeover makes fb0 match 4.9 whatever q25 shows.
+
+### 6.3 Expected log (display-s2 DTB)
+
+```
+exynos9810-decon 16030000.decon_f: SBoot state: GLOBAL_CONTROL=0x… TRIG=0x… DP0=0x… DP1=0x… FRAME_COUNT=N
+exynos9810-decon 16030000.decon_f: sysmmu_dpu0..2 CTRL=0x0 VERSION=0x7…        (major 7 expected)
+exynos9810-decon 16030000.decon_f: win5 -> dpp0: IN_CON=… SRC=0xb9005a0 IMG=0xb9005a0 OFF=0 BASE=0xcc000000
+exynos9810-decon 16030000.decon_f: adopted: win5 dpp0 IDMA format 0 at 0x00000000cc000000
+exynos9810-decon 16030000.decon_f: WRITE HW_SW_TRIG_CONTROL 0x… -> 0x…        (only if masked)
+exynos9810-decon 16030000.decon_f: fb0: 1440x2960 stride 5760 at 0x00000000cc000000
+exynos9810-decon 16030000.decon_f: fb0 takeover: win5 dpp0 DPP BGRA_8888 at …: 0, latched after ~17000 us, FRAME_COUNT a -> a+1..2
+exynos9810-decon 16030000.decon_f: adopt mode ready: TE irq NN, fb0 window owned
+panel-readonly panel_drv@001: read-only backlight "panel": 12800/44700 (no panel driver yet)
+decon selftest: scheduled at 108000 ms uptime, 20 flips every 400 ms
+…
+decon selftest: start at 108.0xx s: FRAME_COUNT=… TE=… commits=1 fb_taken=1
+decon selftest: buffer A at 0x…, buffer B at 0x…   (inside decon-pool, below 4 GiB)
+decon selftest: flip i -> A/B: 0, fence after ≤ 34000 us, FRAME_COUNT … (+~24) TE … (+~24)
+decon selftest: restored fb0: 0
+decon selftest: PASS: 20/20 flips latched, FRAME_COUNT x -> y (advanced in 20/20 flips), TE t0 -> t1, max fence wait … us, latch timeouts 0
+```
+(Window and DPP numbers are SBoot's; the values above are predictions.)
+
+### 6.4 Expected screen
+
+The logo becomes the boot console. If the stage 1 colours were wrong, they are correct from
+the takeover on (white text on black). At ~108 s the screen alternates every 400 ms for
+~8 s between a **green** buffer showing a big "A" and a **magenta** buffer showing "B".
+Both have a white frame, the text "DECON FLIP TEST / CMA BUFFER A|B", and a red bar
+(lower in B). Then the console comes back. The diag restarts at 120 s.
+
+### 6.5 Failure reading
+
+| Log | Meaning |
+|---|---|
+| `PMU DPU domain is off` / `not running in command mode` / `no enabled window scans` | adopt refused; simplefb (stage 1) stays as fb0 |
+| `DPU SysMMU enabled by SBoot` | adopt refused; IOMMU work first |
+| takeover `-110` (ETIMEDOUT), FRAME_COUNT not advancing | the shadow update never latched: no TE-triggered frames (check the TE count) |
+| flips `0` but the screen stays on the console | DECON scans something else: compare the `win… BASE` dump (EXYNOS_DPU_DUMP) with the buffer addresses |
+| TE count stays 0 | the EINT on gpd0-0 is not firing (the pinctrl EINT path is wrong); vsync falls back to sleeps |
+| `cannot allocate … CMA buffer` | decon-pool missing or too small |
+
+### 6.6 HWC readiness
+
+- fb0 ioctls, `vsync`/`psr_info` sysfs and fences are in place. `EXYNOS_DISP_INFO` reports
+  psr_mode 2, chip 9810 and a single 1440x2960 mode (mres disabled: no DSU yet).
+- **The HWC's own layers will be rejected** until the SysMMU works, because gralloc's
+  system-heap buffers are scattered. Expect `win%d rejected (… ): -22` /
+  `buffer not contiguous` and a failing `S3CFB_WIN_CONFIG`. Testing userspace before
+  then needs CMA-heap buffers (`/dev/dma_heap/linux,cma` is only 16 MiB in the defconfig;
+  a 1440x2960 layer is 17 MB).
+- The blank, power-mode and set-display-mode calls are accepted and ignored. Brightness is
+  read-only.
+- The self-test uses the shared win-config path with kernel-exported dma-bufs. Only the fd
+  lookup and copy_from_user of the ioctl are not exercised: a kernel thread cannot hold
+  user fds.
+
+### 6.7 Stage 2 risks (this round)
+
+- **No panel power, voltage, timing or DSIM change exists in this code.** The panel only
+  receives frames in the format 4.9 itself uses for fb0 (BGRA8888), at the timing SBoot
+  set up.
+- Wrong DPP/window programming shows garbage or a frozen picture: recoverable, no damage.
+  A DPP register write to a non-existent offset could raise an SError. Every offset
+  written is one that 4.9 writes for the same DPP id on every frame.
+- Probe hangs: all DPU accesses happen after the PMU DPU_STATUS check. The SysMMU SFRs
+  read are the non-secure ones that 4.9 reads.
+- TE EINT at 60 Hz adds ~60 IRQ/s.
+- Self-test buffers come from a reusable CMA pool. Migration on allocation can take a few
+  ms; failure is logged and nothing is flipped.
