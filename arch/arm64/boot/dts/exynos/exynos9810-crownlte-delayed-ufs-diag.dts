@@ -3,6 +3,7 @@
  * VCC and pad mux are inherited from sboot for this first transport test.
  * No regulator driver is enabled in the parent diagnostic configuration. */
 #include "exynos9810-crownlte-real-clock-usb-diag.dts"
+#include <dt-bindings/thermal/thermal.h>
 
 &{/} {
 	model = "Samsung Note9 delayed UFS transport diagnostic";
@@ -23,8 +24,6 @@
 	crownlte,read-only-diagnostic;
 	status = "okay";
 };
-
-&legacy_acpm_dvfs { samsung,freq-get-selftest; };
 
 /*
  * ACPM TMU plugin and TMU temperature sensors (4.9 exynos_acpm_tmu +
@@ -102,8 +101,13 @@
 	/*
 	 * 4.9 passive control temperatures (BIG 83 C, G3D 88 C; LITTLE/ISP had
 	 * none). 4.9's "hot" trip was 115 C and became the TMU rise7/hardware
-	 * trip; the software critical trip sits below it. No cooling maps yet:
-	 * cpufreq/devfreq cooling devices are not registered in this diag.
+	 * trip; the software critical trip sits below it. 4.9 throttled BIG
+	 * with power_allocator over the big cpufreq domain at big-control-temp
+	 * (cooling-device <&domain1 NO_LIMIT NO_LIMIT>). Without an energy model
+	 * power_allocator cannot drive cpufreq cooling here, so BIG uses the
+	 * default step_wise governor on the same trip and cooling range.
+	 * 4.9's LITTLE maps were all <0 0> (never throttle) and are omitted;
+	 * G3D has no devfreq cooling device yet.
 	 * 4.9 LITTLE/ISP/G3D relied on TMU interrupts; here everything polls.
 	 */
 	thermal-zones {
@@ -113,7 +117,7 @@
 			thermal-sensors = <&tmu_big>;
 
 			trips {
-				big-control-temp {
+				big_control_temp: big-control-temp {
 					temperature = <83000>;
 					hysteresis = <5000>;
 					type = "passive";
@@ -122,6 +126,17 @@
 					temperature = <110000>;
 					hysteresis = <0>;
 					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&big_control_temp>;
+					cooling-device =
+						<&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -171,6 +186,70 @@
 					type = "critical";
 				};
 			};
+		};
+	};
+};
+
+/*
+ * CPU frequency scaling: values from the 4.9 crownlte_eur_open_26 DT
+ * cpufreq/domain@0 and domain@1. cal-id 0x0b040002/0x0b040003 are the ACPM
+ * DVFS vclks dvfs_cpucl0/dvfs_cpucl1; 0x0b040000 is dvfs_mif. 4.9 gave big
+ * max-freq 2314000 with policy-max 1794000; samsung,max-freq-cap (not in
+ * 4.9) holds the table at 1794000 until thermal throttling is verified.
+ * The mif-perf tables only drive a samsung,mif-devfreq supplier (none yet).
+ * The cpufreq core registers each policy CPU node as a cooling device.
+ */
+&cpu0 { #cooling-cells = <2>; };
+&cpu1 { #cooling-cells = <2>; };
+&cpu2 { #cooling-cells = <2>; };
+&cpu3 { #cooling-cells = <2>; };
+&cpu4 { #cooling-cells = <2>; };
+&cpu5 { #cooling-cells = <2>; };
+&cpu6 { #cooling-cells = <2>; };
+&cpu7 { #cooling-cells = <2>; };
+
+&{/} {
+	cpufreq {
+		compatible = "samsung,exynos9810-acpm-cpufreq";
+		samsung,mif-cal-id = <0x0b040000>;
+		/* Diagnostic: exercise both clusters at ~100 s uptime. */
+		samsung,cpufreq-selftest;
+
+		cluster0 {
+			cpus = <&cpu0>, <&cpu1>, <&cpu2>, <&cpu3>;
+			samsung,cal-id = <0x0b040002>;
+			min-freq = <455000>;
+			max-freq = <1950000>;
+			samsung,mif-ect-domain = "dvfs_cpucl0";
+			samsung,mif-perf-table =
+				<1950000 845000>, <1794000 845000>,
+				<1690000 845000>, <1456000 676000>,
+				<1248000 676000>, <1053000 676000>,
+				<949000 676000>, <832000 546000>,
+				<715000 546000>, <598000 421000>,
+				<455000 0>;
+		};
+
+		cluster1 {
+			cpus = <&cpu4>, <&cpu5>, <&cpu6>, <&cpu7>;
+			samsung,cal-id = <0x0b040003>;
+			min-freq = <650000>;
+			max-freq = <2314000>;
+			policy-max = <1794000>;
+			samsung,max-freq-cap = <1794000>;
+			samsung,mif-ect-domain = "dvfs_cpucl1";
+			samsung,mif-perf-table =
+				<2886000 1794000>, <2860000 1794000>,
+				<2704000 1794000>, <2652000 1794000>,
+				<2496000 1794000>, <2314000 1794000>,
+				<2106000 1794000>, <2002000 1794000>,
+				<1924000 1794000>, <1794000 1794000>,
+				<1690000 1539000>, <1586000 1014000>,
+				<1469000 845000>, <1261000 676000>,
+				<1170000 676000>, <1066000 676000>,
+				<962000 546000>, <858000 546000>,
+				<741000 421000>, <650000 421000>,
+				<598000 421000>;
 		};
 	};
 };
