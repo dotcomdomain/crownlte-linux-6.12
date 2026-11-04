@@ -299,5 +299,15 @@
 	status = "okay";
 };
 
+/*
+ * cpuidle staging, stage B: the C2 driver registers with C2 disarmed on
+ * every CPU. At ~90 s the self-test arms C2 on cpu1, then cpu4, then all
+ * secondaries (never cpu0), 2.5 s each, and disarms everything afterwards.
+ */
+&cpuidle {
+	samsung,cpuidle-selftest;
+	status = "okay";
+};
+
 /* SMP bring-up test: all eight CPUs */
 &{/chosen} { bootargs = "panic=30 ro"; };
