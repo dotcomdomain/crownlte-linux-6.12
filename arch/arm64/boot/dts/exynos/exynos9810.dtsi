@@ -323,36 +323,53 @@
 		};
 
 		/*
-		 * DPU System MMUs (4.9 sysmmu_dpu0..2). The 4.9 driver uses the
-		 * SysMMU v7 non-VM register layout (PT_BASE 0x0c, flush 0x10-0x24,
-		 * fault 0x70/0x78, CAPA0/1 0x870/0x874) that mainline
-		 * exynos-iommu calls sysmmu_v7_variant. Ports: dpu0 VGRF/VGF,
+		 * DPU System MMUs (4.9 sysmmu_dpu0..2), SysMMU v7.x with the
+		 * non-VM register layout (PT_BASE 0x0c, flush 0x10-0x24, fault
+		 * 0x70/0x78, CAPA0/1 0x870/0x874). "samsung,exynos9810-sysmmu"
+		 * selects the 4.9 programming model in exynos-iommu: CFG =
+		 * (reset value & ~0x301f1f8c) | QoS override | samsung,qos, no
+		 * access-protection check (CFG_EAP) and no PTE protection bits,
+		 * range TLB flushes, faults never panic. Ports: dpu0 VGRF/VGF,
 		 * dpu1 G0/VG0, dpu2 G1/VG1/WB. Interrupt 0 is the non-secure
 		 * fault IRQ (4.9 index 1 = secure, not used here). The secure
 		 * SFR blocks (0x160d0000, 0x160e0000, 0x160f0000) must not be
-		 * touched from the kernel.
-		 * Disabled: see Documentation/crownlte/display-iommu.md.
+		 * touched from the kernel. No clocks: the GATE_SYSMMU_DPUDn
+		 * vclks are HWACG Q-channel gates whose enable/disable are
+		 * no-ops. samsung,pd-status: PMU DPU_STATUS must read 0xf
+		 * before any SFR access.
+		 * Disabled here; enabled with iommus on decon_f by
+		 * exynos9810-crownlte-delayed-ufs-display-s2-iommu-diag.dts.
+		 * See Documentation/crownlte/display-iommu.md.
 		 */
 		sysmmu_dpu0: sysmmu@160a0000 {
-			compatible = "samsung,exynos-sysmmu";
+			compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
 			reg = <0x160a0000 0x9000>;
 			interrupts = <GIC_SPI 211 IRQ_TYPE_LEVEL_HIGH>;
+			samsung,qos = <15>;
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			samsung,pd-status = <0x4024 0xf 0xf>;
 			#iommu-cells = <0>;
 			status = "disabled";
 		};
 
 		sysmmu_dpu1: sysmmu@160b0000 {
-			compatible = "samsung,exynos-sysmmu";
+			compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
 			reg = <0x160b0000 0x9000>;
 			interrupts = <GIC_SPI 213 IRQ_TYPE_LEVEL_HIGH>;
+			samsung,qos = <15>;
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			samsung,pd-status = <0x4024 0xf 0xf>;
 			#iommu-cells = <0>;
 			status = "disabled";
 		};
 
 		sysmmu_dpu2: sysmmu@160c0000 {
-			compatible = "samsung,exynos-sysmmu";
+			compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
 			reg = <0x160c0000 0x9000>;
 			interrupts = <GIC_SPI 215 IRQ_TYPE_LEVEL_HIGH>;
+			samsung,qos = <15>;
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			samsung,pd-status = <0x4024 0xf 0xf>;
 			#iommu-cells = <0>;
 			status = "disabled";
 		};
