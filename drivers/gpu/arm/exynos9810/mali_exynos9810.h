@@ -7,6 +7,7 @@
 #ifndef _MALI_EXYNOS9810_H_
 #define _MALI_EXYNOS9810_H_
 
+#include <linux/bits.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
@@ -27,6 +28,25 @@ struct thermal_cooling_device;
 #define XG_PMU_G3D_CONFIGURATION	0x4040
 #define XG_PMU_G3D_STATUS		0x4044
 #define XG_PMU_G3D_LOCAL_PWR_MASK	0xf	/* 4.9 gpu_pmu_status_local_pwr_mask */
+
+/*
+ * PMU PWR_EMBEDDED_G3D block (G3D rail sequencer). OPTION 0x4680 / DURATION
+ * 0x4684 are named in 4.9 flexpmu_cal_system_exynos9810.h pmucal_lpm_init;
+ * 0x4678/0x467c are the registers the APM firmware G3D rail routine writes
+ * (1/0) and polls (bit 0); CONFIGURATION/STATUS by the usual PMU layout.
+ */
+#define XG_PMU_G3D_PWR_CONFIGURATION	0x4678
+#define XG_PMU_G3D_PWR_STATUS		0x467c
+#define XG_PMU_G3D_PWR_STATUS_ON	BIT(0)
+
+/* S2MPS18 PMIC (ACPM type 1) BUCK6 = vdd_g3d control, read only here */
+#define XG_S2MPS18_B6CTRL		0x2a
+
+enum xg_pd_mode {
+	XG_PD_OFF,		/* stage 1: domain never switched */
+	XG_PD_BOOT_ON,		/* switch on at probe if off; never off */
+	XG_PD_RUNTIME,		/* + off after kbase GPU power-off (4.9) */
+};
 
 /* CMU_G3D (0x17400000): PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER, bit 4 MUX_SEL */
 #define XG_CMU_G3D_MUX_USER		0x0100
@@ -90,6 +110,19 @@ struct exynos9810_gpu {
 	struct delayed_work selftest_work;
 	unsigned long nr_power_on;
 	unsigned long nr_power_off;
+
+	/* G3D power domain (mali_exynos9810_pd.c). Lock order: pd_lock, set_lock. */
+	enum xg_pd_mode pd_mode;
+	u32 pd_cal_id;
+	u32 pd_need_smc;
+	unsigned int pd_off_delay_ms;
+	struct mutex pd_lock;
+	struct delayed_work pd_off_work;
+	bool pd_failed;			/* a transition failed: no more power-off */
+	bool pd_state_lost;		/* domain cycled since the last kbase power on */
+	unsigned long nr_pd_on;
+	unsigned long nr_pd_off;
+	unsigned long nr_pd_errors;
 };
 
 extern struct exynos9810_gpu *exynos9810_gpu;
@@ -108,6 +141,15 @@ unsigned int xg_dvfs_cur_khz(struct exynos9810_gpu *g);
 void xg_dvfs_hold(struct exynos9810_gpu *g, bool hold);
 int xg_sysfs_init(struct exynos9810_gpu *g);
 void xg_sysfs_term(struct exynos9810_gpu *g);
+
+int xg_pd_init(struct exynos9810_gpu *g);
+void xg_pd_term(struct exynos9810_gpu *g);
+int xg_pd_on_locked(struct exynos9810_gpu *g, const char *why);
+int xg_pd_off_locked(struct exynos9810_gpu *g, const char *why);
+bool xg_pd_may_power_off(struct exynos9810_gpu *g);
+bool xg_pd_power_on(struct exynos9810_gpu *g);
+void xg_pd_power_off(struct exynos9810_gpu *g);
+const char *xg_pd_mode_str(struct exynos9810_gpu *g);
 
 void xg_selftest_schedule(struct exynos9810_gpu *g);
 void xg_selftest_cancel(struct exynos9810_gpu *g);

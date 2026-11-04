@@ -276,6 +276,12 @@
 			interrupt-names = "JOB", "MMU", "GPU";
 			samsung,pmu-syscon = <&pmu_system_controller>;
 			samsung,cal-id = <0x0b040004>;
+			/*
+			 * 4.9 pd-embedded_g3d@14064040 cal_id / need_smc. Used
+			 * only with samsung,g3d-power-control (default off).
+			 */
+			samsung,g3d-pd-cal-id = <0xb1380008>;
+			samsung,g3d-need-smc = <0x17410204>;
 			samsung,dvfs-table = <572000 78 100 5 1794000>,
 					     <546000 78  99 1 1794000>,
 					     <455000 78  85 1 1539000>,

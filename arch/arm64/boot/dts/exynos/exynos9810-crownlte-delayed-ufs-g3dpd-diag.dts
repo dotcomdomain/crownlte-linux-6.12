@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * G3D POWER-DOMAIN TRIAL (stage "boot-on").
+ *
+ * Identical to exynos9810-crownlte-delayed-ufs-diag, except:
+ *  - the S2MPS18 PMIC transport passes the two exact 4.9 G3D rail requests
+ *    (ACPM FUNC_UPDATE type 3, reg 0x2a, mask 0xc0, value 0xc0 / 0x00),
+ *    which the APM firmware turns into PMU PWR_EMBEDDED_G3D on/off plus
+ *    S2MPS18 B6CTRL bits 3:2. Every other PMIC write stays refused.
+ *  - the Mali platform powers the G3D domain on at probe if SBoot left it
+ *    off (4.9 cal_pd_control(0xb1380008, 1): rail, PMUCAL, DTZPC restore
+ *    SMC 0x82000410(1, 0x17410204)), and never off at runtime.
+ *  - the Mali self-test (~109 s) adds one domain off/on cycle with the GPU
+ *    idle, then a kbase power-up, GPU_ID / L2 / cache-clean check.
+ * Expected: "mali selftest: pd cycle: PASS" and "mali selftest: PASS".
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + G3D power domain (boot-on)";
+};
+
+&s2mps18_pmic {
+	samsung,g3d-rail-update;
+};
+
+&gpu {
+	samsung,g3d-power-control = "boot-on";
+};

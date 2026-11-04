@@ -4,12 +4,12 @@
  *
  * Replaces the 4.9 Samsung "gpex" stack (drivers/gpu/arm/exynos, ~14k
  * lines) with the parts this phone needs:
- *  - power: the PMU "embedded_g3d" domain is NOT switched in stage 1. 4.9
- *    cal_pd_control(0xb1380008) powers it with an S2MPS18 BUCK6 (vdd_g3d)
- *    B6CTRL update over ACPM, a PMU write and a DTZPC restore SMC; the 6.12
- *    ACPM PMIC write gate refuses that update by design. The GPU is used
- *    only if SBoot left the domain on, and it is never powered off here:
- *    kbase still power-gates L2 and shader cores through GPU registers.
+ *  - power: by default (stage 1) the PMU "embedded_g3d" domain is NOT
+ *    switched: the GPU is used only if SBoot left the domain on, and it is
+ *    never powered off here; kbase still power-gates L2 and shader cores
+ *    through GPU registers. With samsung,g3d-power-control the 4.9
+ *    cal_pd_control(0xb1380008) sequence (ACPM G3D rail request, PMUCAL,
+ *    DTZPC SMC) is used, see mali_exynos9810_pd.c.
  *  - clock: G3D DVFS through cal_dfs_set_rate() on dvfs_g3d (ACPM vclk,
  *    firmware-chosen voltage), see mali_exynos9810_dvfs.c.
  *  - the kbase core hooks of mali_exynos_kbase_entrypoint.h and the Samsung
@@ -128,20 +128,25 @@ static int xg_platform_init(struct kbase_device *kbdev)
 		ret = dev_err_probe(dev, PTR_ERR(g->pmu), XG_PFX "no PMU syscon\n");
 		goto fail;
 	}
-	if (!xg_pd_is_on(g, &cfg, &st)) {
-		dev_err(dev, XG_PFX "G3D power domain is off (PMU cfg %#x status %#x); stage 1 never powers it, /dev/mali0 not registered\n",
-			cfg, st);
-		ret = -ENODEV;
-		goto fail;
-	}
-
-	/* 2. CMU_G3D user mux must select the G3D clock (pmucal embedded_g3d_on). */
+	/* CMU_G3D is outside the switched domain: readable while it is off. */
 	g->cmu = of_iomap(np, 1);
 	if (!g->cmu) {
 		dev_err(dev, XG_PFX "no CMU_G3D register window (reg index 1)\n");
 		ret = -ENODEV;
 		goto fail;
 	}
+	/* Optional G3D power control: may switch the domain on here. */
+	ret = xg_pd_init(g);
+	if (ret)
+		goto fail;
+	if (!xg_pd_is_on(g, &cfg, &st)) {
+		dev_err(dev, XG_PFX "G3D power domain is off (PMU cfg %#x status %#x); G3D power control %s, /dev/mali0 not registered\n",
+			cfg, st, xg_pd_mode_str(g));
+		ret = -ENODEV;
+		goto fail;
+	}
+
+	/* 2. CMU_G3D user mux must select the G3D clock (pmucal embedded_g3d_on). */
 	mux = xg_cmu_mux(g);
 	if (!(mux & XG_CMU_G3D_MUX_USER_SEL)) {
 		dev_err(dev, XG_PFX "CMU_G3D MUX_CLKCMU_EMBEDDED_G3D_USER %#x selects OSCCLK; /dev/mali0 not registered\n",
@@ -160,15 +165,16 @@ static int xg_platform_init(struct kbase_device *kbdev)
 	if (ret)
 		goto fail;
 
-	dev_info(dev, XG_PFX "G3D domain on (PMU cfg %#x status %#x), CMU mux %#x, %u kHz, %u DVFS levels%s\n",
+	dev_info(dev, XG_PFX "G3D domain on (PMU cfg %#x status %#x), CMU mux %#x, %u kHz, %u DVFS levels%s, power control %s\n",
 		 cfg, st, mux, g->boot_khz, g->nr_levels,
-		 g->dvfs_enabled ? "" : " (DVFS off)");
+		 g->dvfs_enabled ? "" : " (DVFS off)", xg_pd_mode_str(g));
 
 	kbdev->platform_context = g;
 	exynos9810_gpu = g;
 	return 0;
 
 fail:
+	xg_pd_term(g);	/* no-op unless xg_pd_init() enabled power control */
 	if (g->cmu)
 		iounmap(g->cmu);
 	kfree(g);
@@ -183,6 +189,7 @@ static void xg_platform_term(struct kbase_device *kbdev)
 		return;
 	kbdev->platform_context = NULL;
 	exynos9810_gpu = NULL;
+	xg_pd_term(g);
 	if (g->cmu)
 		iounmap(g->cmu);
 	kfree(g);
@@ -230,23 +237,29 @@ struct kbase_platform_funcs_conf exynos9810_gpu_platform_funcs = {
 };
 
 /*
- * kbase power callbacks. The PMU domain stays on, so GPU state is never
- * lost across these: return 0 ("no reset needed"); kbase resets the GPU
- * itself in kbase_pm_init_hw() at power-up.
+ * kbase power callbacks (called under kbase pm.lock, may sleep). Without
+ * G3D power control the PMU domain stays on, so GPU state is never lost:
+ * return 0 ("no reset needed"); kbase resets the GPU itself in
+ * kbase_pm_init_hw() at power-up. With it, return 1 after the domain was
+ * cycled so kbase resets the GPU.
  */
 static int xg_power_on(struct kbase_device *kbdev)
 {
 	struct exynos9810_gpu *g = kbdev->platform_context;
+	bool lost = false;
 	u32 cfg, st;
 
 	if (!g)
 		return 0;
 	g->nr_power_on++;
+	if (g->pd_mode != XG_PD_OFF)
+		lost = xg_pd_power_on(g);
+	else
+		xg_dvfs_power_on(g);
 	if (!xg_pd_is_on(g, &cfg, &st))
 		dev_err_ratelimited(g->dev, XG_PFX "G3D power domain off at GPU power-on (PMU cfg %#x status %#x)\n",
 				    cfg, st);
-	xg_dvfs_power_on(g);
-	return 0;
+	return lost ? 1 : 0;
 }
 
 static void xg_power_off(struct kbase_device *kbdev)
@@ -257,6 +270,7 @@ static void xg_power_off(struct kbase_device *kbdev)
 		return;
 	g->nr_power_off++;
 	xg_dvfs_power_off(g);
+	xg_pd_power_off(g);
 }
 
 struct kbase_pm_callback_conf exynos9810_gpu_pm_callbacks = {

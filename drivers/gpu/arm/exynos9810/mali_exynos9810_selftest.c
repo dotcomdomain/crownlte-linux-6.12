@@ -14,6 +14,10 @@
  *  5. DVFS: the samsung,selftest-khz levels through cal_dfs_set_rate() with
  *     CMU readback and a GPU_ID read at each level, then the original level.
  *  6. kbase_pm_context_idle(): wait until kbase powers the GPU down.
+ *  7. Only with samsung,g3d-power-control: one G3D power-domain cycle
+ *     (4.9 cal_pd_control off, 20 ms, on), then kbase power-up again with a
+ *     GPU_ID / L2 / cache-clean check (kbase resets the GPU first) and
+ *     power-down.
  * No job is submitted (that needs a user context and job memory; the first
  * real job comes from libGLES_mali). Bounded to well under 3 s.
  */
@@ -33,7 +37,6 @@
 #include "mali_exynos9810.h"
 
 #define XG_PD_CAL_ID		0xb1380008	/* 4.9 pd-embedded_g3d cal_id */
-#define XG_S2MPS18_B6CTRL	0x2a
 #define XG_ST_AT_MS		109000
 #define XG_ST_MAX_LEVELS	4
 #define XG_ST_POWEROFF_MS	1000
@@ -119,6 +122,85 @@ static int xg_st_dvfs(struct exynos9810_gpu *g)
 	return fails;
 }
 
+/* Wait until kbase has powered the GPU off; true if it did. */
+static bool xg_st_wait_gpu_off(struct kbase_device *kbdev, s64 *ms)
+{
+	ktime_t t = ktime_get();
+
+	while (xg_gpu_powered(kbdev) && ktime_ms_delta(ktime_get(), t) < XG_ST_POWEROFF_MS)
+		msleep(10);
+	*ms = ktime_ms_delta(ktime_get(), t);
+	return !xg_gpu_powered(kbdev);
+}
+
+/* 7. One G3D power-domain off/on cycle with the GPU idle, then a re-check. */
+static int xg_st_pd_cycle(struct exynos9810_gpu *g)
+{
+	struct kbase_device *kbdev = g->kbdev;
+	u32 cfg, st, id, l2p, l2r;
+	int ret_off, ret_on, ret;
+	s64 off_us, on_us, ms;
+	bool off_ok;
+	ktime_t t;
+
+	if (g->pd_mode == XG_PD_OFF) {
+		pr_info(XG_ST_PFX "pd cycle: not run (G3D power control off)\n");
+		return 0;
+	}
+	cancel_delayed_work_sync(&g->pd_off_work);
+	mutex_lock(&g->pd_lock);
+	if (!xg_pd_may_power_off(g)) {
+		mutex_unlock(&g->pd_lock);
+		pr_err(XG_ST_PFX "pd cycle: GPU not idle, not run: FAIL\n");
+		return 1;
+	}
+	t = ktime_get();
+	ret_off = xg_pd_off_locked(g, "selftest");
+	off_us = xg_us_since(t);
+	off_ok = !xg_pd_is_on(g, &cfg, &st);
+	pr_info(XG_ST_PFX "pd cycle: off %d, %lld us, PMU G3D cfg %#x status %#x\n",
+		ret_off, off_us, cfg, st);
+	msleep(20);
+	t = ktime_get();
+	ret_on = xg_pd_on_locked(g, "selftest");
+	on_us = xg_us_since(t);
+	xg_pd_is_on(g, &cfg, &st);
+	mutex_unlock(&g->pd_lock);
+	pr_info(XG_ST_PFX "pd cycle: on %d, %lld us, PMU G3D cfg %#x status %#x, CAL pd status %d, pd on/off/errors %lu/%lu/%lu\n",
+		ret_on, on_us, cfg, st, cal_pd_status(g->pd_cal_id),
+		g->nr_pd_on, g->nr_pd_off, g->nr_pd_errors);
+	if (ret_off || !off_ok || ret_on < 0) {
+		pr_err(XG_ST_PFX "pd cycle: FAIL\n");
+		return 1;
+	}
+
+	/* kbase power_on sees pd_state_lost and resets the GPU. */
+	t = ktime_get();
+	kbase_pm_context_active(kbdev);
+	ret = kbase_pm_wait_for_desired_state(kbdev);
+	id = kbase_reg_read(kbdev, GPU_CONTROL_REG(GPU_ID));
+	l2p = kbase_reg_read(kbdev, GPU_CONTROL_REG(L2_PRESENT_LO));
+	l2r = kbase_reg_read(kbdev, GPU_CONTROL_REG(L2_READY_LO));
+	pr_info(XG_ST_PFX "pd cycle: kbase power up %d, %lld us, GPU_ID %#010x, L2 present %#x ready %#x, clock %u kHz\n",
+		ret, xg_us_since(t), id, l2p, l2r, xg_dvfs_cur_khz(g));
+	if (ret || id != g->gpu_id || !l2p || l2r != l2p)
+		ret = ret ? ret : -EIO;
+	if (!ret) {
+		t = ktime_get();
+		kbase_gpu_start_cache_clean(kbdev, GPU_COMMAND_CLEAN_INV_CACHES);
+		ret = kbase_gpu_wait_cache_clean_timeout(kbdev, 100);
+		pr_info(XG_ST_PFX "pd cycle: cache clean+invalidate %d, %lld us\n",
+			ret, xg_us_since(t));
+	}
+	kbase_pm_context_idle(kbdev);
+	if (!xg_st_wait_gpu_off(kbdev, &ms)) {
+		pr_err(XG_ST_PFX "pd cycle: kbase GPU still on after %lld ms\n", ms);
+		ret = ret ? ret : -EBUSY;
+	}
+	pr_info(XG_ST_PFX "pd cycle: %s\n", ret ? "FAIL" : "PASS");
+	return ret ? 1 : 0;
+}
+
 static void xg_selftest_fn(struct work_struct *work)
 {
 	struct exynos9810_gpu *g = container_of(to_delayed_work(work),
@@ -201,16 +283,21 @@ static void xg_selftest_fn(struct work_struct *work)
 
 	/* 6. power down through kbase */
 	kbase_pm_context_idle(kbdev);
-	t = ktime_get();
-	while (xg_gpu_powered(kbdev) && ktime_ms_delta(ktime_get(), t) < XG_ST_POWEROFF_MS)
-		msleep(10);
-	on = xg_gpu_powered(kbdev);
-	xg_pd_is_on(g, &cfg, &st);
-	pr_info(XG_ST_PFX "power down: kbase GPU %s after %lld ms, power on/off %lu/%lu, PMU G3D cfg %#x status %#x (domain kept on by design)\n",
-		on ? "STILL ON" : "off", ktime_ms_delta(ktime_get(), t),
-		g->nr_power_on, g->nr_power_off, cfg, st);
+	{
+		s64 ms;
+
+		on = !xg_st_wait_gpu_off(kbdev, &ms);
+		xg_pd_is_on(g, &cfg, &st);
+		pr_info(XG_ST_PFX "power down: kbase GPU %s after %lld ms, power on/off %lu/%lu, PMU G3D cfg %#x status %#x (G3D power control %s)\n",
+			on ? "STILL ON" : "off", ms, g->nr_power_on, g->nr_power_off,
+			cfg, st, xg_pd_mode_str(g));
+	}
 	if (on)
 		fails++;
+
+	/* 7. G3D power-domain cycle (samsung,g3d-power-control only) */
+	if (!on)
+		fails += xg_st_pd_cycle(g);
 
 	pr_info(XG_ST_PFX "%s (%d failures, %lld ms)\n", fails ? "FAIL" : "PASS", fails,
 		ktime_ms_delta(ktime_get(), t0));

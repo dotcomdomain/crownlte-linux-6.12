@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * G3D POWER-DOMAIN TRIAL (stage "runtime"). Run only after the "boot-on"
+ * trial (exynos9810-crownlte-delayed-ufs-g3dpd-diag) passed.
+ *
+ * As the boot-on trial, plus 4.9-style runtime power management: the G3D
+ * domain is switched off 150 ms after kbase powers the GPU off and back on
+ * at the next kbase power-up (kbase then resets the GPU). The first eight
+ * transitions are logged ("mali exynos9810: G3D domain on/off (...)").
+ */
+#include "exynos9810-crownlte-delayed-ufs-g3dpd-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + G3D power domain (runtime)";
+};
+
+&gpu {
+	samsung,g3d-power-control = "runtime";
+	samsung,g3d-off-delay-ms = <150>;
+};

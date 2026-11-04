@@ -8,4 +8,5 @@ mali_kbase-y += \
 	../exynos9810/mali_exynos9810_platform.o \
 	../exynos9810/mali_exynos9810_dvfs.o \
 	../exynos9810/mali_exynos9810_entrypoint.o \
+	../exynos9810/mali_exynos9810_pd.o \
 	../exynos9810/mali_exynos9810_selftest.o

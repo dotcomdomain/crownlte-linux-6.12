@@ -32,7 +32,7 @@ Commits:
 
 | 4.9 | here |
 |---|---|
-| gpexbe_pm: genpd `pd-embedded_g3d` / `cal_pd_control(0xb1380008)` | **not switched.** Probe needs PMU 0x14064040/44 = 0xf; GPU never powered off at PMU level |
+| gpexbe_pm: genpd `pd-embedded_g3d` / `cal_pd_control(0xb1380008)` | **not switched by default.** Probe needs PMU 0x14064040/44 = 0xf; GPU never powered off at PMU level. `samsung,g3d-power-control` enables the 4.9 sequence (g3d-power-domain.md) |
 | gpexbe_clock: `cal_dfs_set_rate(g3d_cmu_cal_id)` | same, `samsung,cal-id = <0x0b040004>`, workqueue, CMU readback `cal_dfs_get_rate` |
 | gpu_dvfs_governor "interactive", 30 ms polling | same algorithm on kbase `MALI_MIDGARD_DVFS` metrics |
 | gpu_tmu / gpu_cooling `thermal-gpufreq-0` | thermal_of cooling device of the same name, bound to the G3D 88 C passive trip |
@@ -68,6 +68,7 @@ Stage 1 therefore depends on SBoot leaving the domain on. The probe log shows wh
   - job slot registers
   - The self-test adds one GPU_COMMAND CLEAN_INV_CACHES.
 - **No PMU, PMIC, CMU or TZPC writes.** PMU, CMU_G3D and PMIC B6CTRL are only read.
+  The exception is a DT with `samsung,g3d-power-control`, which uses the 4.9 `cal_pd_control` sequence (see g3d-power-domain.md).
 
 ## Expected diag log (delayed-ufs-diag DTB)
 
@@ -107,12 +108,13 @@ Failure lines that mean "no /dev/mali0, nothing written":
 - `GPU_ID .. is not a Mali-G72`
 - deferred probe reason `CAL 0xb040004 not ready (ACPM DVFS / FVMap)`
 
-## Stage 2 (not done)
+## Stage 2
 
-1. G3D power-domain control. Needs both of these:
-   - A sealed ACPM write-policy entry for exactly the `cal_pd_control` update. Identify type 3 first; the Samsung DT says vdd_g3d = S2MPS18 BUCK6, `regulator-always-on`.
-   - `exynos_pd_tz_save`/`restore` with need_smc 0x17410204.
+1. G3D power-domain control: **implemented on `crownlte-next`, DT-gated, default off, not yet run on the phone.**
+   See [g3d-power-domain.md](g3d-power-domain.md).
+   "Type 3, reg 0x2a, mask 0xc0" is a G3D rail request that the APM firmware handles itself: PMU PWR_EMBEDDED_G3D 0x4678/0x467c plus S2MPS18 B6CTRL bits 3:2. It is not a SPEEDY slave.
+   The DTZPC SMC is 0x82000410(1/0, 0x17410204).
 
-   Then: runtime PM (4.9 gpu_runtime_pm_delay_time 50 ms), IFPO and suspend support. Remove the suspend veto.
+   Still open: IFPO and suspend support, and removing the suspend veto.
 2. Userspace job test with the vendor blob (`/dev/mali0` open, VERSION_CHECK 11.35, GET_GPUPROPS, a tiny GLES draw).
 3. MIF/CPU QoS columns 6-7 of gpu_dvfs_table, BTS MO, GTS/AMIGO ioctl data (perf only).
