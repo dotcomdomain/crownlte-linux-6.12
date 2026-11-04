@@ -150,7 +150,7 @@ struct dpu_dev {
 	/* DSIM0 command path (dsim_cmd.c), only inside a command window */
 	void __iomem *dsim;
 	bool cmd_window;			/* hw_lock held, trigger masked, no frame */
-	u32 dsim_ntx, dsim_nrx, dsim_nerr;
+	u32 dsim_ntx, dsim_nrx, dsim_nerr, dsim_nnote;
 
 	/* fault-display brightness (panel_bright.c), opt-in via DT */
 	struct delayed_work pb_work;

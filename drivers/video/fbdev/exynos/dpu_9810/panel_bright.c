@@ -451,8 +451,8 @@ void dpu_panel_bright_work(struct work_struct *work)
 
 	if (!ret)
 		pb_publish(d->pb_target);
-	pr_info(DPU_PB_PFX "RESULT %s: %d, %u packets sent, %u reads, %u DSIM errors, window %u us, FRAME_COUNT=%u\n",
-		ret ? "FAIL" : "PASS", ret, d->dsim_ntx, d->dsim_nrx, d->dsim_nerr, us,
+	pr_info(DPU_PB_PFX "RESULT %s: %d, %u packets sent, %u reads, %u DSIM errors, %u ignored-status notes, window %u us, FRAME_COUNT=%u\n",
+		ret ? "FAIL" : "PASS", ret, d->dsim_ntx, d->dsim_nrx, d->dsim_nerr, d->dsim_nnote, us,
 		dpu_hw_frame_count(d));
 	if (!ret)
 		pr_info(DPU_PB_PFX "the panel should now be at 4.9 brightness %u (720 nit extended HBM); a person must confirm the screen became readable\n",

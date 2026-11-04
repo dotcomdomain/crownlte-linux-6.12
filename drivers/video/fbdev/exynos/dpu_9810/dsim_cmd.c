@@ -38,10 +38,23 @@
 #define DSIM_MAX_LONG		64
 #define DSIM_MAX_READ		40	/* 4.9 panel.c MAX_READ_BYTES */
 
-#define DSIM_ERR_BITS	(DSIM_INTSRC_SFR_PH_FIFO_OVERFLOW | DSIM_INTSRC_INVALID_SFR_VALUE | \
-			 DSIM_INTSRC_ABNRMAL_CMD_ST | DSIM_INTSRC_LPRX_TOUT | \
-			 DSIM_INTSRC_BTA_TOUT | DSIM_INTSRC_ERR_RX_ECC)
-#define DSIM_OWN_BITS	(DSIM_ERR_BITS | DSIM_INTSRC_SFR_PH_FIFO_EMPTY | \
+/*
+ * Fatal: lost command or corrupted answer. 4.9 reports RX ECC errors
+ * (dsim_irq_handler) and never queues past a full FIFO.
+ */
+#define DSIM_ERR_BITS	(DSIM_INTSRC_SFR_PH_FIFO_OVERFLOW | DSIM_INTSRC_ERR_RX_ECC)
+/*
+ * Logged only. 4.9 dsim_reg_set_int() leaves BTA_TOUT, LPRX_TOUT and
+ * ABNRMAL_CMD_ST masked and its handlers never look at them or at
+ * INVALID_SFR_VALUE; with the 4.9/SBoot BTA timeout of 0xff, BTA_TOUT is
+ * raised by an otherwise good DCS read (trial q41: RX_DATA_DONE, BUS_TURN_OVER
+ * and a well-formed response, plus BTA_TOUT). Read answers are validated by
+ * their packet type and length, the panel ID / HBM gamma cross-checks and
+ * the read-back instead.
+ */
+#define DSIM_NOTE_BITS	(DSIM_INTSRC_INVALID_SFR_VALUE | DSIM_INTSRC_ABNRMAL_CMD_ST | \
+			 DSIM_INTSRC_LPRX_TOUT | DSIM_INTSRC_BTA_TOUT)
+#define DSIM_OWN_BITS	(DSIM_ERR_BITS | DSIM_NOTE_BITS | DSIM_INTSRC_SFR_PH_FIFO_EMPTY | \
 			 DSIM_INTSRC_SFR_PL_FIFO_EMPTY | DSIM_INTSRC_RX_DATA_DONE | \
 			 DSIM_INTSRC_BUS_TURN_OVER)
 
@@ -104,8 +117,9 @@ int dpu_dsim_check(struct dpu_dev *d)
 	cmdc = dsim_rd(d, DSIM_CMD_CONFIG);
 	isrc = dsim_rd(d, DSIM_INTSRC);
 	imsk = dsim_rd(d, DSIM_INTMSK);
-	pr_info(DPU_PB_PFX "DSIM0: SWRST=%#x CONFIG=%#x CLK_CTRL=%#x ESCMODE=%#x DPHY=%#x LINK1=%#x LINK3=%#x FIFOCTRL=%#x CMD_CONFIG=%#x INTSRC=%#x INTMSK=%#x\n",
-		swrst, cfg, clk, esc, dphy, dsim_rd(d, DSIM_LINK_STATUS1), l3, fifo, cmdc,
+	pr_info(DPU_PB_PFX "DSIM0: SWRST=%#x CONFIG=%#x CLK_CTRL=%#x ESCMODE=%#x (cmd %s) TIMEOUT=%#x DPHY=%#x LINK1=%#x LINK3=%#x FIFOCTRL=%#x CMD_CONFIG=%#x INTSRC=%#x INTMSK=%#x\n",
+		swrst, cfg, clk, esc, esc & DSIM_ESCMODE_CMD_LPDT ? "LP" : "HS",
+		dsim_rd(d, DSIM_TIMEOUT), dphy, dsim_rd(d, DSIM_LINK_STATUS1), l3, fifo, cmdc,
 		isrc, imsk);
 
 	if (swrst & (DSIM_SWRST_RESET | DSIM_SWRST_FUNCRST)) {
@@ -185,6 +199,12 @@ static int dsim_check_errors(struct dpu_dev *d, const char *what, u32 nr)
 {
 	u32 isrc = dsim_rd(d, DSIM_INTSRC);
 
+	if (isrc & DSIM_NOTE_BITS) {
+		d->dsim_nnote++;
+		pr_info(DPU_PB_PFX "%s#%u: note: INTSRC bits %#x (masked and ignored by 4.9; INTSRC=%#x CMD_STATUS=%#x)\n",
+			what, nr, isrc & DSIM_NOTE_BITS, isrc, dsim_rd(d, DSIM_CMD_STATUS));
+		dsim_wr(d, DSIM_INTSRC, isrc & DSIM_NOTE_BITS);
+	}
 	if (!(isrc & DSIM_ERR_BITS))
 		return 0;
 	pr_err(DPU_PB_PFX "%s#%u: DSIM INTSRC error bits %#x (INTSRC=%#x CMD_STATUS=%#x)\n",
@@ -307,7 +327,7 @@ static int dsim_rx_err(struct dpu_dev *d, u32 rx)
 int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len)
 {
 	u8 mrps[2] = { len, 0 };
-	u32 rx, v, nr, depth = DSIM_RX_FIFO_MAX_DEPTH, drained = 0;
+	u32 rx, v, nr, depth = DSIM_RX_FIFO_MAX_DEPTH, drained = 0, hdr = 0;
 	size_t got = 0, i;
 	bool ready;
 	int ret;
@@ -349,6 +369,8 @@ int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len)
 
 	do {
 		rx = dsim_rd(d, DSIM_RXFIFO);
+		if (!hdr)
+			hdr = rx;
 		switch (rx & 0xff) {
 		case MIPI_DSI_RX_ACKNOWLEDGE_AND_ERROR_REPORT:
 			ret = dsim_rx_err(d, rx);
@@ -394,13 +416,18 @@ int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len)
 		goto out;
 	}
 	if (got != len) {
-		pr_err(DPU_PB_PFX "rx#%u dcs %#04x: %zu of %zu bytes\n", nr, cmd, got, len);
+		pr_err(DPU_PB_PFX "rx#%u dcs %#04x: %zu of %zu bytes (rx hdr %#x)\n", nr, cmd, got,
+		       len, hdr);
 		ret = -EIO;
 		goto out;
 	}
 	ret = dsim_check_errors(d, "rx", nr);
 	if (!ret)
-		pr_info(DPU_PB_PFX "rx#%u dcs %#04x len=%zu: %*ph\n", nr, cmd, len, (int)len, buf);
+		pr_info(DPU_PB_PFX "rx#%u dcs %#04x len=%zu (rx hdr %#x): %*ph\n", nr, cmd, len, hdr,
+			(int)len, buf);
+	else if (got)
+		pr_err(DPU_PB_PFX "rx#%u dcs %#04x discarded answer (rx hdr %#x): %*ph\n", nr, cmd, hdr,
+		       (int)got, buf);
 out:
 	if (ret)
 		d->dsim_nerr++;

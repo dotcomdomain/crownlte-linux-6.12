@@ -30,6 +30,8 @@
 
 #define DSIM_CLK_CTRL					(0x20)
 
+#define DSIM_TIMEOUT					(0x28)
+
 #define DSIM_ESCMODE					(0x2c)
 #define DSIM_ESCMODE_FORCE_STOP_STATE			(1 << 20)
 #define DSIM_ESCMODE_FORCE_BTA				(1 << 16)
