@@ -743,6 +743,15 @@ config RTC_DRV_S5M
 	  This driver can also be built as a module. If so, the module
 	  will be called rtc-s5m.
 
+config RTC_DRV_S2MPS18_ACPM
+	bool "Samsung S2MPS18 RTC over Exynos9810 ACPM"
+	depends on MFD_S2MPS18_ACPM
+	help
+	  RTC of the Samsung S2MPS18 PMIC reached through the Exynos9810
+	  ACPM PMIC transport. Read-only unless the PMIC device tree node
+	  has samsung,rtc-read-latch (RUDR latch before reads) or
+	  samsung,rtc-write-enable (set_time and alarm 0).
+
 config RTC_DRV_SD2405AL
 	tristate "DFRobot SD2405AL"
 	select REGMAP_I2C
