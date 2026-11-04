@@ -53,4 +53,43 @@
 			acpm-ipc-channel = <0>;	/* FREQ_REQ/FREQ_GET/MARGIN_REQ, as 4.9 */
 		};
 	};
+
+	/*
+	 * MIF/INT bus DVFS, from 4.9 crownlte_eur_open_26 devfreq_mif@17000010
+	 * and devfreq_int@17000020 (gov_name "interactive", use_acpm, no PPMU).
+	 * samsung,freq-info is 4.9 freq_info verbatim, in kHz:
+	 *   <initial default-floor suspend min max reboot>
+	 * CAL's boot and resume rates replace initial/suspend, as in 4.9.
+	 * samsung,boot-qos is 4.9 boot_info <seconds kHz>; MIF down-delay is
+	 * delay_time_list. acpm-ipc-channel is the firmware FVP channel used
+	 * for the MIF->INT table upload and the sleep RELEASE flag.
+	 * CPU/GPU/display consumers raise floors with dev_pm_qos
+	 * DEV_PM_QOS_MIN_FREQUENCY on these devices, e.g. a cpufreq node with
+	 * samsung,mif-devfreq = <&legacy_devfreq_mif>.
+	 */
+	legacy_devfreq_mif: devfreq-mif {
+		compatible = "samsung,exynos9810-acpm-devfreq";
+		samsung,devfreq-type = <0>;		/* 4.9 DEVFREQ_MIF */
+		samsung,cal-id = <0x0b040000>;		/* dvfs_mif, 4.9 dfs_id */
+		samsung,ect-domain = "dvfs_mif";
+		samsung,freq-info = <2093000 208000 1014000 208000 2093000 2093000>;
+		samsung,boot-qos = <40 1794000>;
+		samsung,down-delay-ms = <20>;
+		acpm-ipc-channel = <1>;
+		samsung,fvp-constraint-upload;
+		samsung,acpm-mif-notify;
+		samsung,dependent-devfreq = <&legacy_devfreq_int>;
+		status = "disabled";
+	};
+
+	legacy_devfreq_int: devfreq-int {
+		compatible = "samsung,exynos9810-acpm-devfreq";
+		samsung,devfreq-type = <1>;		/* 4.9 DEVFREQ_INT */
+		samsung,cal-id = <0x0b040001>;		/* dvfs_int, 4.9 dfs_id */
+		samsung,ect-domain = "dvfs_int";
+		samsung,freq-info = <667000 178000 107000 107000 667000 667000>;
+		samsung,boot-qos = <40 667000>;
+		acpm-ipc-channel = <1>;
+		status = "disabled";
+	};
 };
