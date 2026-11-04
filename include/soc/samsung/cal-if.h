@@ -14,6 +14,7 @@ static inline int cal_if_init(void)
 	return 0;
 }
 #else
+#include <linux/types.h>
 #include "../../../drivers/soc/samsung/cal-if/pmucal_system.h"
 
 #define BLKPWR_MAGIC	0xB1380000
@@ -65,6 +66,13 @@ struct dvfs_rate_volt {
 };
 int cal_dfs_get_rate_asv_table(unsigned int id,
 					struct dvfs_rate_volt *table);
+/* Firmware MIF floor requests (kHz) from ACPM channel 5, see acpm_dvfs.c. */
+typedef void (*exynos_acpm_mif_notify_fn)(void *priv, unsigned int khz);
+int exynos_acpm_dvfs_mif_notify_register(exynos_acpm_mif_notify_fn fn,
+					 void *priv);
+void exynos_acpm_dvfs_mif_notify_unregister(void);
+void exynos_acpm_dvfs_mif_notify_stats(unsigned long *count,
+				       unsigned int *last_khz, u64 *last_ns);
 extern void cal_dfs_set_volt_margin(unsigned int id, int volt);
 extern unsigned long cal_dfs_get_rate_by_member(unsigned int id,
 							char *member,

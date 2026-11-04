@@ -21,7 +21,82 @@
 static struct acpm_dvfs acpm_dvfs;
 static bool acpm_dvfs_ready;
 
-/* MIF throughput notifications require the vendor devfreq port. */
+/*
+ * Firmware MIF floor requests (4.9 acpm_noti_mif_callback). The firmware
+ * sends a requested MIF rate in kHz in cmd[1] on channel 5; 4.9 applied it
+ * as a PM_QOS_BUS_THROUGHPUT minimum (dmesg "req 1794000 KHz", "421000 KHz").
+ * There is no global bus class in 6.12, so one consumer (the MIF devfreq
+ * driver) registers here and turns it into a device PM QoS minimum. The last
+ * request is replayed on registration so nothing sent before the devfreq
+ * driver probes is lost. The callback runs from the ACPM IRQ thread, possibly
+ * under the channel's rx spinlock; the consumer must not sleep.
+ */
+static DEFINE_SPINLOCK(mif_noti_lock);
+static exynos_acpm_mif_notify_fn mif_noti_fn;
+static void *mif_noti_priv;
+static unsigned int mif_noti_khz;
+static unsigned long mif_noti_count;
+static u64 mif_noti_ns;
+
+static void acpm_noti_mif_callback(unsigned int *cmd, unsigned int size)
+{
+	unsigned long flags;
+
+	if (size < 2 * sizeof(u32))
+		return;
+	pr_info_ratelimited("%s : req %u KHz\n", __func__, cmd[1]);
+	spin_lock_irqsave(&mif_noti_lock, flags);
+	mif_noti_khz = cmd[1];
+	mif_noti_count++;
+	mif_noti_ns = local_clock();
+	if (mif_noti_fn)
+		mif_noti_fn(mif_noti_priv, mif_noti_khz);
+	spin_unlock_irqrestore(&mif_noti_lock, flags);
+}
+
+int exynos_acpm_dvfs_mif_notify_register(exynos_acpm_mif_notify_fn fn,
+					 void *priv)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	if (!fn)
+		return -EINVAL;
+	spin_lock_irqsave(&mif_noti_lock, flags);
+	if (mif_noti_fn) {
+		ret = -EBUSY;
+	} else {
+		mif_noti_fn = fn;
+		mif_noti_priv = priv;
+		if (mif_noti_count)
+			fn(priv, mif_noti_khz);
+	}
+	spin_unlock_irqrestore(&mif_noti_lock, flags);
+	return ret;
+}
+
+/* After return no callback is running or will start; flush your own work. */
+void exynos_acpm_dvfs_mif_notify_unregister(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mif_noti_lock, flags);
+	mif_noti_fn = NULL;
+	mif_noti_priv = NULL;
+	spin_unlock_irqrestore(&mif_noti_lock, flags);
+}
+
+void exynos_acpm_dvfs_mif_notify_stats(unsigned long *count,
+				       unsigned int *last_khz, u64 *last_ns)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mif_noti_lock, flags);
+	*count = mif_noti_count;
+	*last_khz = mif_noti_khz;
+	*last_ns = mif_noti_ns;
+	spin_unlock_irqrestore(&mif_noti_lock, flags);
+}
 
 int exynos_acpm_set_rate(unsigned int id, unsigned long rate)
 {
@@ -297,6 +372,8 @@ static void acpm_dvfs_selftest(struct work_struct *work)
  * its static zero. The acpm-dvfs node's own channel (5, TYPE_BUFFER) is the
  * firmware's MIF-floor notification channel and is never used for sending.
  * Describe the command channel explicitly with a "command" child node.
+ * The notification handler is attached last, once the probe cannot fail, so a
+ * deferred probe never leaves a second copy on the channel's callback list.
  */
 static int acpm_dvfs_probe(struct platform_device *pdev)
 {
@@ -306,7 +383,7 @@ static int acpm_dvfs_probe(struct platform_device *pdev)
 	int ret, i;
 
 	acpm_dvfs.dev = pdev->dev.of_node;
-	/* Notification channel: requested only to prove it exists. */
+	/* Notification channel: check it exists before anything else. */
 	ret = acpm_ipc_request_channel(acpm_dvfs.dev, NULL, &noti_ch, &noti_size);
 	if (ret)
 		return ret == -ENODEV ? -EPROBE_DEFER : ret;
@@ -326,7 +403,11 @@ static int acpm_dvfs_probe(struct platform_device *pdev)
 			acpm_dvfs.ch_num, acpm_dvfs.size);
 		return -EPROTO;
 	}
-	dev_info(&pdev->dev, "DVFS commands on channel %u, notifications on channel %u\n",
+	ret = acpm_ipc_request_channel(acpm_dvfs.dev, acpm_noti_mif_callback,
+				       &noti_ch, &noti_size);
+	if (ret)
+		return ret == -ENODEV ? -EPROBE_DEFER : ret;
+	dev_info(&pdev->dev, "DVFS commands on channel %u, MIF notifications on channel %u\n",
 		 acpm_dvfs.ch_num, noti_ch);
 	smp_store_release(&acpm_dvfs_ready, true);
 
