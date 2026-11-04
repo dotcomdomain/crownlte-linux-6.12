@@ -312,3 +312,18 @@
 	samsung,decon-trigger = "hw-te";
 	samsung,display-selftest;
 };
+
+/*
+ * Touchscreen stage 1 (sec_ts Y771 on PERIC0 USI03 HSI2C @0x48). Works only
+ * if the bootloader left LDO35/LDO43 on; otherwise the driver logs and
+ * stops. The only IC writes are SENSE_ON (0x10) and, if its default bits
+ * are missing, SET_TOUCHFUNCTION (0x30). Self-test at ~109 s logs chip id,
+ * firmware versions and the touch events seen since boot
+ * ("touch selftest:").
+ */
+&usi_touch { status = "okay"; };
+&hsi2c_touch { status = "okay"; };
+&touchscreen {
+	samsung,touch-selftest;
+	status = "okay";
+};
