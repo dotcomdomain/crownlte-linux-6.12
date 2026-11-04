@@ -28,6 +28,9 @@
 #include <linux/regmap.h>
 #include <linux/delay.h>
 #include <linux/math64.h>
+#include <linux/ktime.h>
+#include <linux/timekeeping.h>
+#include <linux/workqueue.h>
 
 #define S3C2410_WTCON		0x00
 #define S3C2410_WTDAT		0x04
@@ -77,6 +80,45 @@
 #define GS_CLUSTER2_NONCPU_INT_EN		0x1644
 #define GS_RST_STAT_REG_OFFSET			0x3B44
 
+/*
+ * Exynos9810: CL0 watchdog at 0x10050000 uses the Exynos5-style PMU
+ * DISABLE/MASK/RST_STAT registers at bit 24 (CLUSTER0_WDTRESET), as in the
+ * vendor 4.9 kernel ("samsung,exynos8-wdt" variant on watchdog_cl0).
+ */
+#define EXYNOS9810_CLUSTER0_WDTRESET_BIT	24
+
+/* Exynos9810 PMU registers read (never written) by the SBOOT reset guard */
+#define EXYNOS9810_CPU_RESET_DISABLE_FROM_WDTRESET	0x0414
+#define EXYNOS9810_RESET_SEQUENCER_CONFIGURATION	0x0500
+#define EXYNOS9810_INFORM2				0x0808
+#define EXYNOS9810_INFORM3				0x080c
+#define EXYNOS9810_BIG_CPU0_RESET			0x3c0c
+#define EXYNOS9810_LITTLE_CPU0_ETC_RESET		0x3c4c
+#define EXYNOS9810_BIG_NONCPU_ETC_RESET			0x3c8c
+#define EXYNOS9810_PMU_CPU_STRIDE			0x10
+
+/* DFD dump-GPR enable and the reset-disable bits it arms (4.9 exynos-reboot) */
+#define EXYNOS9810_DFD_EDPCSR_DUMP_EN		BIT(0)
+#define EXYNOS9810_DFD_RESET_DISABLE		(BIT(9) | BIT(10) | BIT(11) | \
+						 (0xfU << 24))
+#define EXYNOS9810_WDT_RESET_PEND		0x3	/* PEND_BIG | PEND_LITTLE */
+#define EXYNOS9810_BIG_CPU_RESET_DISABLE	0x3300
+#define EXYNOS9810_LITTLE_CPU_RESET_DISABLE	0x1100
+#define EXYNOS9810_BIG_NONCPU_RESET_DISABLE	0x84040000
+
+/* SEC sboot normal-boot selection (4.9 sec_reboot.c, crownlte boot shim) */
+#define SEC_POWER_RESET				0x12345678
+#define SEC_RESET_REASON_UNKNOWN		0x12345670
+
+/* Counter-rate check: DIV128 with prescaler 16, i.e. src_clk / 2048 */
+#define S3C2410_RATE_CHECK_PRESCALE		16
+#define S3C2410_RATE_CHECK_SLEEP_MS		25
+
+/* Opt-in expiry selftest: short timeout once petting stops */
+#define S3C2410_SELFTEST_EXPIRE_S		5
+#define S3C2410_SELFTEST_MIN_MS			10000
+#define S3C2410_SELFTEST_MAX_MS			114000
+
 /**
  * DOC: Quirk flags for different Samsung watchdog IP-cores
  *
@@ -114,6 +156,16 @@
  * %QUIRK_HAS_DBGACK_BIT: WTCON register has DBGACK_MASK bit. Setting the
  * DBGACK_MASK bit disables the watchdog outputs when the SoC is in debug mode.
  * Debug mode is determined by the DBGACK CPU signal.
+ *
+ * %QUIRK_SBOOT_RESET_GUARD: Samsung SBOOT handles the watchdog reset. Before
+ * anything is armed, check (read-only) that a watchdog reset would be a plain
+ * full reset into the normal boot, not into Upload (ramdump) mode or a
+ * recovery boot, and measure the counter rate. On any mismatch the device is
+ * not registered and nothing is armed. Also verifies the PMU unmask readback.
+ *
+ * %QUIRK_KEEP_RUNNING_ON_SHUTDOWN: Leave a running watchdog armed (freshly
+ * pinged) across shutdown/restart, so a restart path that hangs or refuses
+ * still ends in a watchdog reset.
  */
 #define QUIRK_HAS_WTCLRINT_REG			BIT(0)
 #define QUIRK_HAS_PMU_MASK_RESET		BIT(1)
@@ -121,11 +173,14 @@
 #define QUIRK_HAS_PMU_AUTO_DISABLE		BIT(3)
 #define QUIRK_HAS_PMU_CNT_EN			BIT(4)
 #define QUIRK_HAS_DBGACK_BIT			BIT(5)
+#define QUIRK_SBOOT_RESET_GUARD			BIT(6)
+#define QUIRK_KEEP_RUNNING_ON_SHUTDOWN		BIT(7)
 
 /* These quirks require that we have a PMU register map */
 #define QUIRKS_HAVE_PMUREG \
 	(QUIRK_HAS_PMU_MASK_RESET | QUIRK_HAS_PMU_RST_STAT | \
-	 QUIRK_HAS_PMU_AUTO_DISABLE | QUIRK_HAS_PMU_CNT_EN)
+	 QUIRK_HAS_PMU_AUTO_DISABLE | QUIRK_HAS_PMU_CNT_EN | \
+	 QUIRK_SBOOT_RESET_GUARD)
 
 static bool nowayout	= WATCHDOG_NOWAYOUT;
 static int tmr_margin;
@@ -189,6 +244,9 @@ struct s3c2410_wdt {
 	struct notifier_block	freq_transition;
 	const struct s3c2410_wdt_variant *drv_data;
 	struct regmap *pmureg;
+	/* Opt-in expiry selftest (QUIRK_SBOOT_RESET_GUARD variants only) */
+	struct delayed_work	selftest_work;
+	bool			selftest_stopped;
 };
 
 static const struct s3c2410_wdt_variant drv_data_s3c2410 = {
@@ -278,6 +336,22 @@ static const struct s3c2410_wdt_variant drv_data_exynosautov9_cl1 = {
 		  QUIRK_HAS_PMU_RST_STAT | QUIRK_HAS_PMU_CNT_EN,
 };
 
+/*
+ * Exynos9810 CL0 watchdog. PMU offsets and bit 24 match the vendor 4.9
+ * crownlte kernel; RST_STAT bit 24 is CLUSTER0_WDTRESET in its reset-reason
+ * table, the bit SBOOT tests for a watchdog reset.
+ */
+static const struct s3c2410_wdt_variant drv_data_exynos9810 = {
+	.disable_reg = EXYNOS5_WDT_DISABLE_REG_OFFSET,
+	.mask_reset_reg = EXYNOS5_WDT_MASK_RESET_REG_OFFSET,
+	.mask_bit = EXYNOS9810_CLUSTER0_WDTRESET_BIT,
+	.rst_stat_reg = EXYNOS5_RST_STAT_REG_OFFSET,
+	.rst_stat_bit = EXYNOS9810_CLUSTER0_WDTRESET_BIT,
+	.quirks = QUIRK_HAS_WTCLRINT_REG | QUIRK_HAS_PMU_MASK_RESET |
+		  QUIRK_HAS_PMU_RST_STAT | QUIRK_HAS_PMU_AUTO_DISABLE |
+		  QUIRK_SBOOT_RESET_GUARD | QUIRK_KEEP_RUNNING_ON_SHUTDOWN,
+};
+
 static const struct s3c2410_wdt_variant drv_data_gs101_cl0 = {
 	.mask_reset_reg = GS_CLUSTER0_NONCPU_INT_EN,
 	.mask_bit = 2,
@@ -321,6 +395,8 @@ static const struct of_device_id s3c2410_wdt_match[] = {
 	  .data = &drv_data_exynos850_cl0 },
 	{ .compatible = "samsung,exynosautov9-wdt",
 	  .data = &drv_data_exynosautov9_cl0 },
+	{ .compatible = "samsung,exynos9810-wdt",
+	  .data = &drv_data_exynos9810 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, s3c2410_wdt_match);
@@ -442,7 +518,9 @@ static int s3c2410wdt_keepalive(struct watchdog_device *wdd)
 	unsigned long flags;
 
 	spin_lock_irqsave(&wdt->lock, flags);
-	writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	/* The opt-in selftest deliberately stops petting to prove expiry. */
+	if (!wdt->selftest_stopped)
+		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
 	spin_unlock_irqrestore(&wdt->lock, flags);
 
 	return 0;
@@ -684,11 +762,272 @@ static void s3c2410wdt_wdt_disable_action(void *data)
 	s3c2410wdt_enable(data, false);
 }
 
+static void s3c2410wdt_hw_stop_action(void *data)
+{
+	s3c2410wdt_stop(&((struct s3c2410_wdt *)data)->wdt_device);
+}
+
+static int s3c2410wdt_pmu_read(struct s3c2410_wdt *wdt, unsigned int reg,
+			       unsigned int *val)
+{
+	int ret = regmap_read(wdt->pmureg, reg, val);
+
+	if (ret)
+		dev_err(wdt->dev, "not arming: PMU read %#x failed (%d)\n",
+			reg, ret);
+	return ret;
+}
+
+static int s3c2410wdt_pmu_clear(struct s3c2410_wdt *wdt, unsigned int reg,
+				u32 mask, const char *what)
+{
+	unsigned int val;
+	int ret = s3c2410wdt_pmu_read(wdt, reg, &val);
+
+	if (ret)
+		return ret;
+	if (val & mask) {
+		dev_err(wdt->dev,
+			"not arming: %s set (PMU %#x = %#x, mask %#x); a watchdog reset would not be a plain full reset\n",
+			what, reg, val, mask);
+		return -ENODEV;
+	}
+	return 0;
+}
+
+/*
+ * Samsung SBOOT picks the next boot from PMU INFORM2/INFORM3. After a
+ * watchdog reset (RST_STAT CLUSTER0_WDTRESET) it enters Upload (ramdump) mode
+ * instead of booting whenever its debug policy (PARAM DEBUG_LEVEL and
+ * FORCE_UPLOAD) allows uploads. SBOOT records that policy in the PMU on every
+ * boot: it enables DFD "dump GPR" (RESET_SEQUENCER_CONFIGURATION bit 0 = 0xc01)
+ * exactly when an upload is possible and writes 0x00f000e0 plus clears the
+ * per-CPU WDT reset-disable bits otherwise. So arm only if INFORM2/3 hold the
+ * normal boot selection and DFD and every WDT reset-disable bit are clear.
+ * This function only reads registers.
+ */
+static int s3c2410wdt_sboot_guard(struct s3c2410_wdt *wdt)
+{
+	unsigned int inform2, inform3, rst_stat, i;
+	int ret;
+
+	ret = s3c2410wdt_pmu_read(wdt, EXYNOS9810_INFORM2, &inform2);
+	if (!ret)
+		ret = s3c2410wdt_pmu_read(wdt, EXYNOS9810_INFORM3, &inform3);
+	if (!ret)
+		ret = s3c2410wdt_pmu_read(wdt, wdt->drv_data->rst_stat_reg,
+					  &rst_stat);
+	if (ret)
+		return ret;
+
+	dev_info(wdt->dev, "sboot state: INFORM2=%#x INFORM3=%#x RST_STAT=%#x%s\n",
+		 inform2, inform3, rst_stat,
+		 rst_stat & BIT(wdt->drv_data->rst_stat_bit) ?
+		 " (last reset: CLUSTER0 watchdog)" : "");
+
+	if (inform2 != SEC_POWER_RESET || inform3 != SEC_RESET_REASON_UNKNOWN) {
+		dev_err(wdt->dev,
+			"not arming: boot selection is not normal boot (want INFORM2=%#x INFORM3=%#x); a watchdog reset would not return to the normal BOOT image\n",
+			SEC_POWER_RESET, SEC_RESET_REASON_UNKNOWN);
+		return -ENODEV;
+	}
+
+	ret = s3c2410wdt_pmu_clear(wdt, EXYNOS9810_RESET_SEQUENCER_CONFIGURATION,
+				   EXYNOS9810_DFD_EDPCSR_DUMP_EN |
+				   EXYNOS9810_DFD_RESET_DISABLE,
+				   "DFD dump-GPR (sboot upload-capable debug policy)");
+	if (ret)
+		return ret;
+	ret = s3c2410wdt_pmu_clear(wdt, EXYNOS9810_CPU_RESET_DISABLE_FROM_WDTRESET,
+				   EXYNOS9810_WDT_RESET_PEND,
+				   "CPU reset disable from WDT reset");
+	if (ret)
+		return ret;
+	for (i = 0; i < 4; i++) {
+		ret = s3c2410wdt_pmu_clear(wdt, EXYNOS9810_BIG_CPU0_RESET +
+					   i * EXYNOS9810_PMU_CPU_STRIDE,
+					   EXYNOS9810_BIG_CPU_RESET_DISABLE,
+					   "big CPU reset disable");
+		if (ret)
+			return ret;
+		ret = s3c2410wdt_pmu_clear(wdt, EXYNOS9810_LITTLE_CPU0_ETC_RESET +
+					   i * EXYNOS9810_PMU_CPU_STRIDE,
+					   EXYNOS9810_LITTLE_CPU_RESET_DISABLE,
+					   "LITTLE CPU reset disable");
+		if (ret)
+			return ret;
+	}
+	return s3c2410wdt_pmu_clear(wdt, EXYNOS9810_BIG_NONCPU_ETC_RESET,
+				    EXYNOS9810_BIG_NONCPU_RESET_DISABLE,
+				    "big non-CPU reset disable");
+}
+
+/*
+ * The timeout is computed from src_clk. Prove that WTCNT really decrements at
+ * src_clk / 2048 before trusting it: a faster counter would reset a healthy
+ * system, a stopped one would never reset. RSTEN and INTEN stay clear, so this
+ * cannot reset or interrupt. Leaves the timer stopped.
+ */
+static int s3c2410wdt_check_rate(struct s3c2410_wdt *wdt)
+{
+	const unsigned int div = S3C2410_RATE_CHECK_PRESCALE * S3C2410_WTCON_MAXDIV;
+	unsigned long rate = s3c2410wdt_get_freq(wdt);
+	unsigned int wtcon, wtdat, wtcnt, i;
+	u32 cnt[3];
+	ktime_t t[3];
+	u64 expect, ticks;
+	s64 ns;
+
+	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	wtdat = readl(wdt->reg_base + S3C2410_WTDAT);
+	wtcnt = readl(wdt->reg_base + S3C2410_WTCNT);
+	dev_info(wdt->dev, "left by bootloader: WTCON=%#x WTDAT=%#x WTCNT=%#x\n",
+		 wtcon, wtdat, wtcnt);
+
+	if (!rate) {
+		dev_err(wdt->dev, "not arming: source clock rate is 0\n");
+		return -ENODEV;
+	}
+
+	writel(0, wdt->reg_base + S3C2410_WTCON);
+	writel(S3C2410_WTCNT_MAXCNT, wdt->reg_base + S3C2410_WTDAT);
+	writel(S3C2410_WTCNT_MAXCNT, wdt->reg_base + S3C2410_WTCNT);
+	writel(S3C2410_WTCON_ENABLE | S3C2410_WTCON_DIV128 |
+	       S3C2410_WTCON_PRESCALE(S3C2410_RATE_CHECK_PRESCALE - 1),
+	       wdt->reg_base + S3C2410_WTCON);
+	for (i = 0; i < ARRAY_SIZE(cnt); i++) {
+		if (i)
+			msleep(S3C2410_RATE_CHECK_SLEEP_MS);
+		t[i] = ktime_get();
+		cnt[i] = readl(wdt->reg_base + S3C2410_WTCNT);
+	}
+	writel(0, wdt->reg_base + S3C2410_WTCON);
+
+	ns = ktime_to_ns(ktime_sub(t[2], t[0]));
+	if (!(cnt[0] > cnt[1] && cnt[1] > cnt[2]) || ns <= 0) {
+		dev_err(wdt->dev,
+			"not arming: counter not counting down (WTCNT %#x %#x %#x)\n",
+			cnt[0], cnt[1], cnt[2]);
+		return -ENODEV;
+	}
+	ticks = cnt[0] - cnt[2];
+	expect = div64_u64((u64)rate * ns, div * (u64)NSEC_PER_SEC);
+	dev_info(wdt->dev, "counter rate check: %llu ticks in %lld us, expected %llu (%lu Hz / %u)\n",
+		 ticks, div_s64(ns, NSEC_PER_USEC), expect, rate, div);
+	if (!expect || ticks * 10 < expect * 9 || ticks * 10 > expect * 11) {
+		dev_err(wdt->dev,
+			"not arming: counter rate is not within 10%% of the source clock\n");
+		return -ENODEV;
+	}
+	return 0;
+}
+
+/* Prove the reset request really reaches the PMU (both bits must read 0). */
+static int s3c2410wdt_check_pmu_unmasked(struct s3c2410_wdt *wdt)
+{
+	const u32 bit = BIT(wdt->drv_data->mask_bit);
+	unsigned int disable, mask;
+	int ret;
+
+	ret = s3c2410wdt_pmu_read(wdt, wdt->drv_data->disable_reg, &disable);
+	if (!ret)
+		ret = s3c2410wdt_pmu_read(wdt, wdt->drv_data->mask_reset_reg,
+					  &mask);
+	if (ret)
+		return ret;
+	dev_info(wdt->dev, "PMU AUTOMATIC_WDT_RESET_DISABLE=%#x MASK_WDT_RESET_REQUEST=%#x (bit %d)\n",
+		 disable, mask, wdt->drv_data->mask_bit);
+	if ((disable | mask) & bit) {
+		dev_err(wdt->dev,
+			"not arming: PMU still disables/masks the watchdog reset\n");
+		return -ENODEV;
+	}
+	return 0;
+}
+
+/*
+ * Opt-in expiry selftest, "samsung,selftest-stop-petting-ms" in DT only.
+ * At that boot time, stop petting and shorten the timeout so the hardware
+ * reset is due a few seconds later. A second pass reports a failure if the
+ * kernel is still alive well after the expected reset.
+ */
+static void s3c2410wdt_selftest_work(struct work_struct *work)
+{
+	struct s3c2410_wdt *wdt = container_of(to_delayed_work(work),
+					       struct s3c2410_wdt, selftest_work);
+	unsigned long flags;
+	int ret;
+
+	if (wdt->selftest_stopped) {
+		dev_emerg(wdt->dev,
+			  "watchdog selftest: FAIL, still running %d s after petting stopped (WTCON=%#x WTCNT=%#x)\n",
+			  S3C2410_SELFTEST_EXPIRE_S + 5,
+			  readl(wdt->reg_base + S3C2410_WTCON),
+			  readl(wdt->reg_base + S3C2410_WTCNT));
+		return;
+	}
+
+	spin_lock_irqsave(&wdt->lock, flags);
+	wdt->selftest_stopped = true;
+	spin_unlock_irqrestore(&wdt->lock, flags);
+
+	ret = s3c2410wdt_set_heartbeat(&wdt->wdt_device,
+				       S3C2410_SELFTEST_EXPIRE_S);
+	spin_lock_irqsave(&wdt->lock, flags);
+	if (!ret)
+		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	spin_unlock_irqrestore(&wdt->lock, flags);
+
+	dev_emerg(wdt->dev,
+		  "watchdog selftest: petting stopped at %lld ms, expecting CLUSTER0 watchdog reset in ~%d s (ret %d, WTCON=%#x WTCNT=%#x)\n",
+		  ktime_to_ms(ktime_get_boottime()), S3C2410_SELFTEST_EXPIRE_S,
+		  ret, readl(wdt->reg_base + S3C2410_WTCON),
+		  readl(wdt->reg_base + S3C2410_WTCNT));
+	schedule_delayed_work(&wdt->selftest_work,
+			      msecs_to_jiffies((S3C2410_SELFTEST_EXPIRE_S + 5) *
+					       MSEC_PER_SEC));
+}
+
+static void s3c2410wdt_selftest_cancel(void *data)
+{
+	cancel_delayed_work_sync(&((struct s3c2410_wdt *)data)->selftest_work);
+}
+
+static int s3c2410wdt_selftest_setup(struct s3c2410_wdt *wdt)
+{
+	struct device *dev = wdt->dev;
+	s64 now, delay;
+	u32 at_ms;
+	int ret;
+
+	if (of_property_read_u32(dev->of_node, "samsung,selftest-stop-petting-ms",
+				 &at_ms))
+		return 0;
+	if (at_ms < S3C2410_SELFTEST_MIN_MS || at_ms > S3C2410_SELFTEST_MAX_MS) {
+		dev_warn(dev, "watchdog selftest: ignoring stop time %u ms (allowed %u..%u)\n",
+			 at_ms, S3C2410_SELFTEST_MIN_MS, S3C2410_SELFTEST_MAX_MS);
+		return 0;
+	}
+
+	INIT_DELAYED_WORK(&wdt->selftest_work, s3c2410wdt_selftest_work);
+	ret = devm_add_action_or_reset(dev, s3c2410wdt_selftest_cancel, wdt);
+	if (ret)
+		return ret;
+	now = ktime_to_ms(ktime_get_boottime());
+	delay = at_ms > now ? at_ms - now : 0;
+	schedule_delayed_work(&wdt->selftest_work, msecs_to_jiffies(delay));
+	dev_warn(dev, "watchdog selftest ENABLED: will stop petting at %u ms boot time (in %lld ms)\n",
+		 at_ms, delay);
+	return 0;
+}
+
 static int s3c2410wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct s3c2410_wdt *wdt;
 	unsigned int wtcon;
+	bool start = tmr_atboot;
+	bool guarded;
 	int wdt_irq;
 	int ret;
 
@@ -733,6 +1072,25 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 	if (IS_ERR(wdt->src_clk))
 		return dev_err_probe(dev, PTR_ERR(wdt->src_clk), "failed to get source clock\n");
 
+	guarded = wdt->drv_data->quirks & QUIRK_SBOOT_RESET_GUARD;
+	if (guarded) {
+		/* Read-only reset-path checks first, then a no-reset rate check. */
+		ret = s3c2410wdt_sboot_guard(wdt);
+		if (ret)
+			return ret;
+		ret = s3c2410wdt_check_rate(wdt);
+		if (ret)
+			return ret;
+		/*
+		 * The core stops a boot-running watchdog neither on unregister
+		 * nor on probe failure; stop the hardware on any unwind.
+		 */
+		ret = devm_add_action_or_reset(dev, s3c2410wdt_hw_stop_action, wdt);
+		if (ret)
+			return ret;
+		start |= of_property_read_bool(dev->of_node, "samsung,start-at-boot");
+	}
+
 	wdt->wdt_device.min_timeout = 1;
 	wdt->wdt_device.max_timeout = s3c2410wdt_max_timeout(wdt);
 
@@ -774,7 +1132,7 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 	 * If we're not enabling the watchdog, then ensure it is disabled if it
 	 * has been left running from the bootloader or other source.
 	 */
-	if (tmr_atboot) {
+	if (start) {
 		dev_info(dev, "starting watchdog timer\n");
 		s3c2410wdt_start(&wdt->wdt_device);
 		set_bit(WDOG_HW_RUNNING, &wdt->wdt_device.status);
@@ -794,6 +1152,12 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	if (guarded) {
+		ret = s3c2410wdt_check_pmu_unmasked(wdt);
+		if (ret)
+			return ret;
+	}
+
 	platform_set_drvdata(pdev, wdt);
 
 	/* print out a statement of readiness */
@@ -805,12 +1169,28 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 		 (wtcon & S3C2410_WTCON_RSTEN) ? "en" : "dis",
 		 (wtcon & S3C2410_WTCON_INTEN) ? "en" : "dis");
 
+	if (guarded && (wtcon & S3C2410_WTCON_ENABLE)) {
+		dev_info(dev, "armed: timeout %u s, kernel pings until userspace opens it\n",
+			 wdt->wdt_device.timeout);
+		ret = s3c2410wdt_selftest_setup(wdt);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
 static void s3c2410wdt_shutdown(struct platform_device *dev)
 {
 	struct s3c2410_wdt *wdt = platform_get_drvdata(dev);
+
+	if ((wdt->drv_data->quirks & QUIRK_KEEP_RUNNING_ON_SHUTDOWN) &&
+	    (readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE)) {
+		s3c2410wdt_keepalive(&wdt->wdt_device);
+		dev_info(wdt->dev, "left armed across shutdown (timeout %u s)\n",
+			 wdt->wdt_device.timeout);
+		return;
+	}
 
 	s3c2410wdt_enable(wdt, false);
 	s3c2410wdt_stop(&wdt->wdt_device);
@@ -869,7 +1249,24 @@ static struct platform_driver s3c2410wdt_driver = {
 	},
 };
 
-module_platform_driver(s3c2410wdt_driver);
+/*
+ * Built in, register at subsys_initcall so a watchdog armed at boot covers
+ * every device_initcall driver (cpufreq, cpuidle, UFS, devfreq, ...). Its
+ * clocks are CLK_OF_DECLARE providers and the PMU is a plain syscon, both
+ * available by then; the watchdog core defers the chardev registration and
+ * starts pinging at its subsys_initcall_sync.
+ */
+static int __init s3c2410wdt_driver_init(void)
+{
+	return platform_driver_register(&s3c2410wdt_driver);
+}
+subsys_initcall(s3c2410wdt_driver_init);
+
+static void __exit s3c2410wdt_driver_exit(void)
+{
+	platform_driver_unregister(&s3c2410wdt_driver);
+}
+module_exit(s3c2410wdt_driver_exit);
 
 MODULE_AUTHOR("Ben Dooks <ben@simtec.co.uk>, Dimitry Andric <dimitry.andric@tomtom.com>");
 MODULE_DESCRIPTION("S3C2410 Watchdog Device Driver");
