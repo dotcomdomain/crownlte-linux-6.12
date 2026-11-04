@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Display stage 2 diagnostic plus the owner's 4.9 fault-display brightness.
+ *
+ * The owner's S6E3HA8 panel looks black below a high brightness, and SBoot
+ * leaves it at 12800 of 44700. Their 4.9 kernel forces 44700 in the normal
+ * display state. Here the DECON adopt driver, once it has adopted SBoot's
+ * display, sends the same 4.9 PANEL_SET_BL_SEQ for 44700 through DSIM0 at
+ * ~96 s, before the DECON flip self-test at ~108 s, so the console and the
+ * self-test pattern are visible. See Documentation/crownlte/panel-brightness.md.
+ *
+ * Opt-in: without samsung,fault-display-brightness on the panel node no
+ * DSIM register is mapped and no panel command is sent.
+ */
+#include "exynos9810-crownlte-delayed-ufs-display-s2-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + display stage 2 + 4.9 panel brightness";
+};
+
+&decon_f {
+	/* the stage 2 windows plus DSIM0 (4.9 dsim@16080000 reg[0], 256 bytes) */
+	reg = <0 0x16030000 0x10000>,	/* DECON-F */
+	      <0 0x16071000 0x6000>,	/* IDMA G0..VGF1 (base, fmt, sizes) */
+	      <0 0x16021000 0x6000>,	/* DPP blocks G0..VGF1 (CSC, scaler) */
+	      <0 0x16070000 0x1000>,	/* DPU DMA common */
+	      <0 0x160a0000 0x1000>,	/* sysmmu_dpu0..2, read only */
+	      <0 0x160b0000 0x1000>,
+	      <0 0x160c0000 0x1000>,
+	      <0 0x16080000 0x100>;	/* DSIM0: command FIFOs only */
+	reg-names = "decon", "dpp-dma", "dpp", "dma-common",
+		    "sysmmu0", "sysmmu1", "sysmmu2", "dsim";
+	samsung,panel = <&{/panel_drv@001}>;
+};
+
+&{/panel_drv@001} {
+	/* 4.9 panel_bl.c PANEL_FAULT_DISPLAY_BRIGHTNESS (cf5bb86c) */
+	samsung,fault-display-brightness = <44700>;
+	samsung,fault-display-brightness-at-ms = <96000>;
+	/* 4.9 log: "s6e3ha8_panel_read_id READ ID : 91 20 47" (crown_a3_s0_default) */
+	samsung,panel-id = [91 20 47];
+	/* 4.9 log, print_gamma_table(): gamma[720] (= gamma[700], from B3) */
+	samsung,hbm-gamma-expect = [07 38 30 39 79 79 79 7a 7a 7a 7e 7e 7e 7d 7f 7d
+				    80 7f 81 7e 7f 7d 72 6f 72 70 75 72 57 36 4a 00
+				    00 00];
+};
