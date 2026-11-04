@@ -396,6 +396,10 @@ CONFIG_S3C2410_WATCHDOG=y
 # MAX77705 read-only battery monitor: battery/ac/usb/wireless power supplies
 # for the health HAL from I2C reads only (never writes charger/fuel gauge).
 CONFIG_BATTERY_MAX77705_RO=y
+# Exynos9810 CMGP SoC ADC: battery/charger/USB thermistors (4.9 tables)
+# for battery/temp and the "ac" thermal zone; read-only conversions.
+CONFIG_IIO=y
+CONFIG_EXYNOS_ADC=y
 # Generic reset/poweroff drivers would take over the syscon-reboot/poweroff
 # nodes from the hardware-verified crownlte diagnostic restart path:
 # CONFIG_POWER_RESET_SYSCON is not set
