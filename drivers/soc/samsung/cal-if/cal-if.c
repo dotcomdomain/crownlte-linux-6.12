@@ -333,6 +333,12 @@ int cal_cpu_disable(unsigned int cpu)
 	return ret;
 }
 
+/* Diagnostics only: true while a CPU is inside a cal_cpu_* / cal_cluster_* call. */
+bool cal_cpu_lock_is_held(void)
+{
+	return spin_is_locked(&pmucal_cpu_lock);
+}
+
 int cal_cpu_status(unsigned int cpu)
 {
 	int ret;

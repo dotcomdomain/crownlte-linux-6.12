@@ -40,6 +40,7 @@ extern int cal_pm_earlywakeup(int mode);
 extern int cal_cpu_enable(unsigned int cpu);
 extern int cal_cpu_disable(unsigned int cpu);
 extern int cal_cpu_status(unsigned int cpu);
+extern bool cal_cpu_lock_is_held(void);
 extern int cal_cluster_enable(unsigned int cluster);
 extern int cal_cluster_disable(unsigned int cluster);
 extern int cal_cluster_status(unsigned int cluster);
