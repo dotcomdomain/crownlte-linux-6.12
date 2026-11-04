@@ -174,3 +174,6 @@
 		};
 	};
 };
+
+/* SMP bring-up test: all eight CPUs */
+&{/chosen} { bootargs = "panic=30 ro"; };
