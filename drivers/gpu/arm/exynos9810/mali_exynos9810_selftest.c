@@ -224,15 +224,32 @@ static void xg_selftest_fn(struct work_struct *work)
 		ret = exynos_acpm_read_reg(ACPM_MFD_TYPE_PMIC, XG_S2MPS18_B6CTRL, &b6);
 		pr_info(XG_ST_PFX "S2MPS18 B6CTRL (vdd_g3d) read %d: %#04x\n", ret, b6);
 	}
-	if (!on) {
+	/*
+	 * With "runtime" power control the domain is off whenever kbase is
+	 * idle; kbase_pm_context_active() below powers it on through the
+	 * platform callbacks. In any other mode an off domain is a failure.
+	 */
+	if (!on && g->pd_mode != XG_PD_RUNTIME) {
 		pr_err(XG_ST_PFX "FAIL: G3D power domain off, GPU registers not read\n");
 		return;
 	}
+	if (!on)
+		pr_info(XG_ST_PFX "domain off at idle (runtime power control): powering up through kbase\n");
 
 	/* 2. power up through kbase */
 	t = ktime_get();
 	kbase_pm_context_active(kbdev);
 	ret = kbase_pm_wait_for_desired_state(kbdev);
+	/* Never touch GPU registers with the domain off: that can stall the bus. */
+	if (!xg_pd_is_on(g, &cfg, &st)) {
+		pr_err(XG_ST_PFX "FAIL: G3D domain still off after kbase power-up (wait %d, PMU cfg %#x status %#x), GPU registers not read\n",
+		       ret, cfg, st);
+		kbase_pm_context_idle(kbdev);
+		return;
+	}
+	if (!on)
+		pr_info(XG_ST_PFX "runtime: domain on after kbase power-up, %lld us, PMU cfg %#x status %#x\n",
+			xg_us_since(t), cfg, st);
 	id = kbase_reg_read(kbdev, GPU_CONTROL_REG(GPU_ID));
 	l2p = kbase_reg_read(kbdev, GPU_CONTROL_REG(L2_PRESENT_LO));
 	l2r = kbase_reg_read(kbdev, GPU_CONTROL_REG(L2_READY_LO));
