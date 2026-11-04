@@ -234,7 +234,7 @@ static int debug_mem_open(struct inode *i, struct file *file)
 	struct debug_mem_data *mem_data;
 	int ret;
 
-	if (get_file_rcu(kctx->filp) == 0)
+	if (get_file_rcu(&kctx->filp) == 0)
 		return -ENOENT;
 
 	/* Check if file was opened in write mode. GPU memory contents

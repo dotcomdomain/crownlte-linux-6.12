@@ -318,7 +318,7 @@ static unsigned long kbase_mem_pool_reclaim_count_objects(struct shrinker *s,
 	struct kbase_mem_pool *pool;
 	size_t pool_size;
 
-	pool = container_of(s, struct kbase_mem_pool, reclaim);
+	pool = s->private_data;
 
 	kbase_mem_pool_lock(pool);
 	if (pool->dont_reclaim && !pool->dying) {
@@ -337,7 +337,7 @@ static unsigned long kbase_mem_pool_reclaim_scan_objects(struct shrinker *s,
 	struct kbase_mem_pool *pool;
 	unsigned long freed;
 
-	pool = container_of(s, struct kbase_mem_pool, reclaim);
+	pool = s->private_data;
 
 	kbase_mem_pool_lock(pool);
 	if (pool->dont_reclaim && !pool->dying) {
@@ -379,14 +379,18 @@ int kbase_mem_pool_init(struct kbase_mem_pool *pool,
 	spin_lock_init(&pool->pool_lock);
 	INIT_LIST_HEAD(&pool->page_list);
 
-	pool->reclaim.count_objects = kbase_mem_pool_reclaim_count_objects;
-	pool->reclaim.scan_objects = kbase_mem_pool_reclaim_scan_objects;
-	pool->reclaim.seeks = DEFAULT_SEEKS;
+	pool->reclaim = shrinker_alloc(0, "mali-pool-%p", pool);
+	if (!pool->reclaim)
+		return -ENOMEM;
+	pool->reclaim->private_data = pool;
+	pool->reclaim->count_objects = kbase_mem_pool_reclaim_count_objects;
+	pool->reclaim->scan_objects = kbase_mem_pool_reclaim_scan_objects;
+	pool->reclaim->seeks = DEFAULT_SEEKS;
 	/* Kernel versions prior to 3.1 :
 	 * struct shrinker does not define batch
 	 */
-	pool->reclaim.batch = 0;
-	register_shrinker(&pool->reclaim);
+	pool->reclaim->batch = 0;
+	shrinker_register(pool->reclaim);
 
 	pool_dbg(pool, "initialized\n");
 
@@ -411,7 +415,8 @@ void kbase_mem_pool_term(struct kbase_mem_pool *pool)
 
 	pool_dbg(pool, "terminate()\n");
 
-	unregister_shrinker(&pool->reclaim);
+	shrinker_free(pool->reclaim);
+	pool->reclaim = NULL;
 
 	kbase_mem_pool_lock(pool);
 	pool->max_size = 0;

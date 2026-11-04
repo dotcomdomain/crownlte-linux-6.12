@@ -506,7 +506,7 @@ struct kbase_mem_pool {
 	u8                  group_id;
 	spinlock_t          pool_lock;
 	struct list_head    page_list;
-	struct shrinker     reclaim;
+	struct shrinker     *reclaim;
 
 	struct kbase_mem_pool *next_pool;
 
@@ -713,7 +713,7 @@ struct kbase_process {
  * @regulators:            Pointer to the structs corresponding to the
  *                         regulators referenced by the GPU device node.
  * @nr_regulators:         Number of regulators set in the regulators array.
- * @opp_table:             Pointer to the device OPP structure maintaining the
+ * @opp_regulator_token:   Token for the OPP regulator configuration maintaining the
  *                         link to OPPs attached to a device. This is obtained
  *                         after setting regulator names for the device.
  * @devname:               string containing the name used for GPU device instance,
@@ -1017,7 +1017,7 @@ struct kbase_device {
 	struct regulator *regulators[BASE_MAX_NR_CLOCKS_REGULATORS];
 	unsigned int nr_regulators;
 #if (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE)
-	struct opp_table *opp_table;
+	int opp_regulator_token;
 #endif /* (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE */
 #endif /* CONFIG_REGULATOR */
 	char devname[DEVNAME_SIZE];
@@ -1844,7 +1844,7 @@ struct kbase_context {
 
 	struct kbase_mem_pool_group mem_pools;
 
-	struct shrinker         reclaim;
+	struct shrinker         *reclaim;
 	struct list_head        evict_list;
 	atomic_t evict_nents;
 

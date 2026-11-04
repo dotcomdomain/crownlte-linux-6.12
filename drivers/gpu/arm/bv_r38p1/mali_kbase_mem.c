@@ -4810,7 +4810,7 @@ int kbase_jd_user_buf_pin_pages(struct kbase_context *kctx,
 					     write ? FOLL_WRITE : 0, pages, NULL, NULL);
 #else
 	pinned_pages = pin_user_pages_remote(mm, address, alloc->imported.user_buf.nr_pages,
-					     write ? FOLL_WRITE : 0, pages, NULL, NULL);
+					     write ? FOLL_WRITE : 0, pages, NULL);
 #endif
 
 	if (pinned_pages <= 0)

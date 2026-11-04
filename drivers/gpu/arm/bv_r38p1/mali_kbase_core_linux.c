@@ -676,7 +676,7 @@ static int kbase_open(struct inode *inode, struct file *filp)
 	}
 
 	filp->private_data = kfile;
-	filp->f_mode |= FMODE_UNSIGNED_OFFSET;
+	/* mmap offsets are unsigned; this device has no llseek operation. */
 
 	return 0;
 
@@ -4497,7 +4497,7 @@ int power_control_init(struct kbase_device *kbdev)
 	unsigned int i;
 #if defined(CONFIG_REGULATOR)
 	static const char * const regulator_names[] = {
-		"mali", "shadercores"
+		"mali", "shadercores", NULL
 	};
 	BUILD_BUG_ON(ARRAY_SIZE(regulator_names) < BASE_MAX_NR_CLOCKS_REGULATORS);
 #endif /* CONFIG_REGULATOR */
@@ -4581,11 +4581,11 @@ int power_control_init(struct kbase_device *kbdev)
 #if ((KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE) && \
 	defined(CONFIG_REGULATOR))
 	if (kbdev->nr_regulators > 0) {
-		kbdev->opp_table = dev_pm_opp_set_regulators(kbdev->dev,
-			regulator_names, BASE_MAX_NR_CLOCKS_REGULATORS);
+		kbdev->opp_regulator_token = dev_pm_opp_set_regulators(
+			kbdev->dev, regulator_names);
 
-		if (IS_ERR_OR_NULL(kbdev->opp_table)) {
-			err = PTR_ERR(kbdev->opp_table);
+		if (kbdev->opp_regulator_token < 0) {
+			err = kbdev->opp_regulator_token;
 			goto regulators_probe_defer;
 		}
 	}
@@ -4626,8 +4626,8 @@ void power_control_term(struct kbase_device *kbdev)
 	dev_pm_opp_of_remove_table(kbdev->dev);
 #if ((KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE) && \
 	defined(CONFIG_REGULATOR))
-	if (!IS_ERR_OR_NULL(kbdev->opp_table))
-		dev_pm_opp_put_regulators(kbdev->opp_table);
+	if (kbdev->nr_regulators > 0 && kbdev->opp_regulator_token >= 0)
+		dev_pm_opp_put_regulators(kbdev->opp_regulator_token);
 #endif /* (KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE */
 #endif /* CONFIG_PM_OPP */
 
@@ -5385,18 +5385,17 @@ void kbase_sysfs_term(struct kbase_device *kbdev)
 	put_device(kbdev->dev);
 }
 
-static int kbase_platform_device_remove(struct platform_device *pdev)
+static void kbase_platform_device_remove(struct platform_device *pdev)
 {
 	struct kbase_device *kbdev = to_kbase_device(&pdev->dev);
 
 	if (!kbdev)
-		return -ENODEV;
+		return;
 
 	kbase_device_term(kbdev);
 	dev_set_drvdata(kbdev->dev, NULL);
 	kbase_device_free(kbdev);
 
-	return 0;
 }
 
 void kbase_backend_devfreq_term(struct kbase_device *kbdev)

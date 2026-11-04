@@ -685,9 +685,9 @@ unsigned long kbase_mem_evictable_reclaim_count_objects(struct shrinker *s,
 {
 	struct kbase_context *kctx;
 
-	kctx = container_of(s, struct kbase_context, reclaim);
+	kctx = s->private_data;
 
-	WARN((sc->gfp_mask & __GFP_ATOMIC),
+	WARN((!gfpflags_allow_blocking(sc->gfp_mask)),
 	     "Shrinkers cannot be called for GFP_ATOMIC allocations. Check kernel mm for problems. gfp_mask==%x\n",
 	     sc->gfp_mask);
 	WARN(in_atomic(),
@@ -725,7 +725,7 @@ unsigned long kbase_mem_evictable_reclaim_scan_objects(struct shrinker *s,
 	struct kbase_mem_phy_alloc *tmp;
 	unsigned long freed = 0;
 
-	kctx = container_of(s, struct kbase_context, reclaim);
+	kctx = s->private_data;
 
 	mutex_lock(&kctx->jit_evict_lock);
 
@@ -779,20 +779,25 @@ int kbase_mem_evictable_init(struct kbase_context *kctx)
 
 	atomic_set(&kctx->evict_nents, 0);
 
-	kctx->reclaim.count_objects = kbase_mem_evictable_reclaim_count_objects;
-	kctx->reclaim.scan_objects = kbase_mem_evictable_reclaim_scan_objects;
-	kctx->reclaim.seeks = DEFAULT_SEEKS;
+	kctx->reclaim = shrinker_alloc(0, "mali-context-%p", kctx);
+	if (!kctx->reclaim)
+		return -ENOMEM;
+	kctx->reclaim->private_data = kctx;
+	kctx->reclaim->count_objects = kbase_mem_evictable_reclaim_count_objects;
+	kctx->reclaim->scan_objects = kbase_mem_evictable_reclaim_scan_objects;
+	kctx->reclaim->seeks = DEFAULT_SEEKS;
 	/* Kernel versions prior to 3.1 :
 	 * struct shrinker does not define batch
 	 */
-	kctx->reclaim.batch = 0;
-	register_shrinker(&kctx->reclaim);
+	kctx->reclaim->batch = 0;
+	shrinker_register(kctx->reclaim);
 	return 0;
 }
 
 void kbase_mem_evictable_deinit(struct kbase_context *kctx)
 {
-	unregister_shrinker(&kctx->reclaim);
+	shrinker_free(kctx->reclaim);
+	kctx->reclaim = NULL;
 }
 
 /**
@@ -1165,7 +1170,7 @@ static void kbase_mem_umm_unmap_attachment(struct kbase_context *kctx,
 {
 	struct tagged_addr *pa = alloc->pages;
 
-	dma_buf_unmap_attachment(alloc->imported.umm.dma_attachment,
+	dma_buf_unmap_attachment_unlocked(alloc->imported.umm.dma_attachment,
 				 alloc->imported.umm.sgt, DMA_BIDIRECTIONAL);
 	alloc->imported.umm.sgt = NULL;
 
@@ -1199,7 +1204,7 @@ static int kbase_mem_umm_map_attachment(struct kbase_context *kctx,
 	WARN_ON_ONCE(alloc->type != KBASE_MEM_TYPE_IMPORTED_UMM);
 	WARN_ON_ONCE(alloc->imported.umm.sgt);
 
-	sgt = dma_buf_map_attachment(alloc->imported.umm.dma_attachment,
+	sgt = dma_buf_map_attachment_unlocked(alloc->imported.umm.dma_attachment,
 			DMA_BIDIRECTIONAL);
 	if (IS_ERR_OR_NULL(sgt))
 		return -EINVAL;
@@ -1673,10 +1678,11 @@ static struct kbase_va_region *kbase_mem_from_user_buffer(
 	 */
 	if (pages != NULL) {
 		faulted_pages =
-			pin_user_pages(address, *va_pages, write ? FOLL_WRITE : 0, pages, NULL);
+			pin_user_pages(address, *va_pages,
+				(write ? FOLL_WRITE : 0) | FOLL_LONGTERM, pages);
 	} else {
 		faulted_pages =
-			get_user_pages(address, *va_pages, write ? FOLL_WRITE : 0, pages, NULL);
+			get_user_pages(address, *va_pages, write ? FOLL_WRITE : 0, pages);
 	}
 #endif
 
@@ -2555,7 +2561,7 @@ static int kbase_cpu_mmap(struct kbase_context *kctx,
 	 * See MIDBASE-1057
 	 */
 
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO;
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO);
 	vma->vm_ops = &kbase_vm_ops;
 	vma->vm_private_data = map;
 
@@ -2584,11 +2590,11 @@ static int kbase_cpu_mmap(struct kbase_context *kctx,
 	}
 
 	if (!kaddr) {
-		vma->vm_flags |= VM_PFNMAP;
+		vm_flags_set(vma, VM_PFNMAP);
 	} else {
 		WARN_ON(aligned_offset);
 		/* MIXEDMAP so we can vfree the kaddr early and not track it after map time */
-		vma->vm_flags |= VM_MIXEDMAP;
+		vm_flags_set(vma, VM_MIXEDMAP);
 		/* vmalloc remaping is easy... */
 		err = remap_vmalloc_range(vma, kaddr, 0);
 		WARN_ON(err);
@@ -2804,9 +2810,9 @@ int kbase_context_mmap(struct kbase_context *const kctx,
 	dev_dbg(dev, "kbase_mmap\n");
 
 	if (!(vma->vm_flags & VM_READ))
-		vma->vm_flags &= ~VM_MAYREAD;
+		vm_flags_clear(vma, VM_MAYREAD);
 	if (!(vma->vm_flags & VM_WRITE))
-		vma->vm_flags &= ~VM_MAYWRITE;
+		vm_flags_clear(vma, VM_MAYWRITE);
 
 	if (nr_pages == 0) {
 		err = -EINVAL;
@@ -3157,16 +3163,7 @@ KBASE_EXPORT_TEST_API(kbase_vunmap);
 
 static void kbasep_add_mm_counter(struct mm_struct *mm, int member, long value)
 {
-#if (KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE)
-	/* To avoid the build breakage due to an unexported kernel symbol
-	 * 'mm_trace_rss_stat' from later kernels, i.e. from V4.19.0 onwards,
-	 * we inline here the equivalent of 'add_mm_counter()' from linux
-	 * kernel V5.4.0~8.
-	 */
-	atomic_long_add(value, &mm->rss_stat.count[member]);
-#else
 	add_mm_counter(mm, member, value);
-#endif
 }
 
 void kbasep_os_process_page_usage_update(struct kbase_context *kctx, int pages)
@@ -3240,8 +3237,8 @@ static int kbase_tracking_page_setup(struct kbase_context *kctx, struct vm_area_
 	spin_unlock(&kctx->mm_update_lock);
 
 	/* no real access */
-	vma->vm_flags &= ~(VM_READ | VM_MAYREAD | VM_WRITE | VM_MAYWRITE | VM_EXEC | VM_MAYEXEC);
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP | VM_IO;
+	vm_flags_clear(vma, (VM_READ | VM_MAYREAD | VM_WRITE | VM_MAYWRITE | VM_EXEC | VM_MAYEXEC));
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP | VM_IO);
 	vma->vm_ops = &kbase_vm_special_ops;
 	vma->vm_private_data = kctx;
 
@@ -3429,13 +3426,13 @@ static int kbase_csf_cpu_mmap_user_io_pages(struct kbase_context *kctx,
 	if (err)
 		goto map_failed;
 
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO;
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO);
 	/* TODO use VM_MIXEDMAP, since it is more appropriate as both types of
 	 * memory with and without "struct page" backing are being inserted here.
 	 * Hw Doorbell pages comes from the device register area so kernel does
 	 * not use "struct page" for them.
 	 */
-	vma->vm_flags |= VM_PFNMAP;
+	vm_flags_set(vma, VM_PFNMAP);
 
 	vma->vm_ops = &kbase_csf_user_io_pages_vm_ops;
 	vma->vm_private_data = queue;
@@ -3541,12 +3538,12 @@ static int kbase_csf_cpu_mmap_user_reg_page(struct kbase_context *kctx,
 	/* Map uncached */
 	vma->vm_page_prot = pgprot_device(vma->vm_page_prot);
 
-	vma->vm_flags |= VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO;
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTDUMP | VM_DONTEXPAND | VM_IO);
 
 	/* User register page comes from the device register area so
 	 * "struct page" isn't available for it.
 	 */
-	vma->vm_flags |= VM_PFNMAP;
+	vm_flags_set(vma, VM_PFNMAP);
 
 	kctx->csf.user_reg_vma = vma;
 

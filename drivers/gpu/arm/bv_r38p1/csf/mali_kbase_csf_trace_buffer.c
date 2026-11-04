@@ -665,7 +665,7 @@ static const struct file_operations kbasep_csf_firmware_trace_debugfs_fops = {
 	.owner = THIS_MODULE,
 	.open = kbasep_csf_firmware_trace_debugfs_open,
 	.read = kbasep_csf_firmware_trace_debugfs_read,
-	.llseek = no_llseek,
+	.llseek = NULL,
 };
 
 void kbase_csf_firmware_trace_buffer_debugfs_init(struct kbase_device *kbdev)
