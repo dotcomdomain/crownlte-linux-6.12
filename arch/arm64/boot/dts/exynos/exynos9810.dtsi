@@ -171,6 +171,20 @@
 			reg = <0x10000000 0x100>;
 		};
 
+		/*
+		 * Multi Core Timer. Only global comparator 0 (MCT G0) is
+		 * described, for the tick broadcast driver exynos9810-mct-bc.
+		 * 4.9 used SPIs 466-469 (G0-G3) and 470-477 (L0-L7).
+		 * Deliberately not "samsung,exynos4210-mct": that early
+		 * TIMER_OF driver panics on any clock or write failure.
+		 */
+		mct: timer@10040000 {
+			compatible = "samsung,exynos9810-mct-broadcast";
+			reg = <0x10040000 0x800>;
+			interrupts = <GIC_SPI 466 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
 		watchdog_cl0: watchdog@10050000 {
 			compatible = "samsung,exynos9810-wdt";
 			reg = <0x10050000 0x100>;

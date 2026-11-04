@@ -450,6 +450,20 @@ config CLKSRC_EXYNOS_MCT
 	help
 	  Support for Multi Core Timer controller on Exynos SoCs.
 
+config EXYNOS9810_MCT_BROADCAST
+	bool "Exynos 9810 MCT tick broadcast device"
+	depends on ARM64 && OF && ARM_ARCH_TIMER
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on GENERIC_CLOCKEVENTS_BROADCAST && TICK_ONESHOT
+	help
+	  Registers global comparator 0 of the Exynos 9810 Multi Core Timer
+	  as the tick broadcast device, after checking its counter rate and
+	  its interrupt. Idle states that stop the arch timer
+	  (local-timer-stop), such as the Exynos 9810 core power-down, need
+	  it. Unlike CLKSRC_EXYNOS_MCT it probes as a platform device, never
+	  panics, and leaves sched_clock and the per-CPU ticks on the arch
+	  timer.
+
 config CLKSRC_SAMSUNG_PWM
 	bool "PWM timer driver for Samsung S3C, S5P" if COMPILE_TEST
 	depends on HAS_IOMEM
