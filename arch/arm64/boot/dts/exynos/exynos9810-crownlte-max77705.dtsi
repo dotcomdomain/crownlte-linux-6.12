@@ -13,6 +13,9 @@
  * (battery,technology, battery,temp_*_normal) and cable-info
  * (full_check_current_1st). samsung,legacy-current-ma keeps the 4.9 sysfs
  * units for battery/current_now and current_avg (mA, sec_battery.c).
+ *
+ * The thermistor channels need &adc (exynos9810.dtsi) enabled with its
+ * clock; until the ADC probes, this node defers.
  */
 
 &hsi2c_pmic {
@@ -32,6 +35,40 @@
 		samsung,temp-low-threshold = <0>;
 		samsung,temp-low-recovery = <50>;
 		samsung,legacy-current-ma;
+
+		/*
+		 * SoC ADC thermistors, as the 4.9 "battery" node
+		 * (crownlte_eur_open_26.dts): io-channels <adc 4> "adc-temp"
+		 * (battery NTC, battery,thermal_source = <2>), <adc 3>
+		 * "adc-chg-temp" (charger NTC, 4.9 ac/TEMP), <adc 1>
+		 * "adc-usb-temp" (USB connector NTC); battery,adc_check_count
+		 * = <5>; tables battery,{,chg_,usb_}temp_table_{adc,data}
+		 * verbatim (ADC code ascending -> 0.1 degC).
+		 */
+		io-channels = <&adc 4>, <&adc 3>, <&adc 1>;
+		io-channel-names = "adc-temp", "adc-chg-temp", "adc-usb-temp";
+		samsung,adc-check-count = <5>;
+		samsung,temp-table-adc = <313 357 429 488 571 677 789 890 920 945 1037 1078 1114
+			1194 1234 1273 1384 1429 1475 1633 1861 2090 2311 2495
+			2539 2587 2717 2737 2808 2933 2969 3006 3132 3165 3201
+			3336 3481 3693 3765>;
+		samsung,temp-table-data = <900 850 800 750 700 650 600 560 550 540 510 500 490 460
+			450 440 410 400 390 350 300 250 200 160 150 140 110 100
+			90 60 50 40 10 0 (-10) (-50) (-100) (-200) (-250)>;
+		samsung,chg-temp-table-adc = <294 339 409 469 555 654 761 867 892 921 1009 1046 1080
+			1165 1214 1242 1351 1398 1442 1598 1827 2058 2275 2438
+			2511 2552 2686 2707 2771 2895 2928 2976 3108 3136 3180
+			3309 3457 3674 3753>;
+		samsung,chg-temp-table-data = <900 850 800 750 700 650 600 560 550 540 510 500 490 460
+			450 440 410 400 390 350 300 250 200 160 150 140 110 100
+			90 60 50 40 10 0 (-10) (-50) (-100) (-200) (-250)>;
+		samsung,usb-temp-table-adc = <303 349 416 480 565 664 772 876 905 931 1021 1055 1088
+			1182 1226 1263 1374 1418 1462 1620 1848 2076 2297 2476
+			2526 2572 2702 2725 2789 2914 2950 2987 3116 3145 3188
+			3323 3470 3689 3756>;
+		samsung,usb-temp-table-data = <900 850 800 750 700 650 600 560 550 540 510 500 490 460
+			450 440 410 400 390 350 300 250 200 160 150 140 110 100
+			90 60 50 40 10 0 (-10) (-50) (-100) (-200) (-250)>;
 		status = "disabled";
 	};
 };

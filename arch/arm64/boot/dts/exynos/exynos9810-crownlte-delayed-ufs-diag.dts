@@ -322,6 +322,7 @@
  */
 &max77705_battery {
 	samsung,selftest-ms = <107000>;
+	samsung,adc-selftest-ms = <104500>;
 	status = "okay";
 };
 

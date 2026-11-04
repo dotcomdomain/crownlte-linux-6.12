@@ -9,7 +9,18 @@
  * builds the power_supply devices that the Lineage/Samsung health HAL scans:
  * "battery" (Battery), "ac" (Mains), "usb" (USB) and "wireless" (Wireless).
  * The power_supply core adds a tripless thermal zone named "battery" because
- * "battery" reports POWER_SUPPLY_PROP_TEMP.
+ * "battery" reports POWER_SUPPLY_PROP_TEMP, and one named "ac" when the
+ * charger thermistor is wired (DT io-channels "adc-chg-temp").
+ *
+ * Temperatures come from the SoC ADC thermistors as on 4.9 (sec_battery.c
+ * sec_bat_get_temperature_info(), battery,thermal_source = <2> ADC):
+ * "adc-temp" = battery NTC, "adc-chg-temp" = charger NTC (4.9 "ac"/TEMP),
+ * "adc-usb-temp" = USB connector NTC. Each value is the 4.9 trimmed mean
+ * of adc_check_count conversions (sec_adc.c sec_bat_get_adc_data()) mapped
+ * through the 4.9 DT table with linear interpolation
+ * (sec_bat_get_value_by_adc()). 4.9 also wrote the battery temperature into
+ * the fuel gauge TEMP register (CONFIG.TEX=1); this driver does not, so FG
+ * TEMP stays stale and is only used if the ADC is not wired.
  *
  * The register conversions and the capacity pipeline follow the 4.9 Samsung
  * drivers (drivers/battery_v2/max77705_fuelgauge.c, max77705_charger.c and
@@ -34,6 +45,8 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/i2c.h>
+#include <linux/iio/consumer.h>
+#include <linux/iio/iio.h>		/* struct iio_chan_spec: channel number for logs */
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -42,6 +55,8 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/soc/samsung/exynos9810-max77705-muic.h>
+#include <linux/sysfs.h>
+#include <linux/thermal.h>
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
 
@@ -158,6 +173,40 @@ enum mx_cable {
 	CABLE_WIRELESS = 10,
 };
 
+/*
+ * SoC ADC thermistors. Channel names, table property names and roles from
+ * the 4.9 crownlte "battery" node (battery,temp_table_*, usb_temp_table_*,
+ * chg_temp_table_*, io-channel-names).
+ */
+enum mx_therm_id { THERM_BATT, THERM_CHG, THERM_USB, THERM_NUM };
+
+static const struct {
+	const char *chan, *adc_prop, *temp_prop, *label;
+} mx_therm_dt[THERM_NUM] = {
+	[THERM_BATT] = { "adc-temp", "samsung,temp-table-adc",
+			 "samsung,temp-table-data", "batt" },
+	[THERM_CHG] = { "adc-chg-temp", "samsung,chg-temp-table-adc",
+			"samsung,chg-temp-table-data", "chg" },
+	[THERM_USB] = { "adc-usb-temp", "samsung,usb-temp-table-adc",
+			"samsung,usb-temp-table-data", "usb" },
+};
+
+/* 0.1 degC value as signed "d.d" (also right for -0.9 .. -0.1) */
+#define DC_FMT			"%s%d.%d"
+#define DC_ARG(x)		(x) < 0 ? "-" : "", abs(x) / 10, abs(x) % 10
+
+#define MX_ADC_RETRY_CNT	3	/* 4.9 sec_adc.h RETRY_CNT */
+#define MX_ADC_MAX_COUNT	16
+
+struct mx_therm {
+	struct iio_channel *ch;		/* NULL: not wired in DT */
+	int n;
+	s32 *adc, *temp;		/* ascending ADC codes, 0.1 degC */
+	int prev_raw;			/* sec_bat_adc_ap_read() prev_value */
+	bool have_raw;
+	unsigned long reads, errors;
+};
+
 /* FG registers that only the host changes: must not move while we run */
 static const u8 fg_cfg_regs[] = {
 	FG_VALRT_TH, FG_TALRT_TH, FG_SALRT_TH, FG_FULLSOCTHR, FG_DESIGNCAP,
@@ -180,7 +229,11 @@ struct mx_snap {
 	/* converted, 4.9 units */
 	int vcell_mv, avgvcell_mv, vfocv_mv, vbyp_mv;
 	int inow_ma, iavg_ma, inow_ua, iavg_ua;
-	int temp_dc;		/* 0.1 degC */
+	int temp_dc;		/* 0.1 degC: ADC battery NTC, else FG TEMP */
+	int fg_temp_dc;		/* FG TEMP register, 0.1 degC */
+	bool therm_ok[THERM_NUM];
+	int therm_raw[THERM_NUM];	/* trimmed-mean ADC code */
+	int therm_dc[THERM_NUM];	/* 0.1 degC */
 	int repsoc_dp;		/* 0.1 % */
 	int rawsoc_cp;		/* 0.01 % */
 	int vfsoc_dp;
@@ -220,7 +273,10 @@ struct mx_ro {
 	s32 t_high, t_high_rec, t_low, t_low_rec;	/* *_normal */
 	bool current_ma;		/* 4.9 sysfs: current_now/avg in mA */
 	u32 selftest_ms;
+	u32 adc_selftest_ms;
 	u32 poll_ms, poll_chg_ms;
+	u32 adc_check_count;		/* battery,adc_check_count */
+	struct mx_therm therm[THERM_NUM];
 
 	/* 4.9 max77705_fuelgauge_data state, all software */
 	int capacity_max;
@@ -246,6 +302,7 @@ struct mx_ro {
 	struct power_supply *psy_bat, *psy_ac, *psy_usb, *psy_wl;
 	struct delayed_work monitor;
 	struct delayed_work selftest;
+	struct delayed_work adc_selftest;
 };
 
 /* The only bus access in this driver. */
@@ -538,6 +595,158 @@ static int mx_temp_health(struct mx_ro *m, int t)
 	return m->temp_health;
 }
 
+/* --- 4.9 sec_adc.c: SoC ADC thermistors ---------------------------------- */
+
+/* sec_bat_adc_ap_read(): RETRY_CNT tries, previous value if all fail */
+static int mx_adc_read_one(struct mx_therm *t, int *raw)
+{
+	int i, v, ret = -EIO;
+
+	for (i = 0; i < MX_ADC_RETRY_CNT; i++) {
+		t->reads++;
+		ret = iio_read_channel_raw(t->ch, &v);
+		if (ret >= 0 && v >= 0) {
+			t->prev_raw = v;
+			t->have_raw = true;
+			*raw = v;
+			return 0;
+		}
+		t->errors++;
+	}
+	if (!t->have_raw)
+		return ret < 0 ? ret : -EIO;
+	*raw = t->prev_raw;
+	return 0;
+}
+
+/*
+ * sec_bat_get_adc_data(): "count" conversions (at least 3), drop the
+ * maximum and the minimum, average the rest. The 4.9 "else if" is kept, so
+ * a sample that sets a new maximum is not also checked against the minimum.
+ */
+static int mx_adc_avg(struct mx_ro *m, struct mx_therm *t, int *samples,
+		      int *avg)
+{
+	int count = clamp_t(int, m->adc_check_count, 3, MX_ADC_MAX_COUNT);
+	int i, v, ret, hi = 0, lo = 0xffff, total = 0;
+
+	for (i = 0; i < count; i++) {
+		ret = mx_adc_read_one(t, &v);
+		if (ret)
+			return ret;
+		if (samples)
+			samples[i] = v;
+		if (i != 0) {
+			if (v > hi)
+				hi = v;
+			else if (v < lo)
+				lo = v;
+		} else {
+			hi = v;
+			lo = v;
+		}
+		total += v;
+	}
+	*avg = (total - hi - lo) / (count - 2);
+	return 0;
+}
+
+/* sec_bat_get_value_by_adc(): binary search + linear interpolation */
+static int mx_adc_to_temp(const struct mx_therm *t, int adc)
+{
+	int low = 0, high = t->n - 1, mid, temp;
+
+	if (t->adc[0] >= adc)
+		return t->temp[0];
+	if (t->adc[high] <= adc)
+		return t->temp[high];
+
+	while (low <= high) {
+		mid = (low + high) / 2;
+		if (t->adc[mid] > adc)
+			high = mid - 1;
+		else if (t->adc[mid] < adc)
+			low = mid + 1;
+		else
+			return t->temp[mid];
+	}
+	temp = t->temp[high];
+	temp += ((t->temp[low] - t->temp[high]) * (adc - t->adc[high])) /
+		(t->adc[low] - t->adc[high]);
+	return temp;
+}
+
+static void mx_sample_therm(struct mx_ro *m, struct mx_snap *s)
+{
+	int i, raw, ret;
+
+	for (i = 0; i < THERM_NUM; i++) {
+		struct mx_therm *t = &m->therm[i];
+
+		s->therm_ok[i] = false;
+		if (!t->ch)
+			continue;
+		ret = mx_adc_avg(m, t, NULL, &raw);
+		if (ret) {
+			dev_warn_ratelimited(m->dev, "%s thermistor ADC read failed: %d\n",
+					     mx_therm_dt[i].label, ret);
+			continue;
+		}
+		s->therm_ok[i] = true;
+		s->therm_raw[i] = raw;
+		s->therm_dc[i] = mx_adc_to_temp(t, raw);
+	}
+}
+
+static int mx_therm_init(struct mx_ro *m)
+{
+	struct device_node *np = m->dev->of_node;
+	int i, j, n, ret;
+
+	for (i = 0; i < THERM_NUM; i++) {
+		struct mx_therm *t = &m->therm[i];
+
+		if (of_property_match_string(np, "io-channel-names",
+					     mx_therm_dt[i].chan) < 0)
+			continue;
+		n = of_property_count_u32_elems(np, mx_therm_dt[i].adc_prop);
+		if (n < 2 || n != of_property_count_u32_elems(np, mx_therm_dt[i].temp_prop))
+			return dev_err_probe(m->dev, -EINVAL, "%s: bad %s/%s\n",
+					     mx_therm_dt[i].label,
+					     mx_therm_dt[i].adc_prop,
+					     mx_therm_dt[i].temp_prop);
+		t->adc = devm_kcalloc(m->dev, n, sizeof(*t->adc), GFP_KERNEL);
+		t->temp = devm_kcalloc(m->dev, n, sizeof(*t->temp), GFP_KERNEL);
+		if (!t->adc || !t->temp)
+			return -ENOMEM;
+		ret = of_property_read_u32_array(np, mx_therm_dt[i].adc_prop,
+						 (u32 *)t->adc, n) ?:
+		      of_property_read_u32_array(np, mx_therm_dt[i].temp_prop,
+						 (u32 *)t->temp, n);
+		if (ret)
+			return ret;
+		for (j = 1; j < n; j++)
+			if (t->adc[j] <= t->adc[j - 1])
+				return dev_err_probe(m->dev, -EINVAL,
+						     "%s: ADC table not ascending at %d\n",
+						     mx_therm_dt[i].label, j);
+		t->n = n;
+
+		t->ch = devm_iio_channel_get(m->dev, mx_therm_dt[i].chan);
+		if (IS_ERR(t->ch))
+			return dev_err_probe(m->dev, PTR_ERR(t->ch),
+					     "%s: IIO channel %s\n",
+					     mx_therm_dt[i].label,
+					     mx_therm_dt[i].chan);
+	}
+	return 0;
+}
+
+static int mx_therm_chan(const struct mx_therm *t)
+{
+	return t->ch ? t->ch->channel->channel : -1;
+}
+
 /* --- sampling ------------------------------------------------------------ */
 
 static int mx_sample(struct mx_ro *m, struct mx_snap *s)
@@ -566,7 +775,10 @@ static int mx_sample(struct mx_ro *m, struct mx_snap *s)
 	s->iavg_ma = conv_current(m, w[5], false);
 	s->iavg_ua = conv_current(m, w[5], true);
 	s->present = !(w[0] & FG_STATUS_BST);
-	s->temp_dc = s->present ? conv_temp(w[6]) : 200;
+	s->fg_temp_dc = s->present ? conv_temp(w[6]) : 200;
+	mx_sample_therm(m, s);
+	s->temp_dc = s->therm_ok[THERM_BATT] ? s->therm_dc[THERM_BATT] :
+					      s->fg_temp_dc;
 	s->repsoc_dp = conv_soc_dp(w[7]);
 	s->rawsoc_cp = conv_soc_cp(w[7]);
 	s->vfsoc_dp = conv_soc_dp(w[8]);
@@ -819,6 +1031,14 @@ static enum power_supply_property mx_src_props[] = {
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 };
 
+/* 4.9 sec_ac_props: ONLINE, TEMP (chg_temp), VOLTAGE_MAX, CURRENT_MAX */
+static enum power_supply_property mx_ac_props[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
+};
+
 static enum power_supply_property mx_wl_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_PRESENT,
@@ -868,6 +1088,11 @@ static int mx_src_get(struct power_supply *psy, enum power_supply_property psp,
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		val->intval = on ? s.input_ma * 1000 : 0;
 		break;
+	case POWER_SUPPLY_PROP_TEMP:	/* 4.9: battery->chg_temp, 0.1 degC */
+		if (!s.therm_ok[THERM_CHG])
+			return -ENODATA;
+		val->intval = s.therm_dc[THERM_CHG];
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -889,6 +1114,62 @@ static const struct power_supply_desc mx_ac_desc = {
 	.num_properties = ARRAY_SIZE(mx_src_props),
 	.get_property = mx_src_get,
 };
+
+/* "ac" with the charger thermistor: the core adds thermal zone "ac" */
+static const struct power_supply_desc mx_ac_temp_desc = {
+	.name = "ac",
+	.type = POWER_SUPPLY_TYPE_MAINS,
+	.properties = mx_ac_props,
+	.num_properties = ARRAY_SIZE(mx_ac_props),
+	.get_property = mx_src_get,
+};
+
+/*
+ * 4.9 sec_battery_sysfs.c battery/{batt,chg,usb}_temp{,_adc}: last polled
+ * values (0.1 degC and trimmed-mean ADC code). Read-only.
+ */
+static ssize_t mx_therm_show(struct device *dev, char *buf, int id, bool adc)
+{
+	struct mx_ro *m = power_supply_get_drvdata(to_power_supply(dev));
+	struct mx_snap s;
+
+	mutex_lock(&m->lock);
+	s = m->snap;
+	mutex_unlock(&m->lock);
+	if (!s.valid)
+		return -ENODATA;
+	if (id == THERM_BATT && !adc)
+		return sysfs_emit(buf, "%d\n", s.temp_dc);
+	if (!s.therm_ok[id])
+		return -ENODATA;
+	return sysfs_emit(buf, "%d\n", adc ? s.therm_raw[id] : s.therm_dc[id]);
+}
+
+#define MX_THERM_ATTR(_name, _id, _adc)					\
+static ssize_t _name##_show(struct device *dev,				\
+			    struct device_attribute *attr, char *buf)	\
+{									\
+	return mx_therm_show(dev, buf, _id, _adc);			\
+}									\
+static DEVICE_ATTR_RO(_name)
+
+MX_THERM_ATTR(batt_temp, THERM_BATT, false);
+MX_THERM_ATTR(batt_temp_adc, THERM_BATT, true);
+MX_THERM_ATTR(chg_temp, THERM_CHG, false);
+MX_THERM_ATTR(chg_temp_adc, THERM_CHG, true);
+MX_THERM_ATTR(usb_temp, THERM_USB, false);
+MX_THERM_ATTR(usb_temp_adc, THERM_USB, true);
+
+static struct attribute *mx_bat_attrs[] = {
+	&dev_attr_batt_temp.attr,
+	&dev_attr_batt_temp_adc.attr,
+	&dev_attr_chg_temp.attr,
+	&dev_attr_chg_temp_adc.attr,
+	&dev_attr_usb_temp.attr,
+	&dev_attr_usb_temp_adc.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mx_bat);
 
 static const struct power_supply_desc mx_usb_desc = {
 	.name = "usb",
@@ -984,8 +1265,10 @@ static void mx_selftest_work(struct work_struct *work)
 		 s.vfsoc_dp % 10, m->capacity_max, s.vcell_mv, s.avgvcell_mv,
 		 s.vfocv_mv, s.inow_ma, s.iavg_ma);
 	dev_info(m->dev,
-		 "battery selftest: temp=%d.%dC (FG TEMP, CONFIG=%04x TEX=%d, %s since probe) present=%d health=%d cycles=%d fullcaprep=%dmAh fullcapnom=%dmAh repcap=%dmAh design=%dmAh\n",
-		 s.temp_dc / 10, abs(s.temp_dc % 10), s.config,
+		 "battery selftest: temp=%d.%dC (%s) fg_temp=%d.%dC (CONFIG=%04x TEX=%d, %s since probe) present=%d health=%d cycles=%d fullcaprep=%dmAh fullcapnom=%dmAh repcap=%dmAh design=%dmAh\n",
+		 s.temp_dc / 10, abs(s.temp_dc % 10),
+		 s.therm_ok[THERM_BATT] ? "SoC ADC" : "FG TEMP",
+		 s.fg_temp_dc / 10, abs(s.fg_temp_dc % 10), s.config,
 		 !!(s.config & FG_CONFIG_TEX),
 		 m->temp_changed ? "changed" : "UNCHANGED", s.present, s.health,
 		 s.cycles_reg / 100, s.fullcaprep_mah, s.fullcapnom_mah,
@@ -1015,6 +1298,111 @@ static void mx_selftest_work(struct work_struct *work)
 		 pass ? "PASS" : "FAIL");
 }
 
+/*
+ * DT-gated ADC thermistor self-test (samsung,adc-selftest-ms): fresh 4.9
+ * sampling of each wired thermistor with every raw code shown, comparison
+ * with the FG TEMP register, and the "battery"/"ac" thermal zones read
+ * through the thermal core.
+ */
+static int mx_zone_temp(struct power_supply *psy, const char **type)
+{
+	int mc = INT_MIN;
+
+	*type = "-";
+#ifdef CONFIG_THERMAL
+	if (!IS_ERR_OR_NULL(psy->tzd)) {
+		*type = thermal_zone_device_type(psy->tzd);
+		if (thermal_zone_get_temp(psy->tzd, &mc))
+			mc = INT_MIN;
+	}
+#endif
+	return mc;
+}
+
+static void mx_adc_selftest_work(struct work_struct *work)
+{
+	struct mx_ro *m = container_of(to_delayed_work(work), struct mx_ro,
+				       adc_selftest);
+	int samples[MX_ADC_MAX_COUNT], count, i, j, raw, dc, ret, n_ok = 0;
+	int n_wired = 0, bat_dc = INT_MIN, fg_dc, bat_mc, ac_mc;
+	const char *bat_type, *ac_type;
+	u16 fg_temp = 0, fg_cfg = 0;
+	bool pass = true;
+	char line[128];
+
+	count = clamp_t(int, m->adc_check_count, 3, MX_ADC_MAX_COUNT);
+	for (i = 0; i < THERM_NUM; i++) {
+		struct mx_therm *t = &m->therm[i];
+		int len = 0;
+		bool in_range;
+
+		if (!t->ch) {
+			dev_info(m->dev, "adc selftest: %s thermistor not wired (no %s)\n",
+				 mx_therm_dt[i].label, mx_therm_dt[i].chan);
+			continue;
+		}
+		n_wired++;
+		mutex_lock(&m->lock);
+		ret = mx_adc_avg(m, t, samples, &raw);
+		mutex_unlock(&m->lock);
+		if (ret) {
+			pass = false;
+			dev_warn(m->dev, "adc selftest: %s ch%d read failed: %d\n",
+				 mx_therm_dt[i].label, mx_therm_chan(t), ret);
+			continue;
+		}
+		dc = mx_adc_to_temp(t, raw);
+		if (i == THERM_BATT)
+			bat_dc = dc;
+		for (j = 0; j < count; j++)
+			len += scnprintf(line + len, sizeof(line) - len, " %d",
+					 samples[j]);
+		/* outside the table = clamped: open or shorted NTC */
+		in_range = raw > t->adc[0] && raw < t->adc[t->n - 1];
+		if (in_range && dc > -200 && dc < 800)
+			n_ok++;
+		else
+			pass = false;
+		dev_info(m->dev,
+			 "adc selftest: %s ch%d raw%s -> avg %d -> " DC_FMT "C (table %d..%d = " DC_FMT ".." DC_FMT "C%s) reads=%lu errors=%lu\n",
+			 mx_therm_dt[i].label, mx_therm_chan(t), line, raw,
+			 DC_ARG(dc), t->adc[0], t->adc[t->n - 1],
+			 DC_ARG(t->temp[0]),
+			 DC_ARG(t->temp[t->n - 1]),
+			 in_range ? "" : ", OUT OF TABLE", t->reads, t->errors);
+	}
+
+	mutex_lock(&m->lock);
+	ret = mx_fg_word(m, FG_TEMP, &fg_temp) ?: mx_fg_word(m, FG_CONFIG, &fg_cfg);
+	mutex_unlock(&m->lock);
+	fg_dc = conv_temp(fg_temp);
+	if (ret)
+		dev_warn(m->dev, "adc selftest: FG TEMP read failed: %d\n", ret);
+	else if (bat_dc != INT_MIN)
+		dev_info(m->dev,
+			 "adc selftest: batt ADC " DC_FMT "C vs FG TEMP " DC_FMT "C (reg %04x, CONFIG.TEX=%d: %s, %s since probe) diff " DC_FMT "C; FG TEMP is never written by 6.12\n",
+			 DC_ARG(bat_dc), DC_ARG(fg_dc),
+			 fg_temp, !!(fg_cfg & FG_CONFIG_TEX),
+			 (fg_cfg & FG_CONFIG_TEX) ? "host-written, stale" : "gauge-measured",
+			 fg_temp != m->temp_first ? "changed" : "UNCHANGED",
+			 DC_ARG(bat_dc - fg_dc));
+
+	bat_mc = mx_zone_temp(m->psy_bat, &bat_type);
+	ac_mc = mx_zone_temp(m->psy_ac, &ac_type);
+	dev_info(m->dev,
+		 "adc selftest: thermal zones \"%s\"=%d mC \"%s\"=%d mC (power_supply TEMP x100, tripless)\n",
+		 bat_type, bat_mc, ac_type, ac_mc);
+	if (m->therm[THERM_BATT].ch && (bat_mc == INT_MIN || strcmp(bat_type, "battery")))
+		pass = false;
+	if (m->therm[THERM_CHG].ch && (ac_mc == INT_MIN || strcmp(ac_type, "ac")))
+		pass = false;
+
+	dev_info(m->dev,
+		 "adc selftest: thermistors wired=%d ok=%d max77705_writes=%lu -> %s\n",
+		 n_wired, n_ok, m->writes,
+		 pass && n_wired && m->writes == 0 ? "PASS" : "FAIL");
+}
+
 /* --- probe ------------------------------------------------------------- */
 
 static void mx_parse_dt(struct mx_ro *m)
@@ -1034,6 +1422,8 @@ static void mx_parse_dt(struct mx_ro *m)
 	RD("samsung,poll-ms", poll_ms, 30000);
 	RD("samsung,poll-charging-ms", poll_chg_ms, 10000);
 	RD("samsung,selftest-ms", selftest_ms, 0);
+	RD("samsung,adc-selftest-ms", adc_selftest_ms, 0);
+	RD("samsung,adc-check-count", adc_check_count, 5);
 #undef RD
 	if (of_property_read_s32(np, "samsung,temp-high-threshold", &m->t_high))
 		m->t_high = 500;
@@ -1059,6 +1449,7 @@ static void mx_cancel(void *data)
 {
 	struct mx_ro *m = data;
 
+	cancel_delayed_work_sync(&m->adc_selftest);
 	cancel_delayed_work_sync(&m->selftest);
 	cancel_delayed_work_sync(&m->monitor);
 }
@@ -1066,10 +1457,10 @@ static void mx_cancel(void *data)
 static int mx_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
-	struct power_supply_config cfg = {};
+	struct power_supply_config cfg = {}, bat_cfg = {};
 	struct mx_ro *m;
 	u16 designcap, w;
-	int ret, raw;
+	int ret, raw, i;
 
 	if (!i2c_check_functionality(client->adapter,
 				     I2C_FUNC_SMBUS_READ_BYTE_DATA |
@@ -1085,6 +1476,7 @@ static int mx_probe(struct i2c_client *client)
 	mutex_init(&m->lock);
 	INIT_DELAYED_WORK(&m->monitor, mx_monitor_work);
 	INIT_DELAYED_WORK(&m->selftest, mx_selftest_work);
+	INIT_DELAYED_WORK(&m->adc_selftest, mx_adc_selftest_work);
 	i2c_set_clientdata(client, m);
 	mx_parse_dt(m);
 
@@ -1103,6 +1495,11 @@ static int mx_probe(struct i2c_client *client)
 	if (IS_ERR(m->pmic))
 		return dev_err_probe(dev, PTR_ERR(m->pmic), "pmic 0x%02x busy\n",
 				     MX_ADDR_PMIC);
+
+	/* SoC ADC thermistors (may defer until the ADC has probed) */
+	ret = mx_therm_init(m);
+	if (ret)
+		return ret;
 
 	ret = mx_read_u8(m, MX_ADDR_PMIC, PMIC_REG_PMICID1, &m->pmic_id) ?:
 	      mx_read_u8(m, MX_ADDR_PMIC, PMIC_REG_PMICREV, &m->pmic_rev);
@@ -1157,12 +1554,29 @@ static int mx_probe(struct i2c_client *client)
 		 abs(m->snap.temp_dc % 10), m->snap.cable, m->snap.status,
 		 DTLS01_CHG(m->snap.dtls1), chg_dtls_name(DTLS01_CHG(m->snap.dtls1)),
 		 m->snap.cnfg00);
+	for (i = 0; i < THERM_NUM; i++) {
+		if (!m->therm[i].ch)
+			continue;
+		dev_info(dev,
+			 "SoC ADC thermistor %s: ch%d (%s), %d-point 4.9 table, %u samples per read; first %s raw %d -> " DC_FMT "C\n",
+			 mx_therm_dt[i].label, mx_therm_chan(&m->therm[i]),
+			 mx_therm_dt[i].chan, m->therm[i].n, m->adc_check_count,
+			 m->snap.therm_ok[i] ? "read" : "read FAILED",
+			 m->snap.therm_raw[i], DC_ARG(m->snap.therm_dc[i]));
+	}
+	dev_info(dev, "battery temperature source: %s; ac temperature: %s; FG TEMP is not written\n",
+		 m->therm[THERM_BATT].ch ? "SoC ADC battery NTC" : "FG TEMP register",
+		 m->therm[THERM_CHG].ch ? "SoC ADC charger NTC (thermal zone \"ac\")" :
+					  "none (no \"ac\" thermal zone)");
 
 	cfg.drv_data = m;
-	m->psy_bat = devm_power_supply_register(dev, &mx_bat_desc, &cfg);
+	bat_cfg.drv_data = m;
+	bat_cfg.attr_grp = mx_bat_groups;
+	m->psy_bat = devm_power_supply_register(dev, &mx_bat_desc, &bat_cfg);
 	if (IS_ERR(m->psy_bat))
 		return dev_err_probe(dev, PTR_ERR(m->psy_bat), "battery psy\n");
-	m->psy_ac = devm_power_supply_register(dev, &mx_ac_desc, &cfg);
+	m->psy_ac = devm_power_supply_register(dev, m->therm[THERM_CHG].ch ?
+					       &mx_ac_temp_desc : &mx_ac_desc, &cfg);
 	if (IS_ERR(m->psy_ac))
 		return dev_err_probe(dev, PTR_ERR(m->psy_ac), "ac psy\n");
 	m->psy_usb = devm_power_supply_register(dev, &mx_usb_desc, &cfg);
@@ -1187,6 +1601,15 @@ static int mx_probe(struct i2c_client *client)
 		dev_info(dev, "battery selftest armed for %u ms after boot\n",
 			 m->selftest_ms);
 		queue_delayed_work(system_power_efficient_wq, &m->selftest,
+				   msecs_to_jiffies(delay));
+	}
+	if (m->adc_selftest_ms) {
+		u64 now = ktime_to_ms(ktime_get_boottime());
+		u64 delay = now < m->adc_selftest_ms ? m->adc_selftest_ms - now : 0;
+
+		dev_info(dev, "adc selftest armed for %u ms after boot\n",
+			 m->adc_selftest_ms);
+		queue_delayed_work(system_power_efficient_wq, &m->adc_selftest,
 				   msecs_to_jiffies(delay));
 	}
 	return 0;
