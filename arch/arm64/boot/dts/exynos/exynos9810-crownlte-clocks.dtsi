@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Actual crownlte live DT resources. Disabled until firmware bring-up. */
+#include <dt-bindings/clock/exynos9810.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/soc/samsung,exynos-usi.h>
 / {
 	/*
 	 * S2MPS18 main PMIC (4.9: speedy@141C0000/s2mps18mfd@00 with
@@ -103,5 +107,90 @@
 		samsung,boot-qos = <40 667000>;
 		acpm-ipc-channel = <1>;
 		status = "disabled";
+	};
+};
+
+/*
+ * Touchscreen bus: PERIC0 USI03 as HSI2C (4.9 alias hsi2c10 = hsi2c@104B0000,
+ * SPI 404, pins gpp1-4/gpp1-5 function 2, clocks rate 224 = USI03 and
+ * gate 205 = GATE_USI03, fast mode 400 kHz default). The USI03 protocol
+ * selector is PERIC0 SYSREG +0x101c (4.9 usi@1041101C usi_v2_mode "i2c",
+ * value I2C_SW_CONF = BIT(2)). 4.9 also set samsung,stop-after-trans and
+ * samsung,reset-before-trans on this bus; the touch driver reproduces the
+ * former by issuing opcode and data as separate transfers.
+ */
+&pinctrl_peric0 {
+	hsi2c10_bus: hsi2c10-bus-pins {
+		samsung,pins = "gpp1-4", "gpp1-5";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <0>;
+		samsung,pin-drv = <0>;
+	};
+};
+
+/* 4.9 attn-irq "on_state": gpa1-0 EINT, no pull, drive 0. */
+&pinctrl_alive {
+	touch_irq: touch-irq-pins {
+		samsung,pins = "gpa1-0";
+		samsung,pin-function = <0xf>;
+		samsung,pin-pud = <0>;
+		samsung,pin-drv = <0>;
+	};
+};
+
+&soc {
+	usi_peric0_03_sysreg: syscon@1041101c {
+		compatible = "samsung,exynos9810-peric0-usi-sysreg", "syscon";
+		reg = <0x1041101c 0x4>;
+	};
+
+	usi_touch: usi@104b00c0 {
+		compatible = "samsung,exynos9810-usi";
+		/* Wrapper owns +0xc4/+0xc8; the HSI2C below owns [0, 0xc0). */
+		reg = <0x104b00c0 0x20>;
+		clocks = <&legacy_cmu GATE_USI03>, <&legacy_cmu USI03>;
+		clock-names = "pclk", "ipclk";
+		samsung,sysreg = <&usi_peric0_03_sysreg 0>;
+		samsung,mode = <USI_V2_I2C>;
+		samsung,clkreq-on;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		status = "disabled";
+
+		hsi2c_touch: i2c@104b0000 {
+			compatible = "samsung,exynos9810-hsi2c";
+			reg = <0x104b0000 0xc0>;
+			interrupts = <GIC_SPI 404 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			clocks = <&legacy_cmu USI03>, <&legacy_cmu GATE_USI03>;
+			clock-names = "hsi2c", "hsi2c_pclk";
+			clock-frequency = <400000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&hsi2c10_bus>;
+			status = "disabled";
+
+			/*
+			 * 4.9 touchscreen@48 "sec,sec_ts": sec,irq_gpio gpa1-0,
+			 * sec,irq_type 0x2008 (level low, oneshot), supplies
+			 * S2MPS18 LDO35 "tsp_io" 1.8 V and LDO43 "tsp_avdd"
+			 * 3.0 V (both regulator-boot-on). No supplies here:
+			 * there is no regulator driver, the bootloader must
+			 * leave the IC powered. Never flashes firmware.
+			 */
+			touchscreen: touchscreen@48 {
+				compatible = "samsung,sec-ts-y771";
+				reg = <0x48>;
+				interrupt-parent = <&gpa1>;
+				interrupts = <0 IRQ_TYPE_LEVEL_LOW>;
+				irq-gpios = <&gpa1 0 GPIO_ACTIVE_LOW>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&touch_irq>;
+				touchscreen-size-x = <1440>;
+				touchscreen-size-y = <2960>;
+				status = "disabled";
+			};
+		};
 	};
 };
