@@ -450,10 +450,17 @@ static const char *mct_bc_setup(struct platform_device *pdev)
 	 * clk_disable_unused() away. Probe runs before that, with the
 	 * bootloader's clock state.
 	 */
-	clk = devm_clk_get_optional_enabled(dev, "mct");
+	/*
+	 * Enable once and never disable: a devm-managed enable would turn the
+	 * gate off again if the device were ever unbound, and releasing a
+	 * PERIS vclk can switch the PERIS user mux (GIC/MCT bus) to OSCCLK.
+	 */
+	clk = clk_get_optional(dev, "mct");
 	if (IS_ERR(clk))
-		pr_warn("mct clock not enabled (%ld), relying on HWACG\n",
+		pr_warn("mct clock lookup failed (%ld), relying on HWACG\n",
 			PTR_ERR(clk));
+	else if (clk && clk_prepare_enable(clk))
+		pr_warn("mct clock enable failed, relying on HWACG\n");
 
 	mct_rate = arch_timer_get_rate();
 	if (!mct_rate)
