@@ -1202,6 +1202,22 @@ config TOUCHSCREEN_SIS_I2C
 	  To compile this driver as a module, choose M here: the
 	  module will be called sis_i2c.
 
+config TOUCHSCREEN_SEC_TS_Y771
+	tristate "Samsung sec_ts Y771 touchscreen (Galaxy Note9, stage 1)"
+	depends on I2C && OF && GPIOLIB
+	help
+	  Say Y here to support the Samsung sec_ts "Y771" touchscreen
+	  controller of the Galaxy Note9 (crownlte), as an evdev multitouch
+	  device named "sec_touchscreen".
+
+	  Stage 1: the driver contains no firmware update, calibration or
+	  NVM code and no power control; it only works if the bootloader
+	  left the controller powered. The only commands written to the
+	  controller are SENSE_ON and SET_TOUCHFUNCTION.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called sec_ts_y771.
+
 config TOUCHSCREEN_ST1232
 	tristate "Sitronix ST1232 or ST1633 touchscreen controllers"
 	depends on I2C
