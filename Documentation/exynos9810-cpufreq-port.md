@@ -1,58 +1,78 @@
-# Exynos9810 CPUFreq source adapter
+# Exynos9810 CPUFreq (drivers/cpufreq/exynos9810-acpm-cpufreq.c)
 
-This adapter uses the existing firmware and the imported original CAL/ASV
-tables. It has no enabled device-tree node. Compilation and policy tests are
-source milestones, not permission to enable scaling on the phone.
+The driver ports the frequency-scaling core of Samsung's 4.9 exynos-acme
+(crownlte 4.9 kernel, drivers/cpufreq/exynos-acme.c) onto the existing ACPM
+firmware and the imported CAL/ECT/FVMap code.
 
-The platform compatible is `samsung,exynos9810-acpm-cpufreq`. Its root requires
-`samsung,mif-devfreq`, a phandle to a real registered MIF devfreq supplier.
-That supplier must use standard Hz frequency values, expose actual hardware
-frequency through `get_cur_freq`, and enforce its own INT/other dependencies.
-The CPU adapter applies standard `DEV_PM_QOS_MIN_FREQUENCY` requests in kHz.
-It retains a supplier device reference and a managed device link.
+## Source of every number
 
-There must be two enabled child nodes, little then big. Each contains four
-`cpus` phandles, checked against original physical affinities0..3 and100..103.
-`samsung,cal-id` is0x0b040002 or0x0b040003 respectively. Each child requires
-`min-freq`, `max-freq`, `samsung,mif-perf-table` CPU/MIF pairs in descending
-order and `samsung,mif-ect-domain` naming its original MINLOCK domain.
-Optional `policy-max` sets the initial user policy cap, permitting subsequent
-`scaling_max_freq` changes. Frequencies in these properties are kHz.
+| Item | 4.9 acme | Here |
+|------|----------|------|
+| Levels | `cal_dfs_get_lv_num()` + `cal_dfs_get_rate_table()` | Same, through `cal_dfs_get_rate_asv_table()` |
+| Voltages | `cal_dfs_get_asv_table()` (OPP only) | Same (OPP only). Firmware picks the real voltage |
+| Range | CAL min/max, DT `min-freq` raises min, DT `max-freq` replaces max | DT `max-freq` can only lower the max, because 6.12 `cal_dfs_set_rate()` refuses rates above the CAL max |
+| Initial user cap | DT `policy-max` | Same, applied to `policy->max_freq_req` in `.ready` |
+| Hard cap | none | `samsung,max-freq-cap`, so the table stops there |
+| Transition | `cal_dfs_set_rate()` FREQ_REQ | Same |
+| `get()` | `cal_dfs_get_rate()` CMU readback; last rate when CAL says 0 | Same |
+| Latency | 100 us | 500 us, from the measured 0.39-0.42 ms ACPM round trip |
 
-The original crownlte DT performance pairs are recorded in the policy report.
-The actual phone has11 little-cluster levels from455000 to1950000kHz, and15
-big-cluster levels from650000 to2314000kHz. Its big user-policy default is
-1794000kHz. The live ECT MINLOCK block contains CPUCL1 but no CPUCL0 domain.
-The original ACME driver skips that absent little-cluster skew constraint;
-the adapter preserves the DT little performance floor and requires the real
-big ECT table. All enabled big levels have exact ECT rows. The helper chooses
-a conservative nearest-higher skew row for other hypothetical rates.
+crownlte DT values (4.9 `cpufreq/domain@0`, `domain@1`) are in
+`exynos9810-crownlte-delayed-ufs-diag.dts`:
 
-Probe requires actual CAL/FVMAP and firmware channel5 readiness. OPP voltage
-values come from the real ASV/FVMAP table, with no fixed voltage fallback.
-The frequency transition goes through firmware's existing paired DVFS command.
-Before a CPU transition raises its MIF requirement, the adapter raises its
-real request, updates the real supplier and checks actual MIF frequency.
-It lowers CPU frequency before releasing a MIF floor. A failed release keeps
-the conservative old requirement and does not report a completed CPU change
-as failed. Requests from the other cluster and GPU aggregate through the
-normal device QoS framework.
+| Cluster | min-freq | max-freq | Other |
+|---------|----------|----------|-------|
+| LITTLE (`0x0b040002`) | 455000 | 1950000 | |
+| big (`0x0b040003`) | 650000 | 2314000 | `policy-max` 1794000 |
 
-A firmware error after a raised MIF requirement retains the higher floor.
-A failed acknowledgement cannot prove that the CPU stayed at its old rate.
-Probe rejects pre-existing CPU OPP tables, and cleanup removes only the
-frequency entries successfully added by this provider. Probe also checks
-actual sharing membership because the OPP helper can silently skip failed
-member allocations. Platform integration must keep it the sole CPU OPP creator.
+The diag DT also sets `samsung,max-freq-cap = <1794000>` on big until thermal
+throttling has been proven on hardware.
 
-CPUFreq registers standard cooling devices and the original100000ns latency.
-Actual TMU sensors, calibrated thermal trips/cooling maps, MIF/INT devfreq,
-legacy UFC/sysfs behavior, scheduler energy models, hotplug and suspend
-integration remain incomplete. No driver readiness or cooling device alone
-establishes working thermal protection. Keep this platform absent or disabled
-until those prerequisites have been implemented and validated.
+## MIF
 
-Validation so far: real ARM64 object compilation with LLVM18 and WERROR;
-131123 production-helper, transition-order and partial-cleanup cases under ASAN/UBSAN, using
-the actual DT performance pairs and live ECT skew values. Firmware, sensors,
-concurrent supplier teardown and policy/hotplug behavior need runtime tests.
+4.9 tied CPU levels to MIF floors through the DVFS Manager:
+
+- `mif-perf` is a DT performance table.
+- `mif-skew` is ECT MINLOCK `dvfs_cpucl0`/`dvfs_cpucl1`, marked as chipset
+  guidance.
+
+With `samsung,mif-devfreq`, both floors are enforced through device PM QoS
+(the earlier adapter's behaviour). Without it, nothing scales MIF:
+
+- At probe the driver reads the MIF rate once from `samsung,mif-cal-id`
+  (`dvfs_mif`, 0x0b040000).
+- It drops every level whose ECT skew requirement is above that rate. An
+  unreadable MIF (0) satisfies no non-zero requirement.
+- A cluster without an ECT MINLOCK domain gets no skew constraint, as in acme.
+- The perf table is ignored in this mode.
+
+## Thermal
+
+The cpufreq core registers each policy CPU node with `#cooling-cells` as a
+cooling device. The BIG zone maps its passive `big-control-temp` (83 C) trip
+to cpu4-7 with no limits. 4.9 used power_allocator there, which needs an
+energy model, so this uses the default step_wise. 4.9 LITTLE maps were all
+`<0 0>` (never throttle) and are not carried over.
+
+## Not ported
+
+- DVFS Manager
+- UFC and legacy sysfs
+- PM QoS classes
+- Boot QoS: `pm_qos-booting`, 40 s at max
+- Hotplug notifiers
+- EMS/energy table
+- exynos-ocp (`max-freq-wo-ocp` 1794000)
+
+## Diagnostic
+
+`samsung,cpufreq-selftest` on the cpufreq node schedules one run at about
+100 s uptime. Every line starts with `cpufreq selftest:`. The run:
+
+1. Reports the probe outcome (also for failed or deferred probes).
+2. Reports the MIF and BIG thermal readings.
+3. Lists each policy, the CAL table and the final table.
+4. Pins each policy through `freq_qos` min=max at the minimum, middle and
+   top levels, then at the 4.9 `max-freq` (must clamp to the top). It
+   checks `policy->cur` and the CMU readback for each one.
+5. Removes the requests.

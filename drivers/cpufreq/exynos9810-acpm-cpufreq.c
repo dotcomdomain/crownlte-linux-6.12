@@ -1,18 +1,45 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Exynos9810 CAL/ACPM CPUFreq adapter for the unchanged crownlte firmware.
- * The original Samsung ACME driver supplies the table and MIF constraint
- * semantics. Firmware owns the paired CPU voltage/frequency transition.
+/*
+ * Exynos9810 CAL/ACPM CPUFreq for the unchanged crownlte firmware.
+ *
+ * This is the frequency-scaling core of Samsung's 4.9 exynos-acme driver
+ * (drivers/cpufreq/exynos-acme.c, crownlte 4.9 kernel):
+ *  - levels come from cal_dfs_get_rate_table() (ECT DVFS block) and
+ *    voltages from cal_dfs_get_asv_table() (FVMap), as in acme init_table();
+ *  - the usable range is the CAL min/max narrowed by DT min-freq/max-freq,
+ *    as in acme init_domain();
+ *  - policy-max is the initial user policy cap, as in acme set_policy();
+ *  - a transition is one FREQ_REQ through cal_dfs_set_rate(), and firmware
+ *    selects the voltage. get() reads the CMU back through cal_dfs_get_rate()
+ *    and returns the last good rate while CAL reports 0 (mid-transition), as
+ *    in acme get_freq().
+ *
+ * Samsung's DVFS Manager is not ported. When a samsung,mif-devfreq supplier
+ * is present, the CPU->MIF minimum constraints are enforced through device
+ * PM QoS. Without one, MIF stays at its current rate. In that case every
+ * level whose ECT MINLOCK MIF requirement (acme "mif-skew", a chipset
+ * guidance constraint) the current MIF rate does not meet is dropped from the
+ * table, including when the MIF rate cannot be read.
+ *
+ * samsung,max-freq-cap is an additional hard ceiling. It is not in 4.9; it
+ * keeps big at 4.9's policy-max until thermal throttling has been verified.
  */
 #include <linux/cpu.h>
 #include <linux/cpufreq.h>
+#include <linux/cpumask.h>
+#include <linux/delay.h>
 #include <linux/devfreq.h>
 #include <linux/device.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
+#include <linux/thermal.h>
+#include <linux/workqueue.h>
 #include <soc/samsung/cal-if.h>
 #include <soc/samsung/ect_parser.h>
 
@@ -20,28 +47,68 @@
 #define EXYNOS9810_LEVELS 48
 #define EXYNOS9810_CPUCL0 0x0b040002
 #define EXYNOS9810_CPUCL1 0x0b040003
+/*
+ * acme declares 100 us (TRANSITION_LATENCY). On crownlte one FREQ_REQ plus
+ * CMU readback over ACPM channel 0 measured 0.39-0.42 ms (acpm-dvfs selftest
+ * timestamps). Declaring 500 us makes schedutil rate-limit to 750 us.
+ */
+#define EXYNOS9810_TRANSITION_NS 500000
+#define EXYNOS9810_SELFTEST_UPTIME_MS 100000
+#define EXYNOS9810_SELFTEST_SETTLE_US 200000
 
 struct exynos9810_domain {
 	struct device *cpu_dev;
 	cpumask_t cpus;
+	unsigned int id;
 	u32 cal_id;
 	struct cpufreq_frequency_table *table;
-	u32 *mif_khz;
+	u32 *mif_khz;		/* MIF floor per table entry (supplier mode) */
+	u32 *skew_khz;		/* ECT MINLOCK MIF requirement per table entry */
+	u32 *perf_khz;		/* DT mif-perf-table floor per table entry */
 	unsigned int levels;
 	unsigned int opps_added;
+	/* Diagnostics: CAL inputs and what was derived from them. */
+	unsigned long cal_rate[EXYNOS9810_LEVELS];
+	unsigned int cal_volt[EXYNOS9810_LEVELS];
+	unsigned int cal_levels;
+	u32 cal_min, cal_max, dt_min, dt_max, cap;
+	unsigned int mif_dropped;
+	bool ect_skew;
 	u32 policy_max;
 	u32 resume_khz;
+	unsigned int last_khz;	/* last CMU readback or acknowledged FREQ_REQ */
 	struct dev_pm_qos_request mif_request;
 	u32 mif_floor;
 };
 
 struct exynos9810_cpufreq {
 	struct device *dev;
-	struct devfreq *mif;
+	struct devfreq *mif;	/* NULL: MIF is not scaled by anyone */
+	u32 mif_cal_id;
+	unsigned long mif_static_khz;
 	struct exynos9810_domain domains[EXYNOS9810_DOMAINS];
 };
 
 static struct exynos9810_cpufreq *provider;
+
+/* Late-log diagnostics: early boot records are lost on the diag setup. */
+static DEFINE_MUTEX(exynos9810_status_lock);
+static int exynos9810_probe_ret = 1;	/* 1: probe never ran */
+static char exynos9810_probe_stage[96] = "none";
+static struct delayed_work exynos9810_selftest_work;
+static bool exynos9810_selftest_armed;
+
+static __printf(2, 3) void exynos9810_note(int ret, const char *fmt, ...)
+{
+	va_list args;
+
+	mutex_lock(&exynos9810_status_lock);
+	exynos9810_probe_ret = ret;
+	va_start(args, fmt);
+	vscnprintf(exynos9810_probe_stage, sizeof(exynos9810_probe_stage), fmt, args);
+	va_end(args);
+	mutex_unlock(&exynos9810_status_lock);
+}
 
 /* Match Samsung ACME's descending nearest-higher performance row. */
 static int exynos9810_perf_floor(const u32 *pairs, unsigned int count,
@@ -69,7 +136,11 @@ static int exynos9810_perf_floor(const u32 *pairs, unsigned int count,
 	return matched ? 0 : -ERANGE;
 }
 
-/* ECT levels are descending. Preserve ACME's previous matched skew floor. */
+/*
+ * ECT levels are descending. An exact row is used as is; a rate without one
+ * takes the row of the nearest higher CPU rate (acme takes the top row above
+ * the first match and 0 below it, so this is never lower than acme).
+ */
 static int exynos9810_skew_floor(struct ect_minlock_domain *ect,
 			       u32 rate, u32 *floor)
 {
@@ -135,29 +206,38 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 {
 	struct exynos9810_domain *domain = policy->driver_data;
 	u32 old_floor = domain->mif_floor;
-	u32 new_floor;
+	u32 new_floor = 0;
+	unsigned int freq;
 	int ret;
 
-	if (index >= domain->levels || !cal_dfs_is_ready(domain->cal_id))
-		return -ENODEV;
-	new_floor = domain->mif_khz[index];
-	/* Raise dependent MIF first, then ask firmware to raise the CPU. */
-	if (new_floor > old_floor) {
-		ret = exynos9810_set_mif_floor(domain, new_floor);
-		if (ret)
-			return ret;
+	if (index >= domain->levels)
+		return -EINVAL;
+	freq = domain->table[index].frequency;
+	if (provider->mif) {
+		new_floor = domain->mif_khz[index];
+		/* Raise dependent MIF first, then ask firmware to raise the CPU. */
+		if (new_floor > old_floor) {
+			ret = exynos9810_set_mif_floor(domain, new_floor);
+			if (ret)
+				return ret;
+		}
 	}
-	ret = cal_dfs_set_rate(domain->cal_id, domain->table[index].frequency);
+	ret = cal_dfs_set_rate(domain->cal_id, freq);
 	if (ret) {
-		/* A failed firmware acknowledgement does not prove that the CPU
-		 * stayed at its previous rate. Keep the raised dependency floor.
+		/*
+		 * A failed firmware acknowledgement does not prove that the CPU
+		 * stayed at its previous rate. Keep any raised MIF floor.
 		 */
-		return ret;
+		pr_err_ratelimited("exynos9810-cpufreq: domain%u FREQ_REQ %u kHz failed: %d\n",
+				   domain->id, freq, ret);
+		return ret > 0 ? -EIO : ret;
 	}
-	/* The CPU transition has succeeded. Retain a conservative old floor if
-	 * releasing its MIF requirement fails; do not misreport CPU ownership.
+	WRITE_ONCE(domain->last_khz, freq);
+	/*
+	 * The CPU transition has succeeded. Retain a conservative old floor if
+	 * releasing its MIF requirement fails; do not misreport the CPU change.
 	 */
-	if (new_floor < old_floor) {
+	if (provider->mif && new_floor < old_floor) {
 		ret = exynos9810_set_mif_floor(domain, new_floor);
 		if (ret) {
 			exynos9810_set_mif_floor(domain, old_floor);
@@ -167,38 +247,81 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 	return 0;
 }
 
+static unsigned int exynos9810_domain_get(struct exynos9810_domain *domain)
+{
+	unsigned long rate = cal_dfs_get_rate(domain->cal_id);
+
+	/* acme get_freq(): CAL returns 0 while the CMU is changing state. */
+	if (!rate || rate > UINT_MAX)
+		return READ_ONCE(domain->last_khz);
+	WRITE_ONCE(domain->last_khz, (unsigned int)rate);
+	return rate;
+}
+
 static unsigned int exynos9810_get(unsigned int cpu)
 {
 	struct exynos9810_domain *domain = exynos9810_find_domain(cpu);
 
-	if (!domain || !cal_dfs_is_ready(domain->cal_id))
-		return 0;
-	return cal_dfs_get_rate(domain->cal_id);
+	return domain ? exynos9810_domain_get(domain) : 0;
 }
 
 static int exynos9810_policy_init(struct cpufreq_policy *policy)
 {
 	struct exynos9810_domain *domain = exynos9810_find_domain(policy->cpu);
-	unsigned int rate, i;
+	unsigned int rate, target, i;
+	bool listed = false;
+	u32 floor = 0;
 	int ret;
 
-	if (!domain)
+	if (!domain || !domain->levels)
 		return -ENODEV;
-	rate = exynos9810_get(policy->cpu);
-	for (i = 0; i < domain->levels; i++)
+	rate = exynos9810_domain_get(domain);
+	if (!rate)
+		return -EIO;
+	/* Table is descending: first entry <= rate, else the lowest entry. */
+	target = domain->table[domain->levels - 1].frequency;
+	for (i = 0; i < domain->levels; i++) {
 		if (domain->table[i].frequency == rate)
+			listed = true;
+		if (domain->table[i].frequency <= rate) {
+			target = domain->table[i].frequency;
 			break;
-	if (i == domain->levels)
-		return -ERANGE;
-	ret = exynos9810_set_mif_floor(domain, domain->mif_khz[i]);
-	if (ret)
-		return ret;
+		}
+	}
+	if (provider->mif) {
+		/* Floor for the current rate; the highest one if it is not listed. */
+		for (i = 0; i < domain->levels; i++) {
+			if (domain->table[i].frequency == rate) {
+				floor = domain->mif_khz[i];
+				break;
+			}
+			floor = max(floor, domain->mif_khz[i]);
+		}
+		ret = exynos9810_set_mif_floor(domain, floor);
+		if (ret)
+			return ret;
+	}
+	/*
+	 * Move an unlisted boot rate (e.g. above samsung,max-freq-cap) onto the
+	 * table here. CPUFREQ_NEED_INITIAL_FREQ_CHECK would do it in the core,
+	 * which BUG()s if that transition fails.
+	 */
+	if (!listed) {
+		ret = cal_dfs_set_rate(domain->cal_id, target);
+		if (ret) {
+			pr_err("exynos9810-cpufreq: domain%u boot rate %u kHz is not in the table and FREQ_REQ %u kHz failed: %d\n",
+			       domain->id, rate, target, ret);
+			return ret > 0 ? -EIO : ret;
+		}
+		WRITE_ONCE(domain->last_khz, target);
+		rate = target;
+	}
 	cpumask_copy(policy->cpus, &domain->cpus);
 	policy->driver_data = domain;
 	policy->freq_table = domain->table;
 	policy->cur = rate;
 	policy->suspend_freq = domain->resume_khz;
-	policy->cpuinfo.transition_latency = 100000;
+	policy->cpuinfo.transition_latency = EXYNOS9810_TRANSITION_NS;
 	policy->dvfs_possible_from_any_cpu = true;
 	return 0;
 }
@@ -208,8 +331,9 @@ static void exynos9810_policy_ready(struct cpufreq_policy *policy)
 	struct exynos9810_domain *domain = policy->driver_data;
 	int ret;
 
-	/* Preserve ACME's initial policy-max through the user policy request.
-	 * A later scaling_max_freq write can replace this initial setting.
+	/*
+	 * acme set_policy(): policy-max is the initial user policy maximum.
+	 * A later scaling_max_freq write can replace it, up to the table max.
 	 */
 	if (!domain->policy_max || !policy->max_freq_req)
 		return;
@@ -225,7 +349,7 @@ static struct freq_attr *exynos9810_attrs[] = {
 
 static struct cpufreq_driver exynos9810_driver = {
 	.name = "exynos9810-acpm",
-	.flags = CPUFREQ_NEED_INITIAL_FREQ_CHECK | CPUFREQ_IS_COOLING_DEV,
+	.flags = CPUFREQ_IS_COOLING_DEV,
 	.verify = cpufreq_generic_frequency_table_verify,
 	.target_index = exynos9810_target_index,
 	.get = exynos9810_get,
@@ -249,29 +373,14 @@ static void exynos9810_domain_cleanup(void *data)
 	}
 }
 
-static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
-		struct device_node *node, struct exynos9810_domain *domain,
-		unsigned int id)
+static int exynos9810_domain_cpus(struct device_node *node,
+				  struct exynos9810_domain *domain, unsigned int id)
 {
-	struct device *dev = state->dev;
-	struct dvfs_rate_volt rates[EXYNOS9810_LEVELS];
-	struct ect_minlock_domain *ect;
 	struct device_node *cpu_node;
 	struct opp_table *existing;
-	const char *ect_name;
-	u32 min_khz, max_khz, perf, skew;
-	u32 *pairs;
-	unsigned int i, j;
 	u64 affinity;
-	cpumask_t shared;
-	int cells, count, cpu, ret;
-	void *block;
+	int count, cpu, i;
 
-	if (of_property_read_u32(node, "samsung,cal-id", &domain->cal_id) ||
-	    domain->cal_id != (id ? EXYNOS9810_CPUCL1 : EXYNOS9810_CPUCL0))
-		return -EINVAL;
-	if (!cal_dfs_is_ready(domain->cal_id))
-		return -EPROBE_DEFER;
 	count = of_count_phandle_with_args(node, "cpus", NULL);
 	if (count != 4)
 		return -EINVAL;
@@ -287,7 +396,8 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 			return -EINVAL;
 		cpumask_set_cpu(cpu, &domain->cpus);
 	}
-	/* Dynamic OPP addition accepts identical duplicates as success. Reject
+	/*
+	 * Dynamic OPP addition accepts identical duplicates as success. Reject
 	 * pre-existing tables so cleanup cannot take ownership of another table.
 	 * This platform is the sole OPP creator for these CPU devices.
 	 */
@@ -305,45 +415,96 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 			return PTR_ERR(existing);
 	}
 	domain->cpu_dev = get_cpu_device(cpumask_first(&domain->cpus));
-	if (!domain->cpu_dev)
-		return -EPROBE_DEFER;
-	min_khz = cal_dfs_get_min_freq(domain->cal_id);
-	max_khz = cal_dfs_get_max_freq(domain->cal_id);
-	if (of_property_read_u32(node, "min-freq", &perf) ||
-	    of_property_read_u32(node, "max-freq", &skew))
+	return domain->cpu_dev ? 0 : -EPROBE_DEFER;
+}
+
+static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
+		struct device_node *node, struct exynos9810_domain *domain,
+		unsigned int id)
+{
+	struct device *dev = state->dev;
+	struct dvfs_rate_volt rates[EXYNOS9810_LEVELS];
+	struct ect_minlock_domain *ect = NULL;
+	const char *ect_name = NULL;
+	u32 min_khz, max_khz, perf, skew;
+	u32 *pairs = NULL;
+	unsigned int i, j;
+	cpumask_t shared;
+	int cells = 0, count, ret;
+	void *block;
+
+	domain->id = id;
+	ret = exynos9810_domain_cpus(node, domain, id);
+	if (ret)
+		return ret;
+
+	/* acme init_domain(): CAL range narrowed by DT min-freq/max-freq. */
+	domain->cal_min = cal_dfs_get_min_freq(domain->cal_id);
+	domain->cal_max = cal_dfs_get_max_freq(domain->cal_id);
+	if (of_property_read_u32(node, "min-freq", &domain->dt_min) ||
+	    of_property_read_u32(node, "max-freq", &domain->dt_max))
 		return -EINVAL;
-	min_khz = max(min_khz, perf);
-	max_khz = min(max_khz, skew);
+	min_khz = max(domain->cal_min, domain->dt_min);
+	/*
+	 * acme lets DT max-freq replace the CAL max outright. cal_dfs_set_rate()
+	 * here refuses rates above the CAL max, so take the smaller one.
+	 */
+	max_khz = min(domain->cal_max, domain->dt_max);
+	if (!of_property_read_u32(node, "samsung,max-freq-cap", &domain->cap))
+		max_khz = min(max_khz, domain->cap);
 	if (!min_khz || min_khz > max_khz)
 		return -EINVAL;
-	if (!of_property_read_u32(node, "policy-max", &domain->policy_max) &&
-	    (domain->policy_max < min_khz || domain->policy_max > max_khz))
-		return -EINVAL;
+	if (!of_property_read_u32(node, "policy-max", &domain->policy_max)) {
+		if (domain->policy_max < min_khz)
+			return -EINVAL;
+		if (domain->policy_max >= max_khz)
+			domain->policy_max = 0;	/* the table already stops there */
+	}
+
+	/* acme init_table(): cal_dfs_get_rate_table() + cal_dfs_get_asv_table(). */
+	if (cal_dfs_get_lv_num(domain->cal_id) > EXYNOS9810_LEVELS)
+		return -E2BIG;
 	count = cal_dfs_get_rate_asv_table(domain->cal_id, rates);
 	if (count <= 0 || count > EXYNOS9810_LEVELS)
 		return -ENODEV;
-	cells = of_property_count_u32_elems(node, "samsung,mif-perf-table");
-	if (cells <= 0 || cells % 2 || cells > EXYNOS9810_LEVELS * 2)
+	domain->cal_levels = count;
+	for (i = 0; i < count; i++) {
+		domain->cal_rate[i] = rates[i].rate;
+		domain->cal_volt[i] = rates[i].volt;
+	}
+
+	/* Optional 4.9 mif-perf table; required to drive a MIF supplier. */
+	if (of_property_present(node, "samsung,mif-perf-table")) {
+		cells = of_property_count_u32_elems(node, "samsung,mif-perf-table");
+		if (cells <= 0 || cells % 2 || cells > EXYNOS9810_LEVELS * 2)
+			return -EINVAL;
+		pairs = devm_kcalloc(dev, cells, sizeof(*pairs), GFP_KERNEL);
+		if (!pairs)
+			return -ENOMEM;
+		ret = of_property_read_u32_array(node, "samsung,mif-perf-table", pairs, cells);
+		if (ret)
+			return ret;
+	} else if (state->mif) {
 		return -EINVAL;
-	pairs = devm_kcalloc(dev, cells, sizeof(*pairs), GFP_KERNEL);
-	if (!pairs)
-		return -ENOMEM;
-	ret = of_property_read_u32_array(node, "samsung,mif-perf-table", pairs, cells);
-	if (ret)
-		return ret;
-	if (of_property_read_string(node, "samsung,mif-ect-domain", &ect_name))
-		return -EINVAL;
-	block = ect_get_block(BLOCK_MINLOCK);
-	ect = block ? ect_minlock_get_domain(block, (char *)ect_name) : NULL;
-	/* This phone's live ECT contains no CPUCL0 MINLOCK domain. ACME skips
-	 * that absent optional constraint, keeping the DT performance table.
-	 * CPUCL1's real skew table is mandatory in this adapter.
+	}
+	if (!of_property_read_string(node, "samsung,mif-ect-domain", &ect_name)) {
+		block = ect_get_block(BLOCK_MINLOCK);
+		ect = block ? ect_minlock_get_domain(block, (char *)ect_name) : NULL;
+	}
+	domain->ect_skew = !!ect;
+	/*
+	 * acme skips an absent ECT MINLOCK domain (crownlte reportedly has no
+	 * CPUCL0 one). The supplier path keeps the stricter rule that big must
+	 * have its real skew table.
 	 */
-	if (!block || (!ect && id))
+	if (state->mif && !ect && id)
 		return -ENODEV;
+
 	domain->table = devm_kcalloc(dev, count + 1, sizeof(*domain->table), GFP_KERNEL);
 	domain->mif_khz = devm_kcalloc(dev, count, sizeof(*domain->mif_khz), GFP_KERNEL);
-	if (!domain->table || !domain->mif_khz)
+	domain->skew_khz = devm_kcalloc(dev, count, sizeof(*domain->skew_khz), GFP_KERNEL);
+	domain->perf_khz = devm_kcalloc(dev, count, sizeof(*domain->perf_khz), GFP_KERNEL);
+	if (!domain->table || !domain->mif_khz || !domain->skew_khz || !domain->perf_khz)
 		return -ENOMEM;
 	ret = devm_add_action_or_reset(dev, exynos9810_domain_cleanup, domain);
 	if (ret)
@@ -354,17 +515,30 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 			return -EINVAL;
 		if (rates[i].rate < min_khz || rates[i].rate > max_khz)
 			continue;
-		ret = exynos9810_perf_floor(pairs, cells / 2, rates[i].rate, &perf);
-		if (ret)
-			return ret;
+		perf = 0;
+		if (pairs) {
+			ret = exynos9810_perf_floor(pairs, cells / 2, rates[i].rate, &perf);
+			if (ret)
+				return ret;
+		}
 		skew = 0;
 		if (ect) {
 			ret = exynos9810_skew_floor(ect, rates[i].rate, &skew);
 			if (ret)
 				return ret;
 		}
+		/*
+		 * Nobody scales MIF: keep only levels the current MIF rate is
+		 * known to satisfy. An unreadable MIF rate satisfies none.
+		 */
+		if (!state->mif && skew > state->mif_static_khz) {
+			domain->mif_dropped++;
+			continue;
+		}
 		domain->table[j].frequency = rates[i].rate;
 		domain->table[j].driver_data = j;
+		domain->perf_khz[j] = perf;
+		domain->skew_khz[j] = skew;
 		domain->mif_khz[j] = max(perf, skew);
 		ret = dev_pm_opp_add(domain->cpu_dev, rates[i].rate * 1000, rates[i].volt);
 		if (ret)
@@ -372,19 +546,22 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 		domain->opps_added = ++j;
 	}
 	if (!j)
-		return -EINVAL;
+		return -ERANGE;
 	domain->levels = j;
 	domain->table[j].frequency = CPUFREQ_TABLE_END;
-	domain->resume_khz = cal_dfs_get_resume_freq(domain->cal_id);
-	for (i = 0; i < j; i++)
-		if (domain->table[i].frequency == domain->resume_khz)
-			break;
-	if (i == j)
-		return -EINVAL;
+	/* Suspend at the CAL resume rate, or the highest table rate below it. */
+	domain->resume_khz = 0;
+	for (i = 0; i < j; i++) {
+		u32 f = domain->table[i].frequency;
+
+		if (f <= cal_dfs_get_resume_freq(domain->cal_id) && f > domain->resume_khz)
+			domain->resume_khz = f;
+	}
 	ret = dev_pm_opp_set_sharing_cpus(domain->cpu_dev, &domain->cpus);
 	if (ret)
 		return ret;
-	/* The OPP helper can skip failed member allocations without an error.
+	/*
+	 * The OPP helper can skip failed member allocations without an error.
 	 * All four CPUs must actually share the calibrated table.
 	 */
 	ret = dev_pm_opp_get_sharing_cpus(domain->cpu_dev, &shared);
@@ -392,6 +569,9 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 		return ret;
 	if (!cpumask_equal(&shared, &domain->cpus))
 		return -ENOMEM;
+	domain->last_khz = cal_dfs_get_rate(domain->cal_id);
+	if (!state->mif)
+		return 0;
 	return dev_pm_qos_add_request(state->mif->dev.parent, &domain->mif_request,
 				     DEV_PM_QOS_MIN_FREQUENCY, 0);
 }
@@ -401,57 +581,312 @@ static void exynos9810_put_mif(void *data)
 	put_device(data);
 }
 
+static int exynos9810_get_mif_supplier(struct exynos9810_cpufreq *state)
+{
+	struct device *dev = state->dev;
+	int ret;
+
+	state->mif = devfreq_get_devfreq_by_phandle(dev, "samsung,mif-devfreq", 0);
+	if (IS_ERR(state->mif)) {
+		ret = PTR_ERR(state->mif);
+		state->mif = NULL;
+		return ret;
+	}
+	if (!state->mif->profile->get_cur_freq) {
+		state->mif = NULL;
+		return -ENODEV;
+	}
+	get_device(&state->mif->dev);
+	ret = devm_add_action_or_reset(dev, exynos9810_put_mif, &state->mif->dev);
+	if (ret) {
+		state->mif = NULL;
+		return ret;
+	}
+	if (!device_link_add(dev, state->mif->dev.parent, DL_FLAG_AUTOREMOVE_CONSUMER))
+		return -ENOMEM;
+	return 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* DT-gated diagnostic (samsung,cpufreq-selftest). Every line is prefixed. */
+
+static void exynos9810_selftest_levels(struct exynos9810_domain *d)
+{
+	char buf[256];
+	unsigned int i, len;
+
+	for (i = 0; i < d->cal_levels; i += 6) {
+		unsigned int k;
+
+		len = 0;
+		for (k = i; k < d->cal_levels && k < i + 6; k++)
+			len += scnprintf(buf + len, sizeof(buf) - len, " %lu@%u",
+					 d->cal_rate[k], d->cal_volt[k]);
+		pr_info("cpufreq selftest: domain%u cal kHz@fvmap-volt [%u..]%s\n",
+			d->id, i, buf);
+	}
+	for (i = 0; i < d->levels; i += 6) {
+		unsigned int k;
+
+		len = 0;
+		for (k = i; k < d->levels && k < i + 6; k++)
+			len += scnprintf(buf + len, sizeof(buf) - len, " %u(skew%u,perf%u)",
+					 d->table[k].frequency, d->skew_khz[k], d->perf_khz[k]);
+		pr_info("cpufreq selftest: domain%u table[%u..]%s\n", d->id, i, buf);
+	}
+}
+
+static bool exynos9810_selftest_step(struct cpufreq_policy *policy,
+				     struct exynos9810_domain *d,
+				     struct freq_qos_request *min_req,
+				     struct freq_qos_request *max_req,
+				     unsigned int *pinned, unsigned int request,
+				     unsigned int expect)
+{
+	ktime_t start = ktime_get();
+	unsigned long cmu;
+	unsigned int cur;
+	bool ok;
+	int r1, r2;
+
+	/* Move the bound on the far side first so min never exceeds max. */
+	if (request >= *pinned) {
+		r1 = freq_qos_update_request(max_req, request);
+		r2 = freq_qos_update_request(min_req, request);
+	} else {
+		r1 = freq_qos_update_request(min_req, request);
+		r2 = freq_qos_update_request(max_req, request);
+	}
+	*pinned = request;
+	/* QoS changes are applied from the policy update work; poll for it. */
+	for (;;) {
+		cur = READ_ONCE(policy->cur);
+		cmu = cal_dfs_get_rate(d->cal_id);
+		ok = cur == expect && cmu == expect;
+		if (ok || ktime_us_delta(ktime_get(), start) > EXYNOS9810_SELFTEST_SETTLE_US)
+			break;
+		usleep_range(200, 400);
+	}
+	pr_info("cpufreq selftest: policy%u request=%u expect=%u limits=%u-%u cur=%u cmu=%lu qos=%d/%d %lldus %s\n",
+		policy->cpu, request, expect, READ_ONCE(policy->min),
+		READ_ONCE(policy->max), cur, cmu, r1, r2,
+		ktime_us_delta(ktime_get(), start), ok ? "PASS" : "FAIL");
+	return ok;
+}
+
+static void exynos9810_selftest_domain(struct exynos9810_domain *d)
+{
+	struct freq_qos_request min_req = {}, max_req = {};
+	struct cpufreq_policy *policy;
+	unsigned int cpu, top, steps[4], expect[4], nsteps = 0, pass = 0, i;
+	unsigned int pinned, old_min, old_max;
+	ktime_t start;
+	int ret;
+
+	cpu = cpumask_first_and(&d->cpus, cpu_online_mask);
+	policy = cpu < nr_cpu_ids ? cpufreq_cpu_get(cpu) : NULL;
+	if (!policy) {
+		pr_info("cpufreq selftest: domain%u cpus=%*pbl no policy (online=%*pbl)\n",
+			d->id, cpumask_pr_args(&d->cpus), cpumask_pr_args(cpu_online_mask));
+		return;
+	}
+	pr_info("cpufreq selftest: policy%u domain%u cal=%#x cpus=%*pbl related=%*pbl gov=%s cur=%u cmu=%lu limits=%u-%u cpuinfo=%u-%u latency=%uns delay=%uus suspend=%u cdev=%s/%d\n",
+		policy->cpu, d->id, d->cal_id, cpumask_pr_args(policy->cpus),
+		cpumask_pr_args(policy->related_cpus),
+		policy->governor ? policy->governor->name : "none", policy->cur,
+		cal_dfs_get_rate(d->cal_id), policy->min, policy->max,
+		policy->cpuinfo.min_freq, policy->cpuinfo.max_freq,
+		policy->cpuinfo.transition_latency,
+		cpufreq_policy_transition_delay_us(policy), policy->suspend_freq,
+		policy->cdev ? policy->cdev->type : "none",
+		policy->cdev ? policy->cdev->id : -1);
+	pr_info("cpufreq selftest: domain%u cal_min=%u cal_max=%u dt_min=%u dt_max=%u cap=%u policy_max=%u levels=%u/%u mif_dropped=%u ect_skew=%d\n",
+		d->id, d->cal_min, d->cal_max, d->dt_min, d->dt_max, d->cap,
+		d->policy_max, d->levels, d->cal_levels, d->mif_dropped, d->ect_skew);
+	exynos9810_selftest_levels(d);
+
+	/* The table is descending: [0] is the max, [levels - 1] the min. */
+	top = d->table[0].frequency;
+	if (d->policy_max && d->policy_max < top)
+		top = d->policy_max;
+	steps[nsteps] = d->table[d->levels - 1].frequency;
+	expect[nsteps++] = steps[0];
+	steps[nsteps] = d->table[d->levels / 2].frequency;
+	expect[nsteps++] = min(steps[1], top);
+	steps[nsteps] = top;
+	expect[nsteps++] = top;
+	/* Above the cap: must be clamped to the top of the table. */
+	if (d->dt_max > d->table[0].frequency) {
+		steps[nsteps] = d->dt_max;
+		expect[nsteps++] = top;
+	}
+
+	old_min = policy->min;
+	old_max = policy->max;
+	start = ktime_get();
+	pinned = policy->cur;
+	ret = freq_qos_add_request(&policy->constraints, &min_req, FREQ_QOS_MIN,
+				   FREQ_QOS_MIN_DEFAULT_VALUE);
+	if (ret < 0)
+		goto out;
+	ret = freq_qos_add_request(&policy->constraints, &max_req, FREQ_QOS_MAX,
+				   FREQ_QOS_MAX_DEFAULT_VALUE);
+	if (ret < 0) {
+		freq_qos_remove_request(&min_req);
+		goto out;
+	}
+	for (i = 0; i < nsteps; i++)
+		pass += exynos9810_selftest_step(policy, d, &min_req, &max_req,
+						 &pinned, steps[i], expect[i]);
+	freq_qos_remove_request(&min_req);
+	freq_qos_remove_request(&max_req);
+	/* Wait for the original limits to come back. */
+	while ((READ_ONCE(policy->min) != old_min || READ_ONCE(policy->max) != old_max) &&
+	       ktime_us_delta(ktime_get(), start) < 2 * EXYNOS9810_SELFTEST_SETTLE_US * (nsteps + 1))
+		usleep_range(500, 1000);
+	ret = 0;
+out:
+	pr_info("cpufreq selftest: policy%u restored ret=%d limits=%u-%u (was %u-%u) cur=%u cmu=%lu steps=%u pass=%u %lldus\n",
+		policy->cpu, ret, READ_ONCE(policy->min), READ_ONCE(policy->max),
+		old_min, old_max, READ_ONCE(policy->cur), cal_dfs_get_rate(d->cal_id),
+		nsteps, pass, ktime_us_delta(ktime_get(), start));
+	cpufreq_cpu_put(policy);
+}
+
+static void exynos9810_selftest(struct work_struct *work)
+{
+	struct exynos9810_cpufreq *state;
+	struct thermal_zone_device *tz;
+	ktime_t start = ktime_get();
+	int temp = 0, ret, stage_ret;
+	unsigned int i;
+
+	mutex_lock(&exynos9810_status_lock);
+	stage_ret = exynos9810_probe_ret;
+	pr_info("cpufreq selftest: start probe_ret=%d stage=%s driver=%s\n",
+		stage_ret, exynos9810_probe_stage, cpufreq_get_current_driver() ?: "none");
+	mutex_unlock(&exynos9810_status_lock);
+	state = smp_load_acquire(&provider);
+	if (!state) {
+		pr_info("cpufreq selftest: no registered provider; ready lit=%d big=%d cmu lit=%lu big=%lu\n",
+			cal_dfs_is_ready(EXYNOS9810_CPUCL0), cal_dfs_is_ready(EXYNOS9810_CPUCL1),
+			cal_dfs_get_rate(EXYNOS9810_CPUCL0), cal_dfs_get_rate(EXYNOS9810_CPUCL1));
+		return;
+	}
+	pr_info("cpufreq selftest: mif mode=%s cal=%#x probe_cmu=%lu now_cmu=%lu\n",
+		state->mif ? "devfreq" : "static", state->mif_cal_id,
+		state->mif_static_khz,
+		state->mif_cal_id ? cal_dfs_get_rate(state->mif_cal_id) : 0);
+	tz = thermal_zone_get_zone_by_name("BIG");
+	ret = IS_ERR(tz) ? PTR_ERR(tz) : thermal_zone_get_temp(tz, &temp);
+	pr_info("cpufreq selftest: thermal BIG zone=%s ret=%d temp=%d mC\n",
+		IS_ERR(tz) ? "absent" : "present", ret, temp);
+	for (i = 0; i < EXYNOS9810_DOMAINS; i++)
+		exynos9810_selftest_domain(&state->domains[i]);
+	pr_info("cpufreq selftest: done %lldus\n", ktime_us_delta(ktime_get(), start));
+}
+
+static void exynos9810_selftest_arm(struct device *dev)
+{
+	s64 uptime_ms, delay_ms;
+
+	if (exynos9810_selftest_armed ||
+	    !of_property_read_bool(dev->of_node, "samsung,cpufreq-selftest"))
+		return;
+	exynos9810_selftest_armed = true;
+	uptime_ms = ktime_to_ms(ktime_get_boottime());
+	delay_ms = max_t(s64, EXYNOS9810_SELFTEST_UPTIME_MS - uptime_ms, 0);
+	INIT_DELAYED_WORK(&exynos9810_selftest_work, exynos9810_selftest);
+	schedule_delayed_work(&exynos9810_selftest_work, msecs_to_jiffies(delay_ms));
+}
+
+/* ---------------------------------------------------------------------- */
+
 static int exynos9810_cpufreq_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct exynos9810_cpufreq *state;
 	struct device_node *child;
 	unsigned int id = 0;
+	u32 cal_id;
 	int ret;
 
+	exynos9810_selftest_arm(dev);
 	if (provider)
 		return -EBUSY;
 	state = devm_kzalloc(dev, sizeof(*state), GFP_KERNEL);
 	if (!state)
 		return -ENOMEM;
 	state->dev = dev;
-	state->mif = devfreq_get_devfreq_by_phandle(dev, "samsung,mif-devfreq", 0);
-	if (IS_ERR(state->mif))
-		return dev_err_probe(dev, PTR_ERR(state->mif), "MIF devfreq supplier unavailable\n");
-	if (!state->mif->profile->get_cur_freq)
-		return -ENODEV;
-	get_device(&state->mif->dev);
-	ret = devm_add_action_or_reset(dev, exynos9810_put_mif, &state->mif->dev);
-	if (ret)
-		return ret;
-	if (!device_link_add(dev, state->mif->dev.parent, DL_FLAG_AUTOREMOVE_CONSUMER))
-		return -ENOMEM;
+
+	/* Bind each child to its CAL domain and wait for ACPM DVFS + FVMap. */
 	for_each_available_child_of_node(dev->of_node, child) {
 		if (id >= EXYNOS9810_DOMAINS) {
 			of_node_put(child);
+			exynos9810_note(-EINVAL, "too many domains");
 			return -EINVAL;
 		}
+		if (of_property_read_u32(child, "samsung,cal-id", &cal_id) ||
+		    cal_id != (id ? EXYNOS9810_CPUCL1 : EXYNOS9810_CPUCL0)) {
+			of_node_put(child);
+			exynos9810_note(-EINVAL, "domain%u bad samsung,cal-id", id);
+			return -EINVAL;
+		}
+		if (!cal_dfs_is_ready(cal_id)) {
+			of_node_put(child);
+			exynos9810_note(-EPROBE_DEFER, "domain%u CAL %#x not ready", id, cal_id);
+			return dev_err_probe(dev, -EPROBE_DEFER,
+					     "CAL DVFS %#x not ready\n", cal_id);
+		}
+		state->domains[id++].cal_id = cal_id;
+	}
+	if (id != EXYNOS9810_DOMAINS) {
+		exynos9810_note(-ENODEV, "found %u domains", id);
+		return -ENODEV;
+	}
+
+	if (of_property_present(dev->of_node, "samsung,mif-devfreq")) {
+		ret = exynos9810_get_mif_supplier(state);
+		if (ret) {
+			exynos9810_note(ret, "MIF devfreq supplier");
+			return dev_err_probe(dev, ret, "MIF devfreq supplier unavailable\n");
+		}
+	} else if (!of_property_read_u32(dev->of_node, "samsung,mif-cal-id",
+					 &state->mif_cal_id)) {
+		state->mif_static_khz = cal_dfs_get_rate(state->mif_cal_id);
+	}
+
+	id = 0;
+	for_each_available_child_of_node(dev->of_node, child) {
 		ret = exynos9810_prepare_domain(state, child, &state->domains[id], id);
 		if (ret) {
 			of_node_put(child);
+			exynos9810_note(ret, "domain%u prepare", id);
 			return dev_err_probe(dev, ret, "CPU domain%u unavailable\n", id);
 		}
 		id++;
 	}
-	if (id != EXYNOS9810_DOMAINS ||
-	    cpumask_intersects(&state->domains[0].cpus, &state->domains[1].cpus))
+	if (cpumask_intersects(&state->domains[0].cpus, &state->domains[1].cpus)) {
+		exynos9810_note(-EINVAL, "overlapping domains");
 		return -EINVAL;
-	provider = state;
+	}
+	smp_store_release(&provider, state);
 	ret = cpufreq_register_driver(&exynos9810_driver);
-	if (ret)
+	if (ret) {
 		provider = NULL;
-	return ret;
-}
-
-static void exynos9810_cpufreq_remove(struct platform_device *pdev)
-{
-	cpufreq_unregister_driver(&exynos9810_driver);
-	provider = NULL;
+		exynos9810_note(ret, "cpufreq_register_driver");
+		return dev_err_probe(dev, ret, "cpufreq registration failed\n");
+	}
+	exynos9810_note(0, "registered mif=%s levels=%u+%u",
+			state->mif ? "devfreq" : "static",
+			state->domains[0].levels, state->domains[1].levels);
+	dev_info(dev, "registered: domain0 %u levels %u-%u kHz, domain1 %u levels %u-%u kHz\n",
+		 state->domains[0].levels,
+		 state->domains[0].table[state->domains[0].levels - 1].frequency,
+		 state->domains[0].table[0].frequency, state->domains[1].levels,
+		 state->domains[1].table[state->domains[1].levels - 1].frequency,
+		 state->domains[1].table[0].frequency);
+	return 0;
 }
 
 static const struct of_device_id exynos9810_cpufreq_match[] = {
@@ -460,14 +895,18 @@ static const struct of_device_id exynos9810_cpufreq_match[] = {
 };
 MODULE_DEVICE_TABLE(of, exynos9810_cpufreq_match);
 
+/*
+ * No remove: the driver is built in, unbinding is suppressed, and the late
+ * selftest work reads the provider without a reference.
+ */
 static struct platform_driver exynos9810_cpufreq_platform_driver = {
 	.probe = exynos9810_cpufreq_probe,
-	.remove = exynos9810_cpufreq_remove,
 	.driver = {
 		.name = "exynos9810-acpm-cpufreq",
 		.of_match_table = exynos9810_cpufreq_match,
+		.suppress_bind_attrs = true,
 	},
 };
-module_platform_driver(exynos9810_cpufreq_platform_driver);
+builtin_platform_driver(exynos9810_cpufreq_platform_driver);
 MODULE_DESCRIPTION("Exynos9810 firmware CPUFreq with original CPU/MIF constraints");
 MODULE_LICENSE("GPL");
