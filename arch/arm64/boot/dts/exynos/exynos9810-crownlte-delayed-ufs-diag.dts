@@ -287,5 +287,17 @@
 	status = "okay";
 };
 
+/*
+ * cpuidle staging, stage A: MCT global comparator as the tick broadcast
+ * device (inert until a CPU enters a local-timer-stop state). The report at
+ * ~86 s shows the probe self-check, FRC drift and per-CPU tick rates.
+ */
+&mct {
+	clocks = <&legacy_cmu GATE_MCT>;
+	clock-names = "mct";
+	samsung,mct-bc-report;
+	status = "okay";
+};
+
 /* SMP bring-up test: all eight CPUs */
 &{/chosen} { bootargs = "panic=30 ro"; };
