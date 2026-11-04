@@ -401,3 +401,6 @@ CONFIG_PRINTK_TIME=y
 # CONFIG_SCSI_SCAN_ASYNC is not set
 # CONFIG_PCI is not set
 # CONFIG_MODULES is not set
+
+# exynos-clkout: generic Exynos clock-output driver; fails probe (-22) on 9810 DT. Off.
+# CONFIG_EXYNOS_CLKOUT is not set
