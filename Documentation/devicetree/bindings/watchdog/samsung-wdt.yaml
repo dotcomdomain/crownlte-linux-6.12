@@ -26,6 +26,7 @@ properties:
           - samsung,exynos7-wdt                   # for Exynos7
           - samsung,exynos850-wdt                 # for Exynos850
           - samsung,exynosautov9-wdt              # for Exynosautov9
+          - samsung,exynos9810-wdt                # for Exynos9810 (CL0)
       - items:
           - enum:
               - tesla,fsd-wdt
@@ -50,6 +51,22 @@ properties:
     description:
       Index of CPU cluster on which watchdog is running (in case of Exynos850
       or Google gs101).
+
+  samsung,start-at-boot:
+    type: boolean
+    description:
+      Exynos9810 only. Start the watchdog at probe; the watchdog core keeps
+      pinging it until userspace opens the device. Arming is refused unless a
+      watchdog reset would reach the normal boot (Samsung SBOOT checks).
+
+  samsung,selftest-stop-petting-ms:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 10000
+    maximum: 114000
+    description:
+      Exynos9810 diagnostic selftest, never for normal use. At this boot time
+      the kernel stops pinging and shortens the timeout to 5 s, so the
+      watchdog must reset the system.
 
   samsung,syscon-phandle:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -77,6 +94,7 @@ allOf:
               - samsung,exynos7-wdt
               - samsung,exynos850-wdt
               - samsung,exynosautov9-wdt
+              - samsung,exynos9810-wdt
     then:
       required:
         - samsung,syscon-phandle
