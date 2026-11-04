@@ -1,0 +1,122 @@
+Exynos 9810 (crownlte) cpuidle staging on 6.12
+==============================================
+
+Why staging
+-----------
+Trial q16 (176bc6563 + 0e1783c44..8c0ea736b, NO_HZ_IDLE + C2 on all CPUs from
+boot) never enumerated over USB and never restarted. The q16 pmsg capture
+(kernel #3 03:22:46) shows that boot did not hang early:
+
+  exynos9810-cpuidle: C2 enabled: cluster0=1 cluster1=1
+  crownlte-diag: USB result stage=gadget-bound op=write UDC errno=0
+  crownlte-diag: serial open errno=0 (success)
+  crownlte-diag: loop tick=0 end sleep
+  crownlte-diag: UFS readiness snapshot complete; probe remains held
+  exynos5-hsi2c 14360000.i2c: 9810 timeout: addr=25 ... irq=73 ptr=0 ... intst=00000001
+  exynos5-hsi2c 14360000.i2c: tx timeout                (4 times, then nothing)
+
+The HSI2C timeouts appear in no other trial (q13, q14, q15, q17: 0). The
+controller raised its first interrupt (TX almost empty, ptr=0) and no handler
+ran within the 100 ms timeout, on each 2 s MAX77705 poll. Under GICv2 every
+SPI targets CPU0 by default (no irqbalance). Timers still ran on at least one
+CPU, because the timeouts were reported.
+
+Most likely reading (not proven): once C2 was enabled, a core that entered
+it, CPU0 among them, did not come back to service its interrupts. The dwc3
+interrupt is lost the same way, so the gadget is bound but never enumerates.
+The restart at 120 s then cannot complete. Which part of the C2 cycle fails
+is unknown:
+  - the APM never powered the core off: EL3 sits in WFI with its GIC CPU
+    interface disabled, and only an APM power cycle can wake it;
+  - the APM powered it off, but the GRP1 wakeup (GIC IRQ out -> PMU) never
+    brought it back;
+  - the core resumed but failed in the 6.12 resume path.
+4.9 runs the same PMUCAL and PSCI sequence on the same firmware without
+trouble, so the difference is in the 6.12 environment. That includes the
+ACPM state in recovery boots, which already differs from 4.9 (plugins
+detached, channels quarantined).
+
+A second, independent defect was certain in q16. The only tick broadcast was
+the hrtimer one from arm64 time_init(). With HIGH_RES_TIMERS=n,
+bc_set_next() only queues an hrtimer, and __hrtimer_reprogram() does not
+touch the hardware in low-res mode. The owning CPU has already stopped its
+tick, so C2 CPUs got their timer wakeups late, whenever something else woke
+the owner. The owning CPU also may never enter C2 itself, so a single-CPU C2
+test would never enter C2.
+
+Fix for the broadcast: drivers/clocksource/exynos9810-mct-bc.c registers MCT
+global comparator 0 (SPI 466) as a real, always-on broadcast device, after
+checking its rate and interrupt at probe. The upstream exynos_mct driver is
+not used: it panics on failure from time_init() and replaces sched_clock.
+
+Stages
+------
+Each stage is a separate image. Run a stage only after the previous one
+passed. All lines below are expected in the late serial and pmsg log.
+
+Stage A: NO_HZ_IDLE + MCT broadcast, no cpuidle (CONFIG_CPU_IDLE=n)
+  Config: integration config -HZ_PERIODIC +NO_HZ_IDLE +EXYNOS9810_MCT_BROADCAST
+  DT:     &mct okay with samsung,mct-bc-report
+  Probe (early, may be lost):
+    exynos9810-mct-bc: tick broadcast device registered: rate=26000000 Hz rate_ppm=<|x|<=10000> test_late_max_us=<small> irq=<n>
+  Report at ~86 s:
+    exynos9810-mct-bc: report: ready=1 why=ok rate=26000000 Hz ... test_fired=3/3 ... early=0 bc_state=oneshot|shutdown
+    exynos9810-mct-bc: report: frc_drift_ppm_1s=<about 0> ...
+    exynos9810-mct-bc: report: cpuN arch_timer irqs/s=<well below 250 for idle CPUs> (HZ=250)
+    exynos9810-mct-bc: report: done irqs=3 programmed=0 etime=0 write_timeouts=0
+  irqs stays at 3 (the probe test): nothing uses the broadcast without
+  cpuidle. Pass criteria: USB and serial as in q15, all later self-tests
+  (cpufreq 100 s, devfreq/TMU 105 s) PASS, 120 s restart works, ready=1,
+  idle CPUs well below HZ.
+  If ready=0 the reason is printed ("not used, hrtimer broadcast stays: ...")
+  and stage B will refuse to arm C2.
+
+Stage B: stage A + cpuidle driver, C2 registered but disarmed
+  Config: stage A +CPU_IDLE +CPU_IDLE_GOV_MENU +CPU_IDLE_GOV_TEO
+          +ARM_EXYNOS9810_CPUIDLE (ARM_PSCI_CPUIDLE stays off)
+  DT:     &cpuidle okay with samsung,cpuidle-selftest
+  Probe:
+    exynos9810-cpuidle: registered: cluster0=1 cluster1=1, C2 disarmed on every CPU
+  Self-test at ~90 s on CPU0 (lines start "cpuidle selftest:"):
+    setup=ok deep_off=0 mct_bc=1 armed=
+    cpuN reg=... live_mpidr=... phycpu=N cluster=C          (8 lines)
+    clusterC cpus=... verified=1 registered=1               (+ state lines,
+                                                             state1 flags=0x54: RCU_IDLE|OFF|TIMER_STOP)
+    before cpuN phy=... status=0xf inform=0 ...              (8 lines)
+    phase little-1: armed 1 for 2500 ms
+    phase little-1 cpu1 c2_enter=+N resumed=+N early=+E psci_fail=+0 ... usage=+N ...
+    phase little-1 cpu1 ping answered=K/K lat_us min=.. avg=.. max=<~500> | sleeper loops=~150 oversleep_max_us=<small> | pmu_off_seen=X/K | running: ... armed_seen=0
+    phase little-1 mct_bc irqs=+M programmed=+M etime=+0 write_timeouts=+0
+    phase little-1: PASS
+    (same for "big-1" with cpu4, then "secondaries" with cpus 1-7)
+    done result=PASS phases_passed=3/3 deep_off=0 armed= elapsed_ms=~8000
+  Key evidence: resumed>0 means the core returned through cpu_resume.
+  pmu_off_seen>0 means the APM really powered the core off, as sampled by
+  CPU0. mct_bc irqs>0 means the broadcast woke C2 cores.
+  Failure lines name the CPU and cause, with PMU/INTR_GEN state before and
+  after disarming:
+    FAIL-state cpuN phy=P status=.. inform=.. event_grp2=..(b) grp1_en=..(b) grp1_pend=..(b) grp2_en=..(b) grp2_pend=..(b)
+    after-disarm cpuN ...
+    phase NAME: FAIL cpuN: <IPI not answered within 100 ms | timer wakeup (broadcast) late ... | C2 hooks found armed ...>; after disarm the IPI <was answered|is still unanswered>
+    done result=FAIL ...
+  Reading a failure:
+    status=0xf + IPI unanswered + grp2 armed -> the APM never powered the core
+      off; EL3 is stuck in WFI (APM side or GRP2 event never seen).
+    status!=0xf + grp1_pend set -> powered off, wakeup seen, never powered on.
+    status!=0xf + grp1_pend clear -> powered off, GIC wake never reached PMU.
+    status=0xf + inform=0 + IPI unanswered -> resumed but stuck in the kernel.
+  A stuck secondary does not take USB or the other self-tests with it,
+  because CPU0 is never armed. The 120 s restart may take about 1 s longer
+  (smp_send_stop timeout).
+  result=INCONCLUSIVE: an armed CPU never resumed from C2 (for example, only
+  "early" returns). No wider phase runs.
+  result=SKIPPED: something refused arming, such as "MCT tick broadcast not
+  active".
+
+Stage C: C2 at boot (only after stage B passed, ideally twice)
+  C1: samsung,c2-boot-cpus = <0xfe> (secondaries from probe; CPU0 still WFI)
+      plus samsung,cpuidle-selftest-keep-armed, if the self-test should run
+      and leave them armed.
+  C2: add CPU0 (<0xff>). CPU0 then has to be woken by device SPIs and by the
+      MCT interrupt itself. That is the step q16 failed with, so test it
+      last.
