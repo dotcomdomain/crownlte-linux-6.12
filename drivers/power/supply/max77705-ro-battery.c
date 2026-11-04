@@ -1158,10 +1158,6 @@ static int mx_probe(struct i2c_client *client)
 		 DTLS01_CHG(m->snap.dtls1), chg_dtls_name(DTLS01_CHG(m->snap.dtls1)),
 		 m->snap.cnfg00);
 
-	ret = devm_add_action_or_reset(dev, mx_cancel, m);
-	if (ret)
-		return ret;
-
 	cfg.drv_data = m;
 	m->psy_bat = devm_power_supply_register(dev, &mx_bat_desc, &cfg);
 	if (IS_ERR(m->psy_bat))
@@ -1175,6 +1171,11 @@ static int mx_probe(struct i2c_client *client)
 	m->psy_wl = devm_power_supply_register(dev, &mx_wl_desc, &cfg);
 	if (IS_ERR(m->psy_wl))
 		return dev_err_probe(dev, PTR_ERR(m->psy_wl), "wireless psy\n");
+
+	/* devm unwinds in reverse: stop the works before the supplies go */
+	ret = devm_add_action_or_reset(dev, mx_cancel, m);
+	if (ret)
+		return ret;
 
 	queue_delayed_work(system_power_efficient_wq, &m->monitor,
 			   msecs_to_jiffies(m->poll_chg_ms));
