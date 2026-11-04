@@ -1,0 +1,73 @@
+crownlte Android kernel configuration
+=====================================
+
+Files
+-----
+arch/arm64/configs/crownlte_android.fragment
+    Hand-maintained, commented list of the options added for Android 16 /
+    LineageOS 23, plus the options deliberately kept off (and why).
+arch/arm64/configs/crownlte_android_defconfig
+    Generated, self-contained defconfig: `make crownlte_android_defconfig`.
+    Do not edit it by hand; change the fragment and regenerate.
+
+Why a standalone defconfig and not gki_defconfig + fragment
+-----------------------------------------------------------
+gki_defconfig targets a module-based generic kernel. Using it as the base
+would turn on MODULES/MODVERSIONS/MODULE_SIG, CFI_CLANG, SHADOW_CALL_STACK,
+KASAN/UBSAN, BTF/DWARF5, Rust, PCI, KVM/pKVM, Gunyah, SCMI/SCPI, eight
+foreign ARCH_* platforms, and generic drivers that bind common DT
+compatibles (syscon-reboot, the PMU, 8250/PL011 serial). It would also
+drop the crownlte-specific options that only the diagnostic config
+carries: ACPM, cal-if, TMU, cpufreq, the diagnostic restart/MUIC/UFS-RO
+guards, Trustonic, and EXTRA_FIRMWARE. Each of those changes would need
+its own hardware re-check.
+
+The hardware-verified diagnostic config is the base instead. The Android
+options from gki_defconfig, the AOSP android-base/recommended
+requirements and the running 4.9 config are layered on top. This tree has
+no kernel/configs/android-*.config, so those requirements were
+reconstructed from AOSP knowledge and cross-checked against
+gki_defconfig.
+
+Regenerating
+------------
+Base: the .config of build/acpm-tmu-6.12.93 (crownlte-acpm-tmu 2ac3a7454,
+hardware-verified ACPM/DVFS/FVMap/TMU, 8 CPUs). A copy is in
+/mnt/ssd/host-builds/kernel-upgrade/android-config-work/diag.config.
+
+  B=<build dir>
+  ARCH=arm64 LLVM=-18 scripts/kconfig/merge_config.sh -O $B \
+      <diag .config> arch/arm64/configs/crownlte_android.fragment
+  make O=$B ARCH=arm64 LLVM=-18 savedefconfig
+  cp $B/defconfig arch/arm64/configs/crownlte_android_defconfig
+
+merge_config.sh reports "Value requested ... not in final .config" for
+every option the fragment changes indirectly. Those reports are expected.
+What matters is that every fragment line lands in the result: compare
+each fragment entry against the final .config.
+
+Build:
+  make O=$B ARCH=arm64 LLVM=-18 -j2 Image \
+      exynos/exynos9810-crownlte-delayed-ufs-diag.dtb
+
+Notes
+-----
+- LOCALVERSION is "-crownlte-android". pack-acpm-q.py checks for the
+  banner "6.12.93-crownlte-diag+", so packing this Image with it needs that
+  check adjusted.
+- PREEMPT=y with PREEMPT_DYNAMIC. The hardware-verified diagnostic ran
+  PREEMPT_NONE; add "preempt=none" to bootargs to get that model back
+  without rebuilding.
+- CPU_IDLE stays off here. That work is on crownlte-cpuidle.
+- MODULES stays off: nothing in this config needs a loadable module.
+- FORTIFY_SOURCE needed one fix: the struct_group() in
+  ufs-exynos9810-fmp.h (21d7dcb7f).
+- ASHMEM is not available: in this ACK it depends on RUST, and the build
+  host has no rustc.
+
+Reference build (2026-11-04, clean O= dir, LLVM-18, -j2, zero warnings)
+--------------------------------------------------------------------------
+build/android-config-clean-6.12.93
+  Image 20,742,152 bytes (diagnostic acpm-tmu Image: 15,007,752)
+  exynos9810-crownlte-delayed-ufs-diag.dtb 17,352 bytes, byte-identical
+  to the acpm-tmu DTB
