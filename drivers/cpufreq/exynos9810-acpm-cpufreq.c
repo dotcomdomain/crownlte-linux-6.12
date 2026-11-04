@@ -23,8 +23,20 @@
  *
  * samsung,max-freq-cap is an additional hard ceiling. It is not in 4.9; it
  * keeps big at 4.9's policy-max until thermal throttling has been verified.
+ *
+ * Cooling devices keep the 4.9 names. 4.9 registered one cpufreq cooling
+ * device per acme domain in DT order (domain@0 = cpus 0-3, domain@1 = cpus
+ * 4-7) through cpu_cooling.c, which named them "thermal-cpufreq-<idr id>":
+ * LITTLE = thermal-cpufreq-0, BIG = thermal-cpufreq-1. The vendor thermal HAL
+ * (/vendor/etc/thermal_info_config.json "CoolingDevices", via the
+ * /dev/thermal/cdev-by-name links made by /vendor/bin/thermal_symlinks from
+ * cooling_deviceN/type) looks them up by that string. So the driver
+ * registers them itself instead of setting CPUFREQ_IS_COOLING_DEV (which
+ * names them "cpufreq-cpu0"/"cpufreq-cpu4"). The device is still bound to
+ * the policy CPU's DT node, so cooling-maps <&cpu4 ...> work unchanged.
  */
 #include <linux/cpu.h>
+#include <linux/cpu_cooling.h>
 #include <linux/cpufreq.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
@@ -326,10 +338,41 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 	return 0;
 }
 
+/* 4.9 cpu_cooling.c name for acme domain N: "thermal-cpufreq-N". */
+static void exynos9810_cooling_register(struct cpufreq_policy *policy,
+					struct exynos9810_domain *domain)
+{
+	char type[THERMAL_NAME_LENGTH];
+	unsigned long max_state = 0;
+
+	/*
+	 * ->ready also runs when an inactive policy comes back online; the
+	 * device stays registered across CPU offline (as the core's own
+	 * CPUFREQ_IS_COOLING_DEV device does), so the cdev-by-name links made
+	 * once at boot stay valid. There is no ->exit: the driver is built in
+	 * and never unregistered, so a policy is never freed under it.
+	 */
+	if (policy->cdev)
+		return;
+	snprintf(type, sizeof(type), "thermal-cpufreq-%u", domain->id);
+	policy->cdev = of_cpufreq_cooling_register_named(policy, type);
+	if (!policy->cdev) {
+		dev_warn(provider->dev, "domain%u: cooling device %s not registered (cpu%u needs #cooling-cells)\n",
+			 domain->id, type, policy->cpu);
+		return;
+	}
+	policy->cdev->ops->get_max_state(policy->cdev, &max_state);
+	dev_info(provider->dev, "domain%u (cpus %*pbl): cooling device %s = cooling_device%d, max_state %lu\n",
+		 domain->id, cpumask_pr_args(policy->related_cpus), type,
+		 policy->cdev->id, max_state);
+}
+
 static void exynos9810_policy_ready(struct cpufreq_policy *policy)
 {
 	struct exynos9810_domain *domain = policy->driver_data;
 	int ret;
+
+	exynos9810_cooling_register(policy, domain);
 
 	/*
 	 * acme set_policy(): policy-max is the initial user policy maximum.
@@ -349,7 +392,7 @@ static struct freq_attr *exynos9810_attrs[] = {
 
 static struct cpufreq_driver exynos9810_driver = {
 	.name = "exynos9810-acpm",
-	.flags = CPUFREQ_IS_COOLING_DEV,
+	/* No CPUFREQ_IS_COOLING_DEV: see exynos9810_cooling_register(). */
 	.verify = cpufreq_generic_frequency_table_verify,
 	.target_index = exynos9810_target_index,
 	.get = exynos9810_get,

@@ -216,7 +216,9 @@
  * max-freq 2314000 with policy-max 1794000; samsung,max-freq-cap (not in
  * 4.9) holds the table at 1794000 until thermal throttling is verified.
  * The mif-perf tables only drive a samsung,mif-devfreq supplier (none yet).
- * The cpufreq core registers each policy CPU node as a cooling device.
+ * The cpufreq driver registers each policy CPU node as a cooling device with
+ * the 4.9 type names the vendor thermal HAL expects: cpu0 (domain@0) =
+ * "thermal-cpufreq-0", cpu4 (domain@1) = "thermal-cpufreq-1".
  */
 &cpu0 { #cooling-cells = <2>; };
 &cpu1 { #cooling-cells = <2>; };

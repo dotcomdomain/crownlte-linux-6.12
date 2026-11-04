@@ -503,9 +503,10 @@ static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
  * @policy: cpufreq policy
  * Normally this should be same as cpufreq policy->related_cpus.
  * @em: Energy Model of the cpufreq policy
+ * @type: cooling device type, or NULL for "cpufreq-<cpu device name>"
  *
  * This interface function registers the cpufreq cooling device with the name
- * "cpufreq-%s". This API can support multiple instances of cpufreq
+ * "cpufreq-%s" (or @type). This API can support multiple instances of cpufreq
  * cooling devices. It also gives the opportunity to link the cooling device
  * with a device tree node, in order to bind it via the thermal DT code.
  *
@@ -515,7 +516,7 @@ static int cpufreq_set_cur_state(struct thermal_cooling_device *cdev,
 static struct thermal_cooling_device *
 __cpufreq_cooling_register(struct device_node *np,
 			struct cpufreq_policy *policy,
-			struct em_perf_domain *em)
+			struct em_perf_domain *em, const char *type)
 {
 	struct thermal_cooling_device *cdev;
 	struct cpufreq_cooling_device *cpufreq_cdev;
@@ -589,7 +590,10 @@ __cpufreq_cooling_register(struct device_node *np,
 	}
 
 	cdev = ERR_PTR(-ENOMEM);
-	name = kasprintf(GFP_KERNEL, "cpufreq-%s", dev_name(dev));
+	if (type)
+		name = kstrdup(type, GFP_KERNEL);
+	else
+		name = kasprintf(GFP_KERNEL, "cpufreq-%s", dev_name(dev));
 	if (!name)
 		goto remove_qos_req;
 
@@ -625,9 +629,36 @@ free_cdev:
 struct thermal_cooling_device *
 cpufreq_cooling_register(struct cpufreq_policy *policy)
 {
-	return __cpufreq_cooling_register(NULL, policy, NULL);
+	return __cpufreq_cooling_register(NULL, policy, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(cpufreq_cooling_register);
+
+static struct thermal_cooling_device *
+__of_cpufreq_cooling_register(struct cpufreq_policy *policy, const char *type)
+{
+	struct device_node *np = of_get_cpu_node(policy->cpu, NULL);
+	struct thermal_cooling_device *cdev = NULL;
+
+	if (!np) {
+		pr_err("cpufreq_cooling: OF node not available for cpu%d\n",
+		       policy->cpu);
+		return NULL;
+	}
+
+	if (of_property_present(np, "#cooling-cells")) {
+		struct em_perf_domain *em = em_cpu_get(policy->cpu);
+
+		cdev = __cpufreq_cooling_register(np, policy, em, type);
+		if (IS_ERR(cdev)) {
+			pr_err("cpufreq_cooling: cpu%d failed to register as cooling device: %ld\n",
+			       policy->cpu, PTR_ERR(cdev));
+			cdev = NULL;
+		}
+	}
+
+	of_node_put(np);
+	return cdev;
+}
 
 /**
  * of_cpufreq_cooling_register - function to create cpufreq cooling device.
@@ -648,30 +679,33 @@ EXPORT_SYMBOL_GPL(cpufreq_cooling_register);
 struct thermal_cooling_device *
 of_cpufreq_cooling_register(struct cpufreq_policy *policy)
 {
-	struct device_node *np = of_get_cpu_node(policy->cpu, NULL);
-	struct thermal_cooling_device *cdev = NULL;
-
-	if (!np) {
-		pr_err("cpufreq_cooling: OF node not available for cpu%d\n",
-		       policy->cpu);
-		return NULL;
-	}
-
-	if (of_property_present(np, "#cooling-cells")) {
-		struct em_perf_domain *em = em_cpu_get(policy->cpu);
-
-		cdev = __cpufreq_cooling_register(np, policy, em);
-		if (IS_ERR(cdev)) {
-			pr_err("cpufreq_cooling: cpu%d failed to register as cooling device: %ld\n",
-			       policy->cpu, PTR_ERR(cdev));
-			cdev = NULL;
-		}
-	}
-
-	of_node_put(np);
-	return cdev;
+	return __of_cpufreq_cooling_register(policy, NULL);
 }
 EXPORT_SYMBOL_GPL(of_cpufreq_cooling_register);
+
+/**
+ * of_cpufreq_cooling_register_named - DT cpufreq cooling device, fixed type.
+ * @policy: cpufreq policy
+ * @type: cooling device type (/sys/class/thermal/cooling_deviceN/type)
+ *
+ * Same as of_cpufreq_cooling_register(), but the cooling device type is
+ * @type instead of "cpufreq-<cpu>". For drivers whose userspace ABI expects
+ * another name (vendor thermal HALs looking up "thermal-cpufreq-N"). Such a
+ * driver must not also set CPUFREQ_IS_COOLING_DEV, and must unregister the
+ * device itself with cpufreq_cooling_unregister().
+ *
+ * Return: a valid struct thermal_cooling_device pointer on success,
+ * and NULL on failure (also when the CPU node has no #cooling-cells).
+ */
+struct thermal_cooling_device *
+of_cpufreq_cooling_register_named(struct cpufreq_policy *policy,
+				  const char *type)
+{
+	if (!type || !*type || strlen(type) >= THERMAL_NAME_LENGTH)
+		return NULL;
+	return __of_cpufreq_cooling_register(policy, type);
+}
+EXPORT_SYMBOL_GPL(of_cpufreq_cooling_register_named);
 
 /**
  * cpufreq_cooling_unregister - function to remove cpufreq cooling device.
