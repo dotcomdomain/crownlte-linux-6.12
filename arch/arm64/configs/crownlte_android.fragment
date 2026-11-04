@@ -404,3 +404,6 @@ CONFIG_PRINTK_TIME=y
 
 # exynos-clkout: generic Exynos clock-output driver; fails probe (-22) on 9810 DT. Off.
 # CONFIG_EXYNOS_CLKOUT is not set
+
+# MIF/INT bus DVFS over CAL/ACPM (hardware-verified q15/q18).
+CONFIG_ARM_EXYNOS9810_ACPM_DEVFREQ=y
