@@ -37,12 +37,28 @@
  * failure (cpu_pm notifier veto, CAL error, PSCI error) runs WFI for that
  * idle period. Repeated PSCI errors, a CAL error or a failed self-test
  * phase disarm every CPU.
+ *
+ * C2 hook reset (4.9 parity, Documentation/crownlte/cpuidle-secondaries-q22b.md):
+ * 4.9 runs cal_cpu_enable() on every CPU as it comes online
+ * (exynos-powermode.c exynos_hotplug_in_callback(), cpuhp
+ * CPUHP_AP_EXYNOS_CPU_UP_POWER_CONTROL). That clears the CPU_INFORM slot,
+ * the core's PMU_EVENT_INTERRUPT_ENABLE_GRP2 bit and any latched GRP2
+ * (core-down) event. The bootloader leaves EVENT_INTERRUPT_ENABLE_GRP2 at
+ * 0xffffffff, so without the reset every WFI of a core latches a GRP2
+ * event, and the first cal_cpu_disable() of that core hands the APM a
+ * core-down request while the core is still running Linux (q22b "before"
+ * dump: event_grp2=0xffffffff grp2_pend=0xef). This driver does the same
+ * reset from a cpuhp online callback and again on each CPU right before it
+ * is armed, and clears a latched GRP2 event of its own core (counted as
+ * stale_grp2) before every cal_cpu_disable().
  */
 
 #define pr_fmt(fmt) "exynos9810-cpuidle: " fmt
 
+#include <linux/arm-smccc.h>
 #include <linux/cpu.h>
 #include <linux/cpu_pm.h>
+#include <linux/cpuhotplug.h>
 #include <linux/cpuidle.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
@@ -66,8 +82,10 @@
 
 #include <uapi/linux/psci.h>
 
+#include <asm/barrier.h>
 #include <asm/cputype.h>
 #include <asm/smp_plat.h>
+#include <asm/suspend.h>
 
 #include <soc/samsung/cal-if.h>
 #include <soc/samsung/exynos9810-mct-bc.h>
@@ -88,26 +106,61 @@ static const u16 pmu_cpu_status[E9810_NR_PHYCPUS] = {
 };
 /* core_on in the APM sequences waits for STATUS[3:0] == 0xf */
 #define PMU_CPU_STATUS_ON		0xf
+/*
+ * CLUSTERx_CPUy_CONFIGURATION sits 4 bytes below STATUS. 4.9
+ * exynos-pmu.c exynos_cpu_up() sets LOCAL_PWR_CFG [3:0] = 0xf to power a
+ * core on; the APM core-on sequence writes the same field.
+ */
+#define PMU_CPU_CONFIG(phy)		(pmu_cpu_status[phy] - 4)
+#define PMU_CPU_LOCAL_PWR_CFG		0xf
 
-/* PMU_INTR_GEN (0x14070000), read only here, for diagnostics */
+/*
+ * PMU_INTR_GEN (0x14070000). Read for diagnostics; the only write here is
+ * a single-bit write-1-to-clear of this core's own latched GRP2 event.
+ */
 #define INTR_GEN_GRP1_ENABLE		0x0100
 #define INTR_GEN_GRP1_PEND		0x0108
+#define INTR_GEN_GRP1_CLEAR		0x010c
 #define INTR_GEN_GRP2_ENABLE		0x0200
 #define INTR_GEN_GRP2_PEND		0x0208
+#define INTR_GEN_GRP2_CLEAR		0x020c
 /* LITTLE cores use bits 4-7, BIG cores bits 0-3 */
 #define INTR_GEN_BIT(phy)		BIT((phy) ^ 4)
 
 #define E9810_FAIL_STREAK_MAX		32
 
+/*
+ * Where a CPU is in the C2 path, written by the CPU itself. A CPU that
+ * stops answering IPIs is located by this marker.
+ */
+enum {
+	E9810_ST_KERNEL = 0,	/* not in the C2 path */
+	E9810_ST_CAL_OFF,	/* in cal_cpu_disable(): holds pmucal_cpu_lock */
+	E9810_ST_FIRMWARE,	/* PSCI CPU_SUSPEND issued: EL3, or powered off */
+	E9810_ST_CAL_ON,	/* back from EL3, in cal_cpu_enable() */
+	E9810_ST_PM_EXIT,	/* in cpu_pm_exit() */
+};
+
+static const char * const e9810_stage_name[] = {
+	[E9810_ST_KERNEL]	= "kernel",
+	[E9810_ST_CAL_OFF]	= "cal_cpu_disable",
+	[E9810_ST_FIRMWARE]	= "firmware",
+	[E9810_ST_CAL_ON]	= "cal_cpu_enable",
+	[E9810_ST_PM_EXIT]	= "cpu_pm_exit",
+};
+
 /* Self-test timing. The diag PID1 restarts the phone at about 120 s. */
-/* After the MCT report (86-89 s), before the DVFS self-tests (100 s). */
+/* After the MCT report (86-89 s); six phases end at about 100 s. */
 #define E9810_SELFTEST_MS		90000
-#define E9810_PHASE_MS			2500
+#define E9810_PHASE_MS			1500
 #define E9810_POLL_MS			20
 #define E9810_PING_TIMEOUT_MS		100
 #define E9810_SLEEP_MS			10
 #define E9810_SLEEPER_STALE_MS		250
 #define E9810_RECHECK_MS		300
+#define E9810_RECOVER_WAIT_MS		200
+#define E9810_LOST_REMINDERS		8
+#define E9810_LOST_REMINDER_MS		5000
 
 struct e9810_cluster {
 	struct cpuidle_driver drv;
@@ -128,12 +181,17 @@ struct e9810_stats {
 	u64 psci_fail;		/* CPU_SUSPEND returned an error */
 	u64 unarmed;		/* C2 requested while not armed: WFI */
 	u64 wfi_fallback;	/* any C2 request that ran WFI instead */
+	u64 stale_grp2;		/* own GRP2 event latched before arming */
 	int last_err;
 	unsigned int fail_streak;
 };
 
 static struct e9810_cluster e9810_clusters[E9810_NR_CLUSTERS];
 static DEFINE_PER_CPU(struct e9810_stats, e9810_stats);
+static DEFINE_PER_CPU(u32, e9810_stage);
+/* C2 hook resets (cal_cpu_enable() on the CPU) and the last CAL result. */
+static DEFINE_PER_CPU(u32, e9810_hooks_reset);
+static DEFINE_PER_CPU(int, e9810_hooks_ret);
 static unsigned int e9810_phycpu[NR_CPUS];
 static unsigned int e9810_cluster_of[NR_CPUS];
 static u64 e9810_live_mpidr[NR_CPUS];
@@ -151,6 +209,14 @@ static void __iomem *e9810_intr_gen;
 
 static struct delayed_work e9810_selftest_work;
 static bool e9810_keep_armed;
+
+/* CPUs that never came back from C2 and could not be recovered. */
+static struct cpumask e9810_lost;
+static struct delayed_work e9810_lost_work;
+static unsigned int e9810_lost_reminders;
+
+/* PSCI CPU_ON function ID from the DT psci node (v0.1 IDs), 0 if unknown. */
+static u32 e9810_psci_cpu_on_fn;
 
 /* Called with interrupts off from the idle path: no plain printk here. */
 static void e9810_disable_deep(const char *why)
@@ -182,12 +248,23 @@ static __cpuidle int e9810_fallback_wfi(void)
 	return 0;
 }
 
+/*
+ * The marker must be visible to CPU0 even if this core is powered off or
+ * stops right after the store, hence the full DSB.
+ */
+static __always_inline void e9810_set_stage(u32 stage)
+{
+	WRITE_ONCE(*this_cpu_ptr(&e9810_stage), stage);
+	dsb(ish);
+}
+
 static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 				    struct cpuidle_driver *drv, int idx)
 {
 	struct e9810_cluster *cl = container_of(drv, struct e9810_cluster, drv);
 	struct e9810_stats *st = this_cpu_ptr(&e9810_stats);
 	unsigned int phy = e9810_phycpu[dev->cpu];
+	u32 bit = INTR_GEN_BIT(phy);
 	int ret;
 
 	if (!cpumask_test_cpu(dev->cpu, &e9810_armed)) {
@@ -201,19 +278,39 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	if (cpu_pm_enter())
 		goto wfi;
 
+	/*
+	 * cal_cpu_disable() enables this core's GRP2 interrupt first. A GRP2
+	 * event latched earlier would reach the APM at once, while the core
+	 * still runs here. The 4.9 core-on sequence clears it the same way
+	 * (GRP2_INTR_BID_CLEAR, own bit); GRP2 is not enabled for this core
+	 * yet, so the APM is not looking at it.
+	 */
+	if (readl_relaxed(e9810_intr_gen + INTR_GEN_GRP2_PEND) & bit) {
+		writel(bit, e9810_intr_gen + INTR_GEN_GRP2_CLEAR);
+		st->stale_grp2++;
+	}
+
+	e9810_set_stage(E9810_ST_CAL_OFF);
 	ret = cal_cpu_disable(phy);
 	if (ret) {
+		e9810_set_stage(E9810_ST_CAL_ON);
 		cal_cpu_enable(phy);
+		e9810_set_stage(E9810_ST_PM_EXIT);
 		cpu_pm_exit();
+		e9810_set_stage(E9810_ST_KERNEL);
 		e9810_disable_deep("cal_cpu_disable failed");
 		goto wfi;
 	}
 
 	st->c2_enter++;
+	e9810_set_stage(E9810_ST_FIRMWARE);
 	ret = psci_cpu_suspend_enter(cl->psci_state[idx]);
+	e9810_set_stage(E9810_ST_CAL_ON);
 
 	cal_cpu_enable(phy);
+	e9810_set_stage(E9810_ST_PM_EXIT);
 	cpu_pm_exit();
+	e9810_set_stage(E9810_ST_KERNEL);
 
 	if (!ret) {
 		st->c2_resumed++;
@@ -462,6 +559,35 @@ static const char *e9810_arm_refused(unsigned int cpu)
 	return NULL;
 }
 
+/*
+ * 4.9 exynos_hotplug_in_callback() -> cpu_enable() -> cal_cpu_enable(): on
+ * the CPU itself, since pmucal_powermode_hint_clear() picks the CPU_INFORM
+ * slot from the live MPIDR. Clears CPU_INFORM, disables the core's GRP2
+ * interrupt, clears a latched GRP2 event and the core's
+ * PMU_EVENT_INTERRUPT_ENABLE_GRP2 bit. Never runs while the CPU is armed.
+ */
+static void e9810_reset_hooks_local(void *unused)
+{
+	unsigned int cpu = smp_processor_id();
+	unsigned long flags;
+	int ret;
+
+	/* pmucal_cpu_lock is a plain spinlock also taken from idle. */
+	local_irq_save(flags);
+	ret = cal_cpu_enable(e9810_phycpu[cpu]);
+	local_irq_restore(flags);
+	this_cpu_write(e9810_hooks_ret, ret);
+	this_cpu_inc(e9810_hooks_reset);
+}
+
+/* cpuhp AP online callback: runs on @cpu, like the 4.9 one. */
+static int e9810_cpu_online(unsigned int cpu)
+{
+	if (!cpumask_test_cpu(cpu, &e9810_armed))
+		e9810_reset_hooks_local(NULL);
+	return 0;
+}
+
 static const char *e9810_arm(const struct cpumask *mask)
 {
 	const char *why = NULL;
@@ -472,6 +598,18 @@ static const char *e9810_arm(const struct cpumask *mask)
 		why = e9810_arm_refused(cpu);
 		if (why)
 			break;
+		if (cpumask_test_cpu(cpu, &e9810_armed))
+			continue;
+		/* Not armed yet, so not in C2: the IPI is answered. */
+		if (smp_call_function_single(cpu, e9810_reset_hooks_local,
+					     NULL, 1)) {
+			why = "C2 hook reset IPI failed";
+			break;
+		}
+		if (per_cpu(e9810_hooks_ret, cpu)) {
+			why = "C2 hook reset (cal_cpu_enable) failed";
+			break;
+		}
 	}
 	if (!why) {
 		cpumask_or(&e9810_armed, &e9810_armed, mask);
@@ -508,24 +646,40 @@ static int e9810_reboot_cb(struct notifier_block *nb, unsigned long event,
 		cpumask_clear(&e9810_armed);
 		/* Disarmed before cpuidle_pause() kicks the idle CPUs. */
 		smp_mb();
-		cpuidle_pause();
+		/*
+		 * cpuidle_pause() waits for an RCU grace period. A CPU lost
+		 * outside an RCU idle section would block it forever, so
+		 * only kick the idle CPUs then.
+		 */
+		if (!cpumask_empty(&e9810_lost)) {
+			pr_emerg("restart with lost CPUs %*pbl: cpuidle_pause() skipped\n",
+				 cpumask_pr_args(&e9810_lost));
+			wake_up_all_idle_cpus();
+		} else {
+			cpuidle_pause();
+		}
 	}
 	return NOTIFY_OK;
 }
 
-/* First in the chain: CPUs leave C2 before any restart notifier runs. */
+/*
+ * CPUs leave C2 before nearly every restart notifier runs. One below
+ * INT_MAX, so the watchdog's restart guard (INT_MAX, arms the final timeout)
+ * always runs first, even if this one blocks.
+ */
 static struct notifier_block e9810_reboot_nb = {
 	.notifier_call = e9810_reboot_cb,
-	.priority = INT_MAX,
+	.priority = INT_MAX - 1,
 };
 
 static const char *e9810_setup(struct platform_device *pdev)
 {
-	struct device_node *np = pdev->dev.of_node;
+	struct device_node *np = pdev->dev.of_node, *psci_np;
 	struct resource *res;
 	bool any = false;
 	unsigned int c;
 	const char *why;
+	int ret;
 
 	why = e9810_init_topology();
 	if (why)
@@ -565,6 +719,27 @@ static const char *e9810_setup(struct platform_device *pdev)
 	if (!any)
 		return "no cluster registered";
 
+	/*
+	 * 4.9 resets the C2 hooks as each CPU comes online. The callback
+	 * also runs now on every online CPU, before anything can be armed.
+	 */
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "cpuidle/exynos9810:hooks",
+				e9810_cpu_online, NULL);
+	if (ret < 0)
+		pr_warn("cpuhp C2 hook reset not registered (%d); reset only at arming\n",
+			ret);
+
+	psci_np = of_find_compatible_node(NULL, NULL, "arm,psci");
+	if (psci_np) {
+		const char *method;
+
+		if (!of_property_read_string(psci_np, "method", &method) &&
+		    !strcmp(method, "smc"))
+			of_property_read_u32(psci_np, "cpu_on",
+					     &e9810_psci_cpu_on_fn);
+		of_node_put(psci_np);
+	}
+
 	register_reboot_notifier(&e9810_reboot_nb);
 	return NULL;
 }
@@ -574,8 +749,9 @@ static const char *e9810_setup(struct platform_device *pdev)
 /* ------------------------------------------------------------------------ */
 
 struct e9810_regs {
-	u32 status, inform, event_grp2;
+	u32 status, config, inform, event_grp2;
 	u32 grp1_en, grp1_pend, grp2_en, grp2_pend;
+	u32 stage;
 };
 
 struct e9810_ping {
@@ -614,12 +790,20 @@ static void e9810_read_regs(unsigned int cpu, struct e9810_regs *r)
 	unsigned int phy = e9810_phycpu[cpu];
 
 	regmap_read(e9810_pmu, pmu_cpu_status[phy], &r->status);
+	regmap_read(e9810_pmu, PMU_CPU_CONFIG(phy), &r->config);
 	regmap_read(e9810_pmu, PMU_CPU_INFORM(phy), &r->inform);
 	regmap_read(e9810_pmu, PMU_EVENT_INT_EN_GRP2, &r->event_grp2);
 	r->grp1_en = readl(e9810_intr_gen + INTR_GEN_GRP1_ENABLE);
 	r->grp1_pend = readl(e9810_intr_gen + INTR_GEN_GRP1_PEND);
 	r->grp2_en = readl(e9810_intr_gen + INTR_GEN_GRP2_ENABLE);
 	r->grp2_pend = readl(e9810_intr_gen + INTR_GEN_GRP2_PEND);
+	r->stage = READ_ONCE(per_cpu(e9810_stage, cpu));
+}
+
+static const char *e9810_stage_str(u32 stage)
+{
+	return stage < ARRAY_SIZE(e9810_stage_name) ?
+		e9810_stage_name[stage] : "?";
 }
 
 static void e9810_log_regs(const char *tag, unsigned int cpu,
@@ -627,12 +811,169 @@ static void e9810_log_regs(const char *tag, unsigned int cpu,
 {
 	u32 bit = INTR_GEN_BIT(e9810_phycpu[cpu]);
 
-	pr_info("cpuidle selftest: %s cpu%u phy=%u status=%#x inform=%#x event_grp2=%#x(%d) grp1_en=%#x(%d) grp1_pend=%#x(%d) grp2_en=%#x(%d) grp2_pend=%#x(%d)\n",
-		tag, cpu, e9810_phycpu[cpu], r->status, r->inform,
+	pr_info("cpuidle selftest: %s cpu%u phy=%u stage=%s status=%#x config=%#x inform=%#x event_grp2=%#x(%d) grp1_en=%#x(%d) grp1_pend=%#x(%d) grp2_en=%#x(%d) grp2_pend=%#x(%d)\n",
+		tag, cpu, e9810_phycpu[cpu], e9810_stage_str(r->stage),
+		r->status, r->config, r->inform,
 		r->event_grp2, !!(r->event_grp2 & bit),
 		r->grp1_en, !!(r->grp1_en & bit), r->grp1_pend,
 		!!(r->grp1_pend & bit), r->grp2_en, !!(r->grp2_en & bit),
 		r->grp2_pend, !!(r->grp2_pend & bit));
+}
+
+static bool e9810_wait_answer(struct e9810_ping *p, unsigned int ms)
+{
+	u64 deadline = ktime_get_ns() + (u64)ms * NSEC_PER_MSEC;
+
+	while (!smp_load_acquire(&p->t_run)) {
+		if (ktime_get_ns() > deadline)
+			return false;
+		usleep_range(500, 1000);
+	}
+	return true;
+}
+
+struct e9810_cpu_on_req {
+	call_single_data_t csd;
+	u32 fn;
+	u64 mpidr;
+	unsigned long entry;
+	long ret;
+	bool done;
+};
+
+/* Runs on a healthy helper CPU, so CPU0 survives if EL3 blocks the call. */
+static void e9810_cpu_on_fn(void *info)
+{
+	struct e9810_cpu_on_req *r = info;
+	struct arm_smccc_res res;
+
+	arm_smccc_smc(r->fn, r->mpidr, r->entry, 0, 0, 0, 0, 0, &res);
+	r->ret = (long)(s32)res.a0;
+	smp_store_release(&r->done, true);
+}
+
+/*
+ * Try to bring back a CPU that does not answer IPIs after disarming.
+ * Returns the step that brought it back, or NULL. Every step is logged.
+ *  1. "ipi": another SGI (wake_up_if_idle() reschedule IPI) and a wait.
+ *  2. "pmu-on": if the PMU reports the core off, request power-on the way
+ *     4.9 exynos_cpu_up() and the APM core-on sequence do
+ *     (CONFIGURATION[3:0] = 0xf). The core then runs the EL3 warm-boot path,
+ *     which resumes it if EL3 still holds its CPU_SUSPEND state.
+ *  3. "psci-cpu-on": only if the marker says the core is inside the
+ *     firmware: PSCI CPU_ON(mpidr, cpu_resume) from a helper CPU. If EL3
+ *     still treats the core as suspended or on, it refuses (ALREADY_ON or
+ *     ON_PENDING) and nothing happens. If EL3 has it as off, the core
+ *     starts in cpu_resume, which restores the context this core saved in
+ *     __cpu_suspend_enter() before CPU_SUSPEND and returns from that call.
+ * Steps 2 and 3 cannot help a core that is stuck in kernel code (marker
+ * cal_cpu_disable / cal_cpu_enable / cpu_pm_exit); that is reported.
+ */
+static const char *e9810_recover(unsigned int cpu, struct e9810_ping *p,
+				 const struct cpumask *unhealthy)
+{
+	unsigned int phy = e9810_phycpu[cpu], helper;
+	struct e9810_cpu_on_req *req;
+	struct e9810_regs r;
+	u32 st;
+	u64 t0;
+
+	pr_warn("cpuidle selftest: recover cpu%u: step ipi\n", cpu);
+	wake_up_if_idle(cpu);
+	if (e9810_wait_answer(p, E9810_PING_TIMEOUT_MS))
+		return "ipi";
+
+	e9810_read_regs(cpu, &r);
+	e9810_log_regs("recover-ipi", cpu, &r);
+	if (r.stage != E9810_ST_FIRMWARE) {
+		pr_err("cpuidle selftest: recover cpu%u: stuck in kernel code at stage=%s (pmucal_cpu_lock %s); PMU/PSCI steps cannot help\n",
+		       cpu, e9810_stage_str(r.stage),
+		       cal_cpu_lock_is_held() ? "HELD" : "free");
+		return NULL;
+	}
+
+	if ((r.status & PMU_CPU_STATUS_ON) != PMU_CPU_STATUS_ON) {
+		pr_warn("cpuidle selftest: recover cpu%u: step pmu-on (config %#x -> LOCAL_PWR_CFG=0xf)\n",
+			cpu, r.config);
+		regmap_update_bits(e9810_pmu, PMU_CPU_CONFIG(phy),
+				   PMU_CPU_LOCAL_PWR_CFG, PMU_CPU_LOCAL_PWR_CFG);
+		t0 = ktime_get_ns();
+		do {
+			regmap_read(e9810_pmu, pmu_cpu_status[phy], &st);
+			if ((st & PMU_CPU_STATUS_ON) == PMU_CPU_STATUS_ON)
+				break;
+			usleep_range(100, 200);
+		} while (ktime_get_ns() - t0 < 20 * NSEC_PER_MSEC);
+		pr_warn("cpuidle selftest: recover cpu%u: pmu-on status=%#x after %llu us\n",
+			cpu, st, div_u64(ktime_get_ns() - t0, NSEC_PER_USEC));
+		wake_up_if_idle(cpu);
+		if (e9810_wait_answer(p, E9810_RECOVER_WAIT_MS))
+			return "pmu-on";
+		e9810_read_regs(cpu, &r);
+		e9810_log_regs("recover-pmu-on", cpu, &r);
+	}
+
+	if (!e9810_psci_cpu_on_fn) {
+		pr_err("cpuidle selftest: recover cpu%u: no PSCI CPU_ON function ID\n",
+		       cpu);
+		return NULL;
+	}
+	helper = nr_cpu_ids;
+	for_each_online_cpu(helper)
+		if (helper && !cpumask_test_cpu(helper, unhealthy))
+			break;
+	if (helper >= nr_cpu_ids) {
+		pr_err("cpuidle selftest: recover cpu%u: no healthy helper CPU for PSCI CPU_ON\n",
+		       cpu);
+		return NULL;
+	}
+	/* Never freed if the helper does not finish: it may still write. */
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return NULL;
+	req->fn = e9810_psci_cpu_on_fn;
+	req->mpidr = cpu_logical_map(cpu);
+	req->entry = __pa_symbol(cpu_resume);
+	INIT_CSD(&req->csd, e9810_cpu_on_fn, req);
+	pr_warn("cpuidle selftest: recover cpu%u: step psci-cpu-on fn=%#x mpidr=%#llx entry=cpu_resume@%#lx via cpu%u\n",
+		cpu, req->fn, req->mpidr, req->entry, helper);
+	if (smp_call_function_single_async(helper, &req->csd)) {
+		pr_err("cpuidle selftest: recover cpu%u: helper IPI busy\n", cpu);
+		return NULL;
+	}
+	t0 = ktime_get_ns();
+	while (!smp_load_acquire(&req->done) &&
+	       ktime_get_ns() - t0 < E9810_RECOVER_WAIT_MS * NSEC_PER_MSEC)
+		usleep_range(500, 1000);
+	if (!smp_load_acquire(&req->done)) {
+		pr_err("cpuidle selftest: recover cpu%u: helper cpu%u still inside PSCI CPU_ON after %d ms\n",
+		       cpu, helper, E9810_RECOVER_WAIT_MS);
+		return NULL;
+	}
+	/* PSCI: 0 ok, -4 ALREADY_ON, -5 ON_PENDING, -2 INVALID_PARAMS */
+	pr_warn("cpuidle selftest: recover cpu%u: PSCI CPU_ON returned %ld\n",
+		cpu, req->ret);
+	kfree(req);
+	wake_up_if_idle(cpu);
+	if (e9810_wait_answer(p, E9810_RECOVER_WAIT_MS))
+		return "psci-cpu-on";
+	e9810_read_regs(cpu, &r);
+	e9810_log_regs("recover-psci", cpu, &r);
+	return NULL;
+}
+
+/* Repeated so the last lines of the console (pmsg) still carry it. */
+static void e9810_lost_remind(struct work_struct *work)
+{
+	unsigned int cpu;
+
+	for_each_cpu(cpu, &e9810_lost)
+		pr_emerg("cpuidle: CPU-LOST cpu%u never came back from C2 (stage=%s); deep idle is off; a restart may hang until the CL0 watchdog resets the SoC\n",
+			 cpu, e9810_stage_str(READ_ONCE(per_cpu(e9810_stage,
+								cpu))));
+	if (++e9810_lost_reminders < E9810_LOST_REMINDERS)
+		queue_delayed_work_on(0, system_long_wq, &e9810_lost_work,
+				      msecs_to_jiffies(E9810_LOST_REMINDER_MS));
 }
 
 static void e9810_ping_fn(void *info)
@@ -706,9 +1047,12 @@ static void e9810_log_setup(void)
 		exynos9810_mct_bc_ready(), cpumask_pr_args(&e9810_armed));
 
 	for_each_possible_cpu(cpu)
-		pr_info("cpuidle selftest: cpu%u reg=%#llx live_mpidr=%#llx phycpu=%u cluster=%u\n",
+		pr_info("cpuidle selftest: cpu%u reg=%#llx live_mpidr=%#llx phycpu=%u cluster=%u hooks_reset=%u ret=%d\n",
 			cpu, cpu_logical_map(cpu), e9810_live_mpidr[cpu],
-			e9810_phycpu[cpu], e9810_cluster_of[cpu]);
+			e9810_phycpu[cpu], e9810_cluster_of[cpu],
+			per_cpu(e9810_hooks_reset, cpu),
+			per_cpu(e9810_hooks_ret, cpu));
+	pr_info("cpuidle selftest: psci cpu_on fn=%#x\n", e9810_psci_cpu_on_fn);
 
 	for (c = 0; c < E9810_NR_CLUSTERS; c++) {
 		struct e9810_cluster *cl = &e9810_clusters[c];
@@ -738,11 +1082,13 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 {
 	struct exynos9810_mct_bc_stats bc0, bc1;
 	unsigned int samples = 0, cpu;
+	struct cpumask unanswered;
 	const char *why = NULL;
 	u64 t_end;
 
 	*failed_cpu = UINT_MAX;
 	*entered_all = false;
+	cpumask_clear(&unanswered);
 
 	for_each_cpu(cpu, &ph->cpus) {
 		struct e9810_sleeper *s = &sl[cpu];
@@ -818,15 +1164,19 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 			usleep_range(50, 100);
 		}
 
+		/* Every CPU is checked, so all unanswered CPUs are named. */
 		for_each_cpu(cpu, &ph->cpus) {
 			struct e9810_ping *p = &pings[cpu];
 			u64 t_run = smp_load_acquire(&p->t_run), lat;
 			u64 hb = smp_load_acquire(&sl[cpu].heartbeat);
 
 			if (!t_run) {
-				*failed_cpu = cpu;
-				why = "IPI not answered within 100 ms";
-				break;
+				cpumask_set_cpu(cpu, &unanswered);
+				if (!why) {
+					*failed_cpu = cpu;
+					why = "IPI not answered within 100 ms";
+				}
+				continue;
 			}
 			lat = t_run > p->t_issue ? t_run - p->t_issue : 0;
 			p->answered++;
@@ -834,36 +1184,77 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 			p->lat_min = min(p->lat_min, lat);
 			p->lat_max = max(p->lat_max, lat);
 
-			if (ktime_get_ns() - hb >
+			if (!why && ktime_get_ns() - hb >
 			    (u64)E9810_SLEEPER_STALE_MS * NSEC_PER_MSEC) {
 				*failed_cpu = cpu;
 				why = "timer wakeup (broadcast) late by more than 250 ms";
-				break;
 			}
 			/* An armed GRP2 event would let the APM cut a running core. */
-			if (p->armed_seen) {
+			if (!why && p->armed_seen) {
 				*failed_cpu = cpu;
 				why = "C2 hooks found armed while the core was running";
-				break;
 			}
 		}
 	}
 
 	if (why) {
+		struct cpumask lost;
 		struct e9810_regs r;
 
 		/* Capture the stuck state before disarming changes it. */
-		e9810_read_regs(*failed_cpu, &r);
-		e9810_log_regs("FAIL-state", *failed_cpu, &r);
+		if (!cpumask_test_cpu(*failed_cpu, &unanswered)) {
+			e9810_read_regs(*failed_cpu, &r);
+			e9810_log_regs("FAIL-state", *failed_cpu, &r);
+		}
+		for_each_cpu(cpu, &unanswered) {
+			e9810_read_regs(cpu, &r);
+			e9810_log_regs("FAIL-state", cpu, &r);
+		}
+		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; unanswered=%*pbl pmucal_cpu_lock=%s\n",
+		       ph->name, *failed_cpu, why, cpumask_pr_args(&unanswered),
+		       cal_cpu_lock_is_held() ? "HELD" : "free");
 		e9810_disable_deep("selftest phase failed");
 		e9810_disarm_all();
 		msleep(E9810_RECHECK_MS);
-		e9810_read_regs(*failed_cpu, &r);
-		e9810_log_regs("after-disarm", *failed_cpu, &r);
-		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; after disarm the IPI %s\n",
+
+		cpumask_clear(&lost);
+		for_each_cpu(cpu, &unanswered) {
+			e9810_read_regs(cpu, &r);
+			e9810_log_regs("after-disarm", cpu, &r);
+			if (smp_load_acquire(&pings[cpu].t_run))
+				pr_warn("cpuidle selftest: cpu%u answered after disarm\n",
+					cpu);
+			else
+				cpumask_set_cpu(cpu, &lost);
+		}
+		for_each_cpu(cpu, &lost) {
+			const char *how = e9810_recover(cpu, &pings[cpu],
+							&unanswered);
+
+			if (how) {
+				pr_warn("cpuidle selftest: RECOVERED cpu%u via %s (stage now %s)\n",
+					cpu, how,
+					e9810_stage_str(READ_ONCE(per_cpu(e9810_stage,
+									  cpu))));
+				cpumask_clear_cpu(cpu, &lost);
+				continue;
+			}
+			e9810_read_regs(cpu, &r);
+			e9810_log_regs("LOST", cpu, &r);
+			pr_emerg("cpuidle selftest: CPU-LOST cpu%u NOT RECOVERED (ipi, pmu-on, psci-cpu-on tried as applicable); stage=%s pmucal_cpu_lock=%s; deep idle stays off\n",
+				 cpu, e9810_stage_str(r.stage),
+				 cal_cpu_lock_is_held() ? "HELD" : "free");
+		}
+		if (!cpumask_empty(&lost)) {
+			cpumask_or(&e9810_lost, &e9810_lost, &lost);
+			e9810_lost_reminders = 0;
+			queue_delayed_work_on(0, system_long_wq,
+					      &e9810_lost_work,
+					      msecs_to_jiffies(E9810_LOST_REMINDER_MS));
+		}
+		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; unanswered=%*pbl lost=%*pbl\n",
 		       ph->name, *failed_cpu, why,
-		       smp_load_acquire(&pings[*failed_cpu].t_run) ?
-		       "was answered" : "is still unanswered");
+		       cpumask_pr_args(&unanswered), cpumask_pr_args(&lost));
 	} else if (!e9810_keep_armed) {
 		e9810_disarm_all();
 	}
@@ -878,10 +1269,15 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 
 		if (sb->c2_resumed == sa->c2_resumed)
 			*entered_all = false;
-		pr_info("cpuidle selftest: phase %s cpu%u c2_enter=+%llu resumed=+%llu early=+%llu psci_fail=+%llu last_err=%d unarmed=+%llu wfi_fallback=+%llu | usage=+%llu time_ms=+%llu rejected=+%llu above=+%llu below=+%llu\n",
+		/* last_err is cumulative: only shown if it changed this phase. */
+		pr_info("cpuidle selftest: phase %s cpu%u c2_enter=+%llu resumed=+%llu early=+%llu psci_fail=+%llu last_err=%d stale_grp2=+%llu stage=%s unarmed=+%llu wfi_fallback=+%llu | usage=+%llu time_ms=+%llu rejected=+%llu above=+%llu below=+%llu\n",
 			ph->name, cpu, sb->c2_enter - sa->c2_enter,
 			sb->c2_resumed - sa->c2_resumed, sb->early - sa->early,
-			sb->psci_fail - sa->psci_fail, sb->last_err,
+			sb->psci_fail - sa->psci_fail,
+			(sb->psci_fail != sa->psci_fail ||
+			 sb->early != sa->early) ? sb->last_err : 0,
+			sb->stale_grp2 - sa->stale_grp2,
+			e9810_stage_str(READ_ONCE(per_cpu(e9810_stage, cpu))),
 			sb->unarmed - sa->unarmed,
 			sb->wfi_fallback - sa->wfi_fallback,
 			b[cpu].usage - a[cpu].usage,
@@ -931,7 +1327,7 @@ stop_sleepers:
 
 static void e9810_selftest(struct work_struct *work)
 {
-	struct e9810_phase phases[3];
+	struct e9810_phase phases[6];
 	struct e9810_snap *a, *b;
 	struct e9810_ping *pings;
 	struct e9810_sleeper *sl;
@@ -967,15 +1363,28 @@ static void e9810_selftest(struct work_struct *work)
 		e9810_read_regs(cpu, &r);
 		e9810_log_regs("before", cpu, &r);
 	}
+	/*
+	 * What the write-1-to-clear registers read back. PMUCAL clears them
+	 * with a read-modify-write; if they read back the pending bits, that
+	 * write would also clear other cores' events.
+	 */
+	if (e9810_intr_gen)
+		pr_info("cpuidle selftest: clear-register readback grp1_clr=%#x (grp1_pend=%#x) grp2_clr=%#x (grp2_pend=%#x)\n",
+			readl(e9810_intr_gen + INTR_GEN_GRP1_CLEAR),
+			readl(e9810_intr_gen + INTR_GEN_GRP1_PEND),
+			readl(e9810_intr_gen + INTR_GEN_GRP2_CLEAR),
+			readl(e9810_intr_gen + INTR_GEN_GRP2_PEND));
 
 	if (raw_smp_processor_id() != 0)
 		pr_warn("cpuidle selftest: running on cpu%d, expected cpu0\n",
 			raw_smp_processor_id());
 
 	/*
-	 * One LITTLE secondary, one BIG CPU, then every secondary. CPU0 owns
-	 * every SPI (GIC default affinity) and the MCT broadcast interrupt; it
-	 * is never armed here.
+	 * One LITTLE secondary, one BIG CPU, then growing groups: two and three
+	 * LITTLE cores, all BIG cores, every secondary. q22b failed on the
+	 * first concurrent phase, so the steps in between locate the
+	 * concurrency limit. CPU0 owns every SPI (GIC default affinity) and the
+	 * MCT broadcast interrupt; it is never armed here.
 	 */
 	phases[nphases].name = "little-1";
 	cpumask_clear(&phases[nphases].cpus);
@@ -983,6 +1392,20 @@ static void e9810_selftest(struct work_struct *work)
 	phases[nphases].name = "big-1";
 	cpumask_clear(&phases[nphases].cpus);
 	cpumask_set_cpu(4, &phases[nphases++].cpus);
+	phases[nphases].name = "little-2";
+	cpumask_clear(&phases[nphases].cpus);
+	cpumask_set_cpu(1, &phases[nphases].cpus);
+	cpumask_set_cpu(2, &phases[nphases++].cpus);
+	phases[nphases].name = "little-3";
+	cpumask_clear(&phases[nphases].cpus);
+	for (i = 1; i <= 3; i++)
+		cpumask_set_cpu(i, &phases[nphases].cpus);
+	nphases++;
+	phases[nphases].name = "big-4";
+	cpumask_clear(&phases[nphases].cpus);
+	for (i = 4; i <= 7; i++)
+		cpumask_set_cpu(i, &phases[nphases].cpus);
+	nphases++;
 	phases[nphases].name = "secondaries";
 	cpumask_copy(&phases[nphases].cpus, cpu_online_mask);
 	cpumask_clear_cpu(0, &phases[nphases++].cpus);
@@ -1027,9 +1450,10 @@ static void e9810_selftest(struct work_struct *work)
 		pr_info("cpuidle selftest: phase %s: PASS\n", phases[i].name);
 	}
 
-	pr_info("cpuidle selftest: done result=%s phases_passed=%u/%u%s%s deep_off=%d armed=%*pbl elapsed_ms=%llu\n",
+	pr_info("cpuidle selftest: done result=%s phases_passed=%u/%u%s%s deep_off=%d armed=%*pbl lost=%*pbl elapsed_ms=%llu\n",
 		result, passed, nphases, why ? " why=" : "", why ? why : "",
 		atomic_read(&e9810_deep_off), cpumask_pr_args(&e9810_armed),
+		cpumask_pr_args(&e9810_lost),
 		div_u64(ktime_get_ns() - t0, NSEC_PER_MSEC));
 
 	kfree(a);
@@ -1063,6 +1487,7 @@ static int e9810_cpuidle_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
 
+	INIT_DELAYED_WORK(&e9810_lost_work, e9810_lost_remind);
 	e9810_setup_why = e9810_setup(pdev);
 	if (e9810_setup_why)
 		pr_warn("deep idle not available, WFI only: %s\n",
