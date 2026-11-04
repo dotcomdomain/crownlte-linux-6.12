@@ -1314,6 +1314,18 @@ config MFD_RN5T618
 	  additional drivers must be enabled in order to use the
 	  functionality of the device.
 
+config MFD_S2MPS18_ACPM
+	bool "Samsung S2MPS18 PMIC over Exynos9810 ACPM (read-only core)"
+	depends on EXYNOS_ACPM && OF
+	select MFD_CORE
+	help
+	  Core driver for the Samsung S2MPS18 main PMIC of the Galaxy Note9
+	  (Exynos9810). Registers are reached through ACPM IPC channel 2; the
+	  APM firmware runs the SPEEDY transaction. The driver logs the chip
+	  id and instantiates the RTC cell. It registers no regulator and
+	  never writes the TOP or PMIC register blocks; RTC writes are
+	  possible only when the device tree opts in.
+
 config MFD_SEC_CORE
 	tristate "Samsung Electronics PMIC Series Support"
 	depends on I2C=y
