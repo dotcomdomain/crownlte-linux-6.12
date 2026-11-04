@@ -256,6 +256,38 @@
 			};
 		};
 
+		/*
+		 * Mali-G72 MP18 (Bifrost THEx), 4.9 crownlte mali@17500000. The
+		 * second window is CMU_G3D, read only (embedded G3D user mux).
+		 * Clock: ACPM vclk dvfs_g3d (CAL 0x0b040004, 4.9 g3d_cmu_cal_id);
+		 * the firmware picks vdd_g3d (S2MPS18 BUCK6). Power domain: PMU
+		 * embedded_g3d (cfg 0x14064040, status 0x14064044, CAL 0xb1380008)
+		 * is never switched by this driver. samsung,dvfs-table rows are the
+		 * 4.9 gpu_dvfs_table columns clock, min/max utilisation, down stay
+		 * count and MIF floor (kHz); samsung,interactive-info is the 4.9
+		 * interactive_info <highspeed clock, load, delay>.
+		 */
+		gpu: gpu@17500000 {
+			compatible = "samsung,exynos9810-mali", "arm,mali-bifrost";
+			reg = <0x17500000 0x5000>, <0x17400000 0x1000>;
+			interrupts = <GIC_SPI 282 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 281 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 283 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "JOB", "MMU", "GPU";
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			samsung,cal-id = <0x0b040004>;
+			samsung,dvfs-table = <572000 78 100 5 1794000>,
+					     <546000 78  99 1 1794000>,
+					     <455000 78  85 1 1539000>,
+					     <338000 78  85 1 1352000>,
+					     <299000 78  85 1 1014000>,
+					     <260000 78  85 1  421000>;
+			samsung,interactive-info = <338000 94 0>;
+			samsung,dvfs-period-ms = <30>;
+			#cooling-cells = <2>;
+			status = "disabled";
+		};
+
 		pinctrl_aud: pinctrl@17c60000 {
 			compatible = "samsung,exynos9810-pinctrl";
 			reg = <0x17c60000 0x1000>;
