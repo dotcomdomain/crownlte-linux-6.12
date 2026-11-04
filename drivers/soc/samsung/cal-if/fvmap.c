@@ -615,6 +615,9 @@ static int fvmap_validate(void __iomem *base)
 		struct clocks *clks;
 		struct vclk *vclk = cmucal_get_node(ACPM_VCLK_TYPE | i);
 		struct rate_volt_header *rates;
+		/* SRAM is mapped as device memory: unaligned accesses fault. */
+		if (h[i].o_ratevolt % sizeof(u32) || h[i].o_members % sizeof(u16))
+			return -EINVAL;
 		if (i < FVMAP_MAX_DOMAINS && vclk && !vclk_get_lv_num(ACPM_VCLK_TYPE | i) &&
 		    h[i].num_of_lv <= 48 &&
 		    h[i].o_ratevolt + h[i].num_of_lv * sizeof(struct rate_volt) <= FVMAP_SIZE) {
@@ -636,7 +639,8 @@ static int fvmap_validate(void __iomem *base)
 				return -EPROTO;
 		clks = (struct clocks *)(base + h[i].o_members);
 		for (j = 0; j < h[i].num_of_pll; j++)
-			if (clks->addr[j] + sizeof(struct pll_header) > FVMAP_SIZE)
+			if (clks->addr[j] % sizeof(u32) ||
+			    clks->addr[j] + sizeof(struct pll_header) > FVMAP_SIZE)
 				return -EINVAL;
 	}
 	return 0;
@@ -645,7 +649,6 @@ static int fvmap_validate(void __iomem *base)
 int fvmap_init(void __iomem *sram_base)
 {
 	void __iomem *map_base;
-	struct kobject *kobj;
 
 	int ret;
 	if (smp_load_acquire(&fvmap_ready))
@@ -662,22 +665,14 @@ int fvmap_init(void __iomem *sram_base)
 	pr_info("%s:fvmap initialize %pK\n", __func__, sram_base);
 	fvmap_copy_from_sram(map_base, sram_base);
 
-	/* percent margin for each doamin at runtime */
-	kobj = kobject_create_and_add("percent_margin", power_kobj);
-	if (!kobj) {
-		ret = -ENOMEM;
-		goto fail;
-	}
-	ret = sysfs_create_group(kobj, &percent_margin_group);
-	if (ret) {
-		kobject_put(kobj);
-		goto fail;
-	}
+	/*
+	 * 4.9 also created /sys/power/percent_margin here. Its store sends
+	 * MARGIN_REQ with the full vclk id, whose top byte lands on the DP_D/DP_A
+	 * plugin-command bits of word 0, and passes a percentage as microvolts.
+	 * Not exposed until that encoding is reworked; boot-time margins above
+	 * are unaffected.
+	 */
+	(void)percent_margin_group;
 	smp_store_release(&fvmap_ready, true);
 	return 0;
-fail:
-	fvmap_base = NULL;
-	sram_fvmap_base = NULL;
-	kfree(map_base);
-	return ret;
 }
