@@ -384,7 +384,15 @@ CONFIG_PRINTK_TIME=y
 # CONFIG_PM_DEVFREQ_EVENT is not set
 # CONFIG_INTERCONNECT is not set
 # CONFIG_IOMMU_SUPPORT is not set
-# CONFIG_WATCHDOG is not set
+# Exynos9810 CL0 watchdog (guarded s3c2410 variant): kernel pings until
+# userspace opens it, so a hung kernel resets to the normal BOOT image.
+CONFIG_WATCHDOG=y
+CONFIG_WATCHDOG_CORE=y
+CONFIG_WATCHDOG_HANDLE_BOOT_ENABLED=y
+CONFIG_WATCHDOG_OPEN_TIMEOUT=0
+CONFIG_WATCHDOG_SYSFS=y
+# CONFIG_WATCHDOG_NOWAYOUT is not set
+CONFIG_S3C2410_WATCHDOG=y
 # Generic reset/poweroff drivers would take over the syscon-reboot/poweroff
 # nodes from the hardware-verified crownlte diagnostic restart path:
 # CONFIG_POWER_RESET_SYSCON is not set
