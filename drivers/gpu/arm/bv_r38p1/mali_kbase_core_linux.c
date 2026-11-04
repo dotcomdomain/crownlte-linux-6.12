@@ -95,6 +95,7 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/mm.h>
 #include <linux/compat.h>	/* is_compat_task/in_compat_syscall */
 #include <linux/mman.h>
@@ -431,6 +432,20 @@ static struct kbase_device *to_kbase_device(struct device *dev)
 
 int assign_irqs(struct kbase_device *kbdev)
 {
+	/*
+	 * Since Linux 5.16 the OF core no longer creates IORESOURCE_IRQ
+	 * resources for platform devices, so the DDK's platform_get_resource()
+	 * walk finds nothing. Look the three lines up by their DT names
+	 * ("JOB", "MMU", "GPU") and take the trigger type from the mapping.
+	 */
+	static const struct {
+		const char *name;
+		int tag;
+	} lines[] = {
+		{ "JOB", JOB_IRQ_TAG },
+		{ "MMU", MMU_IRQ_TAG },
+		{ "GPU", GPU_IRQ_TAG },
+	};
 	struct platform_device *pdev;
 	int i;
 
@@ -438,34 +453,17 @@ int assign_irqs(struct kbase_device *kbdev)
 		return -ENODEV;
 
 	pdev = to_platform_device(kbdev->dev);
-	/* 3 IRQ resources */
-	for (i = 0; i < 3; i++) {
-		struct resource *irq_res;
-		int irqtag;
+	for (i = 0; i < ARRAY_SIZE(lines); i++) {
+		int irq = platform_get_irq_byname(pdev, lines[i].name);
 
-		irq_res = platform_get_resource(pdev, IORESOURCE_IRQ, i);
-		if (!irq_res) {
-			dev_err(kbdev->dev, "No IRQ resource at index %d\n", i);
-			return -ENOENT;
+		if (irq < 0) {
+			dev_err(kbdev->dev, "no %s interrupt (%d)\n",
+				lines[i].name, irq);
+			return irq;
 		}
-
-#if IS_ENABLED(CONFIG_OF)
-		if (!strncasecmp(irq_res->name, "JOB", 4)) {
-			irqtag = JOB_IRQ_TAG;
-		} else if (!strncasecmp(irq_res->name, "MMU", 4)) {
-			irqtag = MMU_IRQ_TAG;
-		} else if (!strncasecmp(irq_res->name, "GPU", 4)) {
-			irqtag = GPU_IRQ_TAG;
-		} else {
-			dev_err(&pdev->dev, "Invalid irq res name: '%s'\n",
-				irq_res->name);
-			return -EINVAL;
-		}
-#else
-		irqtag = i;
-#endif /* CONFIG_OF */
-		kbdev->irqs[irqtag].irq = irq_res->start;
-		kbdev->irqs[irqtag].flags = irq_res->flags & IRQF_TRIGGER_MASK;
+		kbdev->irqs[lines[i].tag].irq = irq;
+		kbdev->irqs[lines[i].tag].flags =
+			irq_get_trigger_type(irq) & IRQF_TRIGGER_MASK;
 	}
 
 	return 0;
