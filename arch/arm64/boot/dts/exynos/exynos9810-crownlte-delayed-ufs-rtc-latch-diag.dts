@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * RTC READ-LATCH TRIAL - allows exactly one PMIC write per RTC time read.
+ *
+ * Identical to exynos9810-crownlte-delayed-ufs-diag, except that the
+ * S2MPS18 RTC may write RTC UPDATE = base | RUDR before each time read, as
+ * 4.9 rtc-s2mps18.c does, so reads return the live clock. Expected:
+ * "pmic selftest: rtc advance" of about 1 s and a sane system realtime.
+ * No time/alarm writes (samsung,rtc-write-enable stays off).
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + RTC read latch";
+};
+
+&s2mps18_pmic {
+	samsung,rtc-read-latch;
+};

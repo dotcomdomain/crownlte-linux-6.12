@@ -20,3 +20,4 @@ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-diag.dtb
 
 # Deliberately resets the phone at ~115 s (watchdog expiry selftest)
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-wdt-selftest-diag.dtb
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-rtc-latch-diag.dtb
