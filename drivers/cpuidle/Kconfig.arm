@@ -43,6 +43,26 @@ config ARM_PSCI_CPUIDLE_DOMAIN
 	  which is needed to support the hierarchical DT based layout of the
 	  idle states.
 
+config ARM_EXYNOS9810_CPUIDLE
+	bool "Exynos 9810 WFI and core power-down (C2) idle driver"
+	depends on ARM64 && ARM_PSCI_FW && CPU_PM && OF
+	depends on EXYNOS9810_LEGACY_CAL
+	depends on !PREEMPT_RT
+	select CPU_IDLE_MULTIPLE_DRIVERS
+	select DT_IDLE_STATES
+	select MFD_SYSCON
+	help
+	  Per-cluster CPU idle driver for the Exynos 9810. Besides the PSCI
+	  CPU_SUSPEND call it runs the FlexPMU steps of the vendor 4.9
+	  kernel (PMUCAL cal_cpu_disable()/cal_cpu_enable()), which tell
+	  the APM firmware to power the core down and back up. The generic
+	  PSCI idle driver does not do this.
+
+	  C2 starts disarmed on every CPU. It is armed per CPU by the
+	  DT-gated self-test or the samsung,c2-boot-cpus DT property, and
+	  only while the EXYNOS9810_MCT_BROADCAST tick broadcast device is
+	  active. Any setup or runtime failure leaves the CPUs in WFI.
+
 config ARM_BIG_LITTLE_CPUIDLE
 	bool "Support for ARM big.LITTLE processors"
 	depends on ARCH_VEXPRESS_TC2_PM || ARCH_EXYNOS || COMPILE_TEST
