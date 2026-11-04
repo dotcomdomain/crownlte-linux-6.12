@@ -312,3 +312,16 @@
 	samsung,decon-trigger = "hw-te";
 	samsung,display-selftest;
 };
+
+/*
+ * Trustonic TEE: driver init only, as 4.9 does at boot before userspace
+ * (Documentation/crownlte/trustonic-tee.md). The diagnostic PID1 never opens
+ * /dev/mobicore*, so no TA/driver is loaded and no secure storage is used.
+ * "tee selftest:" at ~110 s reports what init already did; it issues no SMC
+ * and no MCP command of its own.
+ */
+&trustonic_tee {
+	samsung,tee-selftest;
+	samsung,tee-selftest-ms = <110000>;
+	status = "okay";
+};
