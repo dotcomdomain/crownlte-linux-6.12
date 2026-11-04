@@ -18,10 +18,13 @@
  * thing that is needed: it routes D+/D- to the AP, and repeats that whenever
  * VBUS reappears.
  */
+#include <linux/atomic.h>
 #include <linux/delay.h>
+#include <linux/export.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/soc/samsung/exynos9810-max77705-muic.h>
 #include <linux/workqueue.h>
 
 #define REG_UIC_HW_REV		0x00
@@ -68,6 +71,19 @@ MODULE_PARM_DESC(path, "CONTROL1 switch value to apply (0x09 USB, 0x3f open, -1 
 static int s9p_muic_poll_ms = 2000;
 module_param_named(poll_ms, s9p_muic_poll_ms, int, 0644);
 
+/*
+ * Every I2C write this driver issues (the CONTROL1 opcode = one block write
+ * to AP_DATAOUT0 plus one byte write to AP_DATAOUT32) is counted, so that the
+ * read-only battery monitor can report all MAX77705 writes since boot.
+ */
+static atomic_t s9p_muic_writes = ATOMIC_INIT(0);
+
+int exynos9810_max77705_muic_write_count(void)
+{
+	return atomic_read(&s9p_muic_writes);
+}
+EXPORT_SYMBOL_GPL(exynos9810_max77705_muic_write_count);
+
 struct s9p_muic {
 	struct i2c_client *client;
 	struct delayed_work work;
@@ -111,12 +127,15 @@ static int muic_opcode_write(struct s9p_muic *m, u8 opcode, const u8 *data,
 	buf[0] = opcode;
 	if (len)
 		memcpy(buf + 1, data, len);
+	atomic_inc(&s9p_muic_writes);
 	ret = i2c_smbus_write_i2c_block_data(m->client, REG_AP_DATAOUT0,
 					     len + 1, buf);
 	if (ret < 0)
 		return ret;
-	if (len < 32)
+	if (len < 32) {
+		atomic_inc(&s9p_muic_writes);
 		ret = i2c_smbus_write_byte_data(m->client, REG_AP_DATAOUT32, 0);
+	}
 	return ret < 0 ? ret : 0;
 }
 
