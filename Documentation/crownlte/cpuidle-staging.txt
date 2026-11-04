@@ -113,6 +113,14 @@ Stage B: stage A + cpuidle driver, C2 registered but disarmed
   result=SKIPPED: something refused arming, such as "MCT tick broadcast not
   active".
 
+Stage B result (q22b) and stage B2 (crownlte-integration-idle-c, trial q40)
+  q22b: little-1 and big-1 PASS; "secondaries" lost cpu1 and cpu3. The
+  bootloader leaves every core's C2 hooks dirty, and 4.9 resets them per
+  CPU at online. Stage B2 does the same, adds the per-CPU stage marker,
+  lost-CPU recovery and four intermediate phases (little-2, little-3,
+  big-4). Analysis and the q40 reading guide are in
+  Documentation/crownlte/cpuidle-secondaries-q22b.md.
+
 Stage C: C2 at boot (only after stage B passed, ideally twice)
   C1: samsung,c2-boot-cpus = <0xfe> (secondaries from probe; CPU0 still WFI)
       plus samsung,cpuidle-selftest-keep-armed, if the self-test should run
