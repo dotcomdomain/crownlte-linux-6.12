@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: GPL-2.0
+source "drivers/gpu/arm/bv_r38p1/Kconfig"

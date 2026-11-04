@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Exynos9810 (crownlte) platform layer, included from ../bv_r38p1/Kbuild.
+
+ccflags-y += -I$(srctree)/include/uapi/gpu/arm/exynos
+
+mali_kbase-y += \
+	../exynos9810/mali_exynos9810_platform.o \
+	../exynos9810/mali_exynos9810_dvfs.o \
+	../exynos9810/mali_exynos9810_entrypoint.o \
+	../exynos9810/mali_exynos9810_selftest.o
