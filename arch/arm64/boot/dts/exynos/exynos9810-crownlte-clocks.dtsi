@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Actual crownlte live DT resources. Disabled until firmware bring-up. */
 / {
+	/*
+	 * S2MPS18 main PMIC (4.9: speedy@141C0000/s2mps18mfd@00 with
+	 * acpm-ipc-channel = <2>). Every register access is an ACPM channel-2
+	 * request; the APM firmware drives SPEEDY. Read-only unless
+	 * samsung,rtc-read-latch / samsung,rtc-write-enable open the RTC block
+	 * (never TOP/PMIC). PMIC IRQ = gpa0-1 (4.9 s2mps18,irq-gpio), unused.
+	 */
+	s2mps18_pmic: s2mps18-pmic {
+		compatible = "samsung,exynos9810-s2mps18-acpm";
+		acpm-ipc-channel = <2>;
+		status = "disabled";
+	};
 	/* Original crownlte S2MPS18 firmware transport channel, not an I2C device. */
 	legacy_acpm_pmic: acpm-pmic-client {
 		compatible = "samsung,exynos9810-acpm-pmic-client";

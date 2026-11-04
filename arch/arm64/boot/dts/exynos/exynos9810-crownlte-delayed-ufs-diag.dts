@@ -289,3 +289,14 @@
 
 /* SMP bring-up test: all eight CPUs */
 &{/chosen} { bootargs = "panic=30 ro"; };
+
+/*
+ * S2MPS18 PMIC + RTC, first trial read-only: no samsung,rtc-read-latch and
+ * no samsung,rtc-write-enable, so the transport write policy is sealed empty
+ * and nothing is written to the PMIC. The self-test at ~106 s logs the chip
+ * id, status and regulator registers and two RTC reads 1 s apart.
+ */
+&s2mps18_pmic {
+	samsung,pmic-selftest;
+	status = "okay";
+};
