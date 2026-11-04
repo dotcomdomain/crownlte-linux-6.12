@@ -18,3 +18,11 @@ config FB_EXYNOS9810_DPU
 	  through the DPP channels for physically contiguous buffers.
 	  It does not control panel power, clocks or timing.
 	  See Documentation/crownlte/display-port.md.
+
+config FB_EXYNOS9810_PANEL_RO
+	bool "Read-only \"panel\" backlight for the Galaxy Note9"
+	depends on OF && BACKLIGHT_CLASS_DEVICE=y
+	help
+	  Registers the backlight class device "panel" that the vendor
+	  light HAL expects, mirroring the bootloader brightness and refusing
+	  changes until the S6E3HA8 panel driver is ported.
