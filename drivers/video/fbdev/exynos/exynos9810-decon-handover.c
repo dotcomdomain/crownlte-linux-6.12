@@ -8,6 +8,19 @@
  * analysis: DPP IDMA_IN_BASE_ADDR_Y = 0xcc000000, IN_CON format 0, SRC and
  * IMG size 1440x2960, offset 0). simplefb draws into that buffer.
  *
+ * Register banks (4.9 DT dpp@... reg[0]/[1], dpp_drv.c dpp_init_resources(),
+ * SBoot DPP init raw 0x100904): each DPP channel n has TWO 4 KiB blocks:
+ *   DPP  0x16021000 + n*0x1000  (dpp_read):  ENABLE, IRQ, IN_CON (DPP fmt,
+ *        alpha sel), IMG_SIZE 0x18, CSC, scaler; no address registers;
+ *   IDMA 0x16071000 + n*0x1000  (dma_read):  ENABLE, IRQ, IN_CON (IDMA fmt
+ *        [15:11], rotation, AFBC, block), SRC_SIZE 0x10, SRC_OFFSET 0x14,
+ *        IMG_SIZE 0x18, IN_BASE_ADDR_Y 0x40.
+ * SBoot writes the base address to IDMA+0x40 (raw 0x100d64). Trial q25
+ * read the DPP block for everything and got IMG right (both blocks have
+ * IMG_SIZE at 0x18) but IN_CON/SRC/BASE = 0, so the scanout was never
+ * verified. The IDMA registers now come from the "dpp-dma" resource and the
+ * DPP block is only read to cross-check IMG_SIZE.
+ *
  * On a command-mode panel new pixels only reach the panel GRAM when DECON
  * transfers a frame. With trig_mode = HW (4.9 DT decon_f), DECON transfers
  * one frame per TE pulse while HW_TRIG_EN is set and HW_TRIG_MASK_DECON is
@@ -75,17 +88,26 @@
 #define DECON_SHADOW_OFFSET		0x7000
 #define DECON_MAX_WIN			6
 
-/* DPP IDMA channels: G0 at 0x16021000, then G1, VG0, VG1, VGF0, VGF1 */
+/*
+ * Channels G0, G1, VG0, VG1, VGF0, VGF1 (alias dpp0..5), 0x1000 apart.
+ * IDMA block ("dpp-dma", 0x16071000), 4.9 regs-dpp.h IDMA_*:
+ */
 #define DPP_STRIDE			0x1000
 #define DPP_NR				6
 #define IDMA_ENABLE			0x0000
 #define IDMA_IN_CON			0x0008
 #define  IDMA_IN_FMT(v)			(((v) >> 11) & 0x1f)
 #define  IDMA_IN_FMT_ARGB8888		0
+#define  IDMA_IN_ROT_MASK		(7 << 8)
+#define  IDMA_IN_AFBC_EN		BIT(7)
+#define  IDMA_IN_BLOCK_EN		BIT(3)
 #define IDMA_SRC_SIZE			0x0010	/* h [29:16], w [15:0] */
 #define IDMA_SRC_OFFSET			0x0014
 #define IDMA_IMG_SIZE			0x0018	/* h [28:16], w [12:0] */
 #define IDMA_IN_BASE_ADDR_Y		0x0040
+/* DPP block ("dpp", 0x16021000), 4.9 regs-dpp.h DPP_*: */
+#define DPP_IN_CON			0x0008
+#define DPP_IMG_SIZE			0x0018	/* h [28:16], w [12:0] */
 
 /* DPU SysMMUs (4.9 sysmmu_dpu0..2), non-secure SFRs, 4.9 exynos-iommu.h */
 #define SYSMMU_NR			3
@@ -116,6 +138,7 @@ struct ho_dev {
 	struct device *dev;
 	void __iomem *decon;
 	void __iomem *dpp;
+	void __iomem *dma;	/* IDMA block; NULL: old DT, never verified */
 	void __iomem *sysmmu[SYSMMU_NR];
 	struct regmap *pmu;
 	struct device_node *fb_np;
@@ -150,6 +173,11 @@ static u32 ho_rd(struct ho_dev *ho, u32 off)
 static u32 ho_dpp_rd(struct ho_dev *ho, int dpp, u32 off)
 {
 	return readl(ho->dpp + dpp * DPP_STRIDE + off);
+}
+
+static u32 ho_dma_rd(struct ho_dev *ho, int dpp, u32 off)
+{
+	return readl(ho->dma + dpp * DPP_STRIDE + off);
 }
 
 /*
@@ -190,7 +218,7 @@ static bool ho_survey(struct ho_dev *ho, const char *pfx)
 
 	ho->scan_dpp = -1;
 	for (w = 0; w < DECON_MAX_WIN; w++) {
-		u32 ch, dpp, en, in, src, img, off, base;
+		u32 ch, dpp, en, in, src, img, off, base, d_en, d_in, d_img;
 
 		if (!(dp0 & BIT(4 * w)))
 			continue;
@@ -201,23 +229,45 @@ static bool ho_survey(struct ho_dev *ho, const char *pfx)
 			continue;
 		}
 		dpp = decon_ch_to_dpp[ch];
-		en = ho_dpp_rd(ho, dpp, IDMA_ENABLE);
-		in = ho_dpp_rd(ho, dpp, IDMA_IN_CON);
-		src = ho_dpp_rd(ho, dpp, IDMA_SRC_SIZE);
-		img = ho_dpp_rd(ho, dpp, IDMA_IMG_SIZE);
-		off = ho_dpp_rd(ho, dpp, IDMA_SRC_OFFSET);
-		base = ho_dpp_rd(ho, dpp, IDMA_IN_BASE_ADDR_Y);
-		pr_info("%swin%d -> ch%u dpp%u(%s): ENABLE=%#x IN_CON=%#x (fmt %u) SRC=%ux%u IMG=%ux%u OFF=%u,%u BASE=%#010x\n",
+		d_en = ho_dpp_rd(ho, dpp, 0);
+		d_in = ho_dpp_rd(ho, dpp, DPP_IN_CON);
+		d_img = ho_dpp_rd(ho, dpp, DPP_IMG_SIZE);
+		pr_info("%swin%d -> ch%u dpp%u(%s): DPP ENABLE=%#x IN_CON=%#x IMG=%ux%u\n",
+			pfx, w, ch, dpp, dpp_names[dpp], d_en, d_in,
+			d_img & 0x1fff, (d_img >> 16) & 0x1fff);
+		if (!ho->dma) {
+			pr_info("%swin%d: no \"dpp-dma\" (IDMA) resource in DT; scanout cannot be verified\n",
+				pfx, w);
+			continue;
+		}
+		en = ho_dma_rd(ho, dpp, IDMA_ENABLE);
+		in = ho_dma_rd(ho, dpp, IDMA_IN_CON);
+		src = ho_dma_rd(ho, dpp, IDMA_SRC_SIZE);
+		img = ho_dma_rd(ho, dpp, IDMA_IMG_SIZE);
+		off = ho_dma_rd(ho, dpp, IDMA_SRC_OFFSET);
+		base = ho_dma_rd(ho, dpp, IDMA_IN_BASE_ADDR_Y);
+		pr_info("%swin%d -> ch%u dpp%u(%s): IDMA ENABLE=%#x IN_CON=%#x (fmt %u rot %u afbc %u blk %u) SRC=%ux%u IMG=%ux%u OFF=%u,%u BASE=%#010x\n",
 			pfx, w, ch, dpp, dpp_names[dpp], en, in, IDMA_IN_FMT(in),
+			(in & IDMA_IN_ROT_MASK) >> 8, !!(in & IDMA_IN_AFBC_EN),
+			!!(in & IDMA_IN_BLOCK_EN),
 			src & 0xffff, (src >> 16) & 0x3fff,
 			img & 0x1fff, (img >> 16) & 0x1fff,
 			off & 0x1fff, (off >> 16) & 0x1fff, base);
+		/*
+		 * Linear, unrotated ARGB8888 of exactly the simplefb buffer;
+		 * the DPP block must agree on the image size (both banks are
+		 * programmed with the same size by SBoot and 4.9 for an
+		 * unscaled window), which also catches swapped banks.
+		 */
 		if (base == ho->fb_base &&
 		    IDMA_IN_FMT(in) == IDMA_IN_FMT_ARGB8888 &&
+		    !(in & (IDMA_IN_ROT_MASK | IDMA_IN_AFBC_EN |
+			    IDMA_IN_BLOCK_EN)) &&
 		    (src & 0xffff) * 4 == ho->fb_stride &&
 		    ((src >> 16) & 0x3fff) >= ho->fb_h &&
 		    (img & 0x1fff) == ho->fb_w &&
-		    ((img >> 16) & 0x1fff) == ho->fb_h && off == 0) {
+		    ((img >> 16) & 0x1fff) == ho->fb_h && off == 0 &&
+		    (d_img & 0x1fff1fff) == (img & 0x1fff1fff)) {
 			match = true;
 			ho->scan_dpp = dpp;
 		}
@@ -627,6 +677,15 @@ static int ho_probe(struct platform_device *pdev)
 	if (IS_ERR(ho->dpp)) {
 		ret = PTR_ERR(ho->dpp);
 		goto err_put;
+	}
+	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "dpp-dma")) {
+		ho->dma = devm_platform_ioremap_resource_byname(pdev, "dpp-dma");
+		if (IS_ERR(ho->dma)) {
+			ret = PTR_ERR(ho->dma);
+			goto err_put;
+		}
+	} else {
+		pr_warn(HO_PFX "DT has no \"dpp-dma\" (IDMA 0x16071000) resource: read-only, trigger never written\n");
 	}
 	for (i = 0; i < SYSMMU_NR; i++) {
 		char name[8];
