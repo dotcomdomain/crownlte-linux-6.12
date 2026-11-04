@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Samsung Exynos display (fbdev)
+#
+
+config FB_EXYNOS9810_DECON_HANDOVER
+	bool "Exynos9810 DECON-F boot scanout handover (simplefb helper)"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on FB_SIMPLE=y && OF && MFD_SYSCON
+	select FONT_SUPPORT
+	help
+	  Helper for a simple-framebuffer that points at the buffer the
+	  Exynos9810 bootloader (Galaxy S9/Note9 SBoot) leaves DECON-F
+	  scanning out. It reads and logs the DECON/DPP state, and when the
+	  device tree asks for it, enables the DECON TE trigger so that a
+	  MIPI command-mode panel receives the new frame contents. It can
+	  also draw a delayed on-screen self-test pattern.
+
+	  It never changes clocks, power, panel or timing settings.
