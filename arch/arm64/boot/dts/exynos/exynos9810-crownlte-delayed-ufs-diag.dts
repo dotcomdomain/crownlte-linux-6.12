@@ -312,3 +312,15 @@
 	samsung,decon-trigger = "hw-te";
 	samsung,display-selftest;
 };
+
+/*
+ * MAX77705 read-only battery monitor: "battery", "ac", "usb" and "wireless"
+ * power supplies plus the tripless "battery" thermal zone, from I2C reads
+ * only. The self-test at ~107 s ("battery selftest:") logs SOC, voltage,
+ * current, temperature, charger state and online source, and checks that the
+ * FG and charger configuration registers are unchanged since probe.
+ */
+&max77705_battery {
+	samsung,selftest-ms = <107000>;
+	status = "okay";
+};
