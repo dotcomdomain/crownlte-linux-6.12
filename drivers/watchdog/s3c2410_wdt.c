@@ -15,6 +15,7 @@
 #include <linux/types.h>
 #include <linux/timer.h>
 #include <linux/watchdog.h>
+#include <linux/reboot.h>
 #include <linux/platform_device.h>
 #include <linux/interrupt.h>
 #include <linux/clk.h>
@@ -247,6 +248,9 @@ struct s3c2410_wdt {
 	/* Opt-in expiry selftest (QUIRK_SBOOT_RESET_GUARD variants only) */
 	struct delayed_work	selftest_work;
 	bool			selftest_stopped;
+	/* Restart in progress: armed with a short timeout, no longer petted */
+	struct notifier_block	reboot_nb;
+	bool			reboot_pending;
 };
 
 static const struct s3c2410_wdt_variant drv_data_s3c2410 = {
@@ -519,7 +523,7 @@ static int s3c2410wdt_keepalive(struct watchdog_device *wdd)
 
 	spin_lock_irqsave(&wdt->lock, flags);
 	/* The opt-in selftest deliberately stops petting to prove expiry. */
-	if (!wdt->selftest_stopped)
+	if (!wdt->reboot_pending && !wdt->selftest_stopped)
 		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
 	spin_unlock_irqrestore(&wdt->lock, flags);
 
@@ -1021,6 +1025,9 @@ static int s3c2410wdt_selftest_setup(struct s3c2410_wdt *wdt)
 	return 0;
 }
 
+static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
+				    unsigned long action, void *data);
+
 static int s3c2410wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1144,6 +1151,14 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	if (wdt->drv_data->quirks & QUIRK_KEEP_RUNNING_ON_SHUTDOWN) {
+		wdt->reboot_nb.notifier_call = s3c2410wdt_reboot_notify;
+		wdt->reboot_nb.priority = INT_MAX;	/* before anything that may hang */
+		ret = devm_register_reboot_notifier(dev, &wdt->reboot_nb);
+		if (ret)
+			return ret;
+	}
+
 	ret = s3c2410wdt_enable(wdt, true);
 	if (ret < 0)
 		return ret;
@@ -1178,6 +1193,36 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 	}
 
 	return 0;
+}
+
+/*
+ * QUIRK_KEEP_RUNNING_ON_SHUTDOWN: a restart that hangs before it reaches the
+ * reset (trial q22b: a CPU lost in C2 kept the reboot from completing while
+ * the kernel kept petting) must still end in a reset. At the very start of a
+ * restart, set a short timeout, pet once, then stop petting for good. Power
+ * off is left alone so a slow power-off is never turned into a reboot.
+ */
+#define S3C2410_WDT_RESTART_TIMEOUT	30
+
+static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
+				    unsigned long action, void *data)
+{
+	struct s3c2410_wdt *wdt = container_of(nb, struct s3c2410_wdt, reboot_nb);
+	unsigned long flags;
+
+	if (action != SYS_RESTART)
+		return NOTIFY_DONE;
+	if (!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
+		return NOTIFY_DONE;
+
+	s3c2410wdt_set_heartbeat(&wdt->wdt_device, S3C2410_WDT_RESTART_TIMEOUT);
+	spin_lock_irqsave(&wdt->lock, flags);
+	writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	wdt->reboot_pending = true;
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	dev_info(wdt->dev, "restart: armed for %u s and no longer petted\n",
+		 wdt->wdt_device.timeout);
+	return NOTIFY_DONE;
 }
 
 static void s3c2410wdt_shutdown(struct platform_device *dev)
