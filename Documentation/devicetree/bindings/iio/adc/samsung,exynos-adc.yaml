@@ -18,6 +18,7 @@ properties:
           - samsung,exynos3250-adc
           - samsung,exynos4212-adc                # Exynos4212 and Exynos4412
           - samsung,exynos7-adc
+          - samsung,exynos9810-adc               # 12 channels, CMGP
           - samsung,s3c2410-adc
           - samsung,s3c2416-adc
           - samsung,s3c2440-adc
@@ -61,6 +62,11 @@ properties:
     description:
       Phandle to the PMU system controller node (to access the ADC_PHY
       register on Exynos3250/4x12/5250/5420/5800).
+
+  samsung,adc-selftest-ms:
+    description:
+      Diagnostic only. Boot time in ms at which every channel is converted
+      five times and the raw codes are logged ("adc selftest:").
 
   has-touchscreen:
     description:
