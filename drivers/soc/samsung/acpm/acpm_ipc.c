@@ -1310,6 +1310,10 @@ int acpm_ipc_copy_firmware_snapshot(struct device *framework,
 		ret = acpm_snapshot_name(ipc, descriptor.fw_name, entry->name);
 		if (ret)
 			goto failed_plugin;
+		dev_info(ipc->dev, "ACPM plugin index=%u id=%u base=%#x size=%#x attached=%u stay=%u name=%.*s\n",
+			 i, descriptor.id, descriptor.base_addr, descriptor.size,
+			 descriptor.is_attached, descriptor.stay_attached,
+			 (int)ACPM_PLUGIN_NAME_SIZE, entry->name);
 		if (entry->attached &&
 		    !acpm_sram_range(entry->base, entry->bytes)) {
 			ret = -EPROTO;
@@ -1386,6 +1390,25 @@ static bool acpm_sram_overlap(u64 a, u64 a_bytes, u64 b, u64 b_bytes)
 	return a_bytes && b_bytes && a < b + b_bytes && b < a + a_bytes;
 }
 
+/* True only if every byte of [offset, offset + bytes) reads back as zero. */
+static bool acpm_sram_all_zero(struct acpm_ipc_info *ipc, u32 offset, u32 bytes)
+{
+	u32 chunk[16];
+	u32 pos, i;
+
+	for (pos = 0; pos < bytes; pos += sizeof(chunk)) {
+		u32 n = min_t(u32, sizeof(chunk), bytes - pos);
+
+		memset(chunk, 0, sizeof(chunk));
+		if (acpm_sram_copy(ipc, offset + pos, chunk, n))
+			return false;
+		for (i = 0; i < ARRAY_SIZE(chunk); i++)
+			if (chunk[i])
+				return false;
+	}
+	return true;
+}
+
 /* Returns the name of the first firmware-owned region the extent overlaps. */
 static const char *acpm_dynamic_plugin_conflict(struct acpm_ipc_info *ipc,
 					       const struct acpm_framework *header,
@@ -1438,8 +1461,27 @@ static const char *acpm_dynamic_plugin_conflict(struct acpm_ipc_info *ipc,
 			return "plugin-read";
 		/* Detached plugins may share an overlay region; attached ones not. */
 		if (other.is_attached &&
-		    acpm_sram_overlap(base, bytes, other.base_addr & ~1U, other.size))
+		    acpm_sram_overlap(base, bytes, other.base_addr & ~1U, other.size) &&
+		    acpm_sram_all_zero(ipc, base, bytes)) {
+			/*
+			 * crownlte recovery boots: plugin 4 (0xc400+0x2800) declares
+			 * an extent covering the TMU slot (0xd800+0x1400), but its
+			 * image and data end at 0xcbbc (highest literal reference
+			 * 0xcbb8) and the slot reads all zero. A slot holding nothing
+			 * cannot be live code or data of the attached plugin; 4.9
+			 * writes it unconditionally. Any non-zero byte still refuses.
+			 */
+			dev_warn(ipc->dev, "ACPM dynamic plugin extent %#x+%#x lies inside attached plugin index=%u id=%u base=%#x size=%#x but reads all zero; allowing\n",
+				 base, bytes, i, other.id, other.base_addr, other.size);
+			continue;
+		}
+		if (other.is_attached &&
+		    acpm_sram_overlap(base, bytes, other.base_addr & ~1U, other.size)) {
+			dev_err(ipc->dev, "ACPM dynamic plugin extent %#x+%#x overlaps attached plugin index=%u id=%u base=%#x size=%#x stay=%u\n",
+				base, bytes, i, other.id, other.base_addr, other.size,
+				other.stay_attached);
 			return "attached-plugin";
+		}
 	}
 	return NULL;
 }
