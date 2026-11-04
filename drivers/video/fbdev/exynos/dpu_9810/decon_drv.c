@@ -1321,6 +1321,12 @@ static int dpu_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret, "memory-region\n");
 	}
 
+	/* look the TE irq up before any side effect, so a deferral is clean */
+	ret = platform_get_irq_byname_optional(pdev, "te");
+	if (ret == -EPROBE_DEFER)
+		goto err_mem;
+	d->te_irq = ret > 0 ? ret : -1;
+
 	ret = dpu_adopt(d);
 	if (ret)
 		goto err_mem;
@@ -1340,16 +1346,14 @@ static int dpu_probe(struct platform_device *pdev)
 	if (of_property_read_bool(np, "samsung,fb-takeover"))
 		dpu_fb_takeover(d);
 
-	ret = platform_get_irq_byname_optional(pdev, "te");
-	if (ret > 0) {
-		d->te_irq = ret;
+	if (d->te_irq > 0) {
 		ret = devm_request_irq(dev, d->te_irq, dpu_te_irq, 0, "decon0-te", d);
 		if (ret) {
 			dev_warn(dev, "TE irq: %d, vsync falls back to 60 Hz sleeps\n", ret);
 			d->te_irq = -1;
 		}
-	} else if (ret == -EPROBE_DEFER) {
-		goto err_fb;
+	} else {
+		dev_warn(dev, "no TE irq, vsync falls back to 60 Hz sleeps\n");
 	}
 	d->vsync_thread = kthread_run(dpu_vsync_thread, d, "decon0_vsync");
 	if (IS_ERR(d->vsync_thread)) {
@@ -1381,6 +1385,8 @@ err_fb:
 	framebuffer_release(d->fb);
 err_worker:
 	kthread_destroy_worker(d->worker);
+	dpu_commit_free(d->active);
+	d->active = NULL;
 err_mem:
 	of_reserved_mem_device_release(dev);
 	return ret;
