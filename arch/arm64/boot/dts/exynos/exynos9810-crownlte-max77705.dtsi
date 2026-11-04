@@ -1,0 +1,37 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * MAX77705 read-only battery monitor (stage 1) on the CMGP HSI2C bus at
+ * 0x14360000 that already carries the MAX77705 USB-C MCU (muic@25).
+ *
+ * The node sits at the fuel gauge address (0x36). The driver reserves the
+ * charger (0x69) and PMIC (0x66) addresses and reads one USB-C status
+ * register at 0x25; it never writes to the MAX77705.
+ *
+ * Values from the crownlte 4.9 DT (exynos9810-crownlte_eur_open_26.dts):
+ * max77705-fuelgauge (fuelgauge,fg_resistor/capacity/capacity_max/
+ * capacity_max_margin/capacity_min/capacity_calculation_type), battery
+ * (battery,technology, battery,temp_*_normal) and cable-info
+ * (full_check_current_1st). samsung,legacy-current-ma keeps the 4.9 sysfs
+ * units for battery/current_now and current_avg (mA, sec_battery.c).
+ */
+
+&hsi2c_pmic {
+	max77705_battery: battery-monitor@36 {
+		compatible = "samsung,exynos9810-max77705-battery-ro";
+		reg = <0x36>;
+		maxim,fg-resistor = <2>;
+		maxim,design-capacity = <3753>;
+		maxim,capacity-max = <1000>;
+		maxim,capacity-max-margin = <300>;
+		maxim,capacity-min = <0>;
+		maxim,capacity-calculation-type = <28>;
+		samsung,full-check-current-1st = <400>;
+		samsung,technology = <2>;
+		samsung,temp-high-threshold = <500>;
+		samsung,temp-high-recovery = <450>;
+		samsung,temp-low-threshold = <0>;
+		samsung,temp-low-recovery = <50>;
+		samsung,legacy-current-ma;
+		status = "disabled";
+	};
+};
