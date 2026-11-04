@@ -19,7 +19,26 @@
 	model_info-system_rev = "028";
 	model_info-hw_rev_end = <255>;
 	chosen {
+		#address-cells = <2>;
+		#size-cells = <1>;
+		ranges;
 		bootargs = "maxcpus=1 panic=30 ro";
+
+		/*
+		 * SBoot's scanout buffer (static SBoot analysis: DPP IDMA base
+		 * 0xcc000000, IDMA format 0 = ARGB8888, 1440x2960, packed
+		 * 5760-byte rows, SysMMU bypassed). Only the CPU writes to it;
+		 * DECON keeps scanning it with SBoot's settings. See
+		 * Documentation/crownlte/display-port.md.
+		 */
+		sboot_fb: framebuffer@cc000000 {
+			compatible = "simple-framebuffer";
+			reg = <0 0xcc000000 (1440 * 2960 * 4)>;
+			width = <1440>;
+			height = <2960>;
+			stride = <(1440 * 4)>;
+			format = "a8r8g8b8";
+		};
 	};
 };
 
@@ -104,8 +123,9 @@
 			reg = <0 0x80001000 0x1000>;
 			no-map;
 		};
-		framebuffer@cc000000 {
-			reg = <0 0xcc000000 (1440 * 2960 * 4)>;
+		/* SBoot "lcd_buffer" 0xcc000000..0xcd400000 (skipped by its DRAM test) */
+		sboot_fb_mem: framebuffer@cc000000 {
+			reg = <0 0xcc000000 0x1400000>;
 			no-map;
 		};
 	};
@@ -115,6 +135,22 @@
  * providers, pad routing and power setup are still incomplete. Keep disabled.
  */
 &soc {
+	/*
+	 * SBoot DECON-F scanout handover helper. Read-only unless
+	 * samsung,decon-trigger is set (see the delayed-UFS diagnostic).
+	 * DECON-F 0x16030000; DPP IDMA G0..VGF1 0x16021000..0x16026fff;
+	 * sysmmu_dpu0..2 non-secure SFRs (read only, bypass check).
+	 */
+	decon_handover: display-handover@16030000 {
+		compatible = "samsung,exynos9810-decon-handover";
+		reg = <0x16030000 0x10000>, <0x16021000 0x6000>,
+		      <0x160a0000 0x1000>, <0x160b0000 0x1000>,
+		      <0x160c0000 0x1000>;
+		reg-names = "decon", "dpp", "sysmmu0", "sysmmu1", "sysmmu2";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,simplefb = <&sboot_fb>;
+	};
+
 	usbdrd_phy: phy@11100000 {
 		compatible = "samsung,exynos9810-usbdrd-phy";
 		reg = <0x11100000 0x200>;
