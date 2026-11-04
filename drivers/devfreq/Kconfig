@@ -86,6 +86,22 @@ config DEVFREQ_GOV_PASSIVE
 
 comment "DEVFREQ Drivers"
 
+config ARM_EXYNOS9810_ACPM_DEVFREQ
+	bool "Exynos9810 MIF/INT bus DVFS through CAL/ACPM"
+	depends on EXYNOS9810_LEGACY_CAL && EXYNOS_ACPM && ECT
+	select PM_OPP
+	help
+	  MIF (memory) and INT (interconnect) bus frequency scaling for
+	  Exynos9810, ported from the 4.9 exynos-devfreq MIF/INT drivers.
+	  Levels come from the ECT DVFS tables checked against CAL, rates
+	  are requested from ACPM firmware with cal_dfs_set_rate(), and the
+	  rate is the highest PM QoS minimum (consumers use dev_pm_qos
+	  DEV_PM_QOS_MIN_FREQUENCY on the devfreq parent device, in kHz).
+	  MIF drives an INT minimum from the ECT MINLOCK table and honours
+	  firmware MIF requests from ACPM channel 5. Registers the
+	  "exynos9810-qos" governor. Probes only for enabled DT nodes and
+	  leaves the bootloader rates alone if any table fails validation.
+
 config EXYNOS9810_BUS_GUARDS
 	bool "Exynos9810 durable dependency guard ownership"
 	depends on EXYNOS9810_BUS_TABLES
