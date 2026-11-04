@@ -1121,22 +1121,35 @@ static int dpu_adopt(struct dpu_dev *d)
 	d->boot_win = -1;
 	for (w = 0; w < DECON_MAX_WIN; w++) {
 		int dpp;
-		u32 src, img, base, in;
+		u32 src, img, base, in, off, dimg;
 
 		if (!(dp0 & WIN_EN_F(w)))
 			continue;
 		dpp = dpu_hw_channel_to_dpp((dp1 >> (4 * w)) & 0x7);
 		if (dpp < 0)
 			continue;
+		/*
+		 * IDMA block (0x16071000 + n*0x1000) holds format, sizes and
+		 * the base address; the DPP block (0x16021000 + ...) only has
+		 * IMG_SIZE at the same offset. Trial q26 had the two swapped
+		 * in DT and read IMG right but IN_CON/SRC/BASE = 0. The DPP
+		 * IMG_SIZE cross-check refuses adoption if that ever recurs.
+		 */
 		in = dpu_hw_dma_rd(d, dpp, IDMA_IN_CON);
 		src = dpu_hw_dma_rd(d, dpp, IDMA_SRC_SIZE);
 		img = dpu_hw_dma_rd(d, dpp, IDMA_IMG_SIZE);
+		off = dpu_hw_dma_rd(d, dpp, IDMA_SRC_OFFSET);
 		base = dpu_hw_dma_rd(d, dpp, IDMA_IN_BASE_ADDR_Y);
-		dev_info(d->dev, "win%d -> dpp%d: IN_CON=%#x SRC=%#x IMG=%#x OFF=%#x BASE=%#x\n",
-			 w, dpp, in, src, img, dpu_hw_dma_rd(d, dpp, IDMA_SRC_OFFSET), base);
+		dimg = readl(d->dpp_regs + dpp * 0x1000 + DPP_IMG_SIZE);
+		dev_info(d->dev, "win%d -> dpp%d: IN_CON=%#x SRC=%#x IMG=%#x OFF=%#x BASE=%#x (DPP IMG=%#x)\n",
+			 w, dpp, in, src, img, off, base, dimg);
 		if (base == d->fb_phys && (src & 0xffff) * 4 == d->fb_stride &&
+		    ((src >> 16) & 0x3fff) >= d->lcd.yres &&
 		    (img & 0x1fff) == d->lcd.xres && ((img >> 16) & 0x1fff) == d->lcd.yres &&
-		    !dpu_hw_dma_rd(d, dpp, IDMA_SRC_OFFSET) && d->boot_win < 0) {
+		    (dimg & 0x1fff1fff) == (img & 0x1fff1fff) &&
+		    ((in >> 11) & 0x1f) <= IDMA_IMG_FORMAT_BGRX8888 &&
+		    !(in & (IDMA_ROTATION_MASK | IDMA_AFBC_EN | IDMA_BLOCK_EN)) &&
+		    !off && d->boot_win < 0) {
 			d->boot_win = w;
 			d->boot_dpp = dpp;
 			d->boot_fmt = (in >> 11) & 0x1f;

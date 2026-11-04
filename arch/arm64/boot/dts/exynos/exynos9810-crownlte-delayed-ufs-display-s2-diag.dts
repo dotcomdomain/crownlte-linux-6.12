@@ -24,9 +24,14 @@
 	 */
 	decon_f: decon_f@16030000 {
 		compatible = "samsung,exynos9810-decon";
+		/*
+		 * 4.9 DT dpp@16021000: reg[0] = DPP block 0x16021000 (dpp_read),
+		 * reg[1] = IDMA 0x16071000 (dma_read), reg[2] = DMA common
+		 * 0x16070000. SBoot writes IN_BASE_ADDR_Y at 0x16071040.
+		 */
 		reg = <0 0x16030000 0x10000>,	/* DECON-F */
-		      <0 0x16021000 0x6000>,	/* DPP IDMA G0..VGF1 */
-		      <0 0x16071000 0x6000>,	/* DPP blocks G0..VGF1 */
+		      <0 0x16071000 0x6000>,	/* IDMA G0..VGF1 (base, fmt, sizes) */
+		      <0 0x16021000 0x6000>,	/* DPP blocks G0..VGF1 (CSC, scaler) */
 		      <0 0x16070000 0x1000>,	/* DPU DMA common */
 		      <0 0x160a0000 0x1000>,	/* sysmmu_dpu0..2, read only */
 		      <0 0x160b0000 0x1000>,
