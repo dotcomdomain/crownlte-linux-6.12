@@ -405,3 +405,18 @@ Both have a white frame, the text "DECON FLIP TEST / CMA BUFFER A|B", and a red 
 - TE EINT at 60 Hz adds ~60 IRQ/s.
 - Self-test buffers come from a reusable CMA pool. Migration on allocation can take a few
   ms; failure is logged and nothing is flipped.
+
+## q25/q26 result: wrong register bank (fixed 2026-11-04)
+
+q25 and q26 both reported `IMG=1440x2960` but `IN_CON=0 SRC=0 BASE=0`, so neither stage verified the
+SBoot scanout. Cause: every DPP channel has two blocks. The DPP block at 0x16021000 + n·0x1000 (4.9
+`dpp_read`, DT reg[0]) holds the DPP format, IMG_SIZE at 0x18, CSC and scaler. The IDMA block at
+0x16071000 + n·0x1000 (4.9 `dma_read`, DT reg[1]) holds the IDMA format, SRC_SIZE, SRC_OFFSET,
+IMG_SIZE and IN_BASE_ADDR_Y (0x40). SBoot's DPP init (raw 0x100904) uses the same split and writes
+0xcc000000 to 0x16071040. Stage 1 only mapped the DPP block; the stage 2 DT had `dpp-dma`/`dpp` swapped.
+
+Fixes: dd4a8255e (stage 1, new `dpp-dma` resource; also crownlte-display 6ac56b174) and c3b589012 (stage
+2 DT un-swap). Both drivers now also require the DPP-block IMG_SIZE to equal the IDMA IMG_SIZE and a
+linear (no rotation/AFBC/block) IDMA input. Trials: q38-display3 (stage 1, recovery 4d2c9154) and
+q39-display4 (stage 2, recovery d9fd174d). Full analysis: gekko
+`/mnt/ssd/host-builds/kernel-upgrade/roadmap/display-scanout-handover.md`.
