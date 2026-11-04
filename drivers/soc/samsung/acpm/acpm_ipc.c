@@ -478,8 +478,20 @@ static irqreturn_t acpm_ipc_irq_handler(int irq, void *data)
 	struct acpm_ipc_info *ipc = data;
 	unsigned int status;
 	int i;
-	if (!smp_load_acquire(&acpm_ipc_ready))
-		return IRQ_NONE;
+	if (!smp_load_acquire(&acpm_ipc_ready)) {
+		/*
+		 * The line is level-high: returning IRQ_NONE with a source still
+		 * pending would storm until the IRQ is disabled for good. Before
+		 * ready (and while retiring) nobody consumes the event, so ack it.
+		 */
+		if (!ipc || !ipc->intr)
+			return IRQ_NONE;
+		status = __raw_readl(ipc->intr + INTSR1);
+		for (i = 0; i < ipc->num_channels; i++)
+			if (!ipc->channel[i].polling && (status & (0x1 << ipc->channel[i].id)))
+				__raw_writel(1 << ipc->channel[i].id, ipc->intr + INTCR1);
+		return status ? IRQ_HANDLED : IRQ_NONE;
+	}
 
 	/* ACPM IPC INTERRUPT STATUS REGISTER */
 	status = __raw_readl(acpm_ipc->intr + INTSR1);
@@ -1779,6 +1791,8 @@ static struct platform_driver samsung_acpm_ipc_driver = {
 		.name = "exynos-acpm-ipc",
 		.owner	= THIS_MODULE,
 		.of_match_table	= acpm_ipc_match,
+		/* FVMap, TMU and DVFS users keep SRAM pointers with no refcount. */
+		.suppress_bind_attrs = true,
 	},
 };
 

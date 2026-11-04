@@ -155,6 +155,13 @@ static void acpm_attach_dynamic_plugin(struct device *framework,
 			st->post_attached = after.plugins[st->index].attached;
 		acpm_ipc_free_firmware_snapshot(&after);
 	}
+	/* acpm_send_data() succeeds once the id is echoed; the descriptor is
+	 * the firmware's own record of whether the plugin is now attached. */
+	if (!ret && !st->post_attached) {
+		st->result = -EIO;
+		dev_err(framework, "ACPM plugin %s acknowledged DP_A but is not attached\n",
+			plugin->fw_name);
+	}
 	dev_info(framework, "ACPM plugin %s index=%u id=%u DP_A ret=%d reply=%08x %08x %08x %08x is_attached now=%u\n",
 		 plugin->fw_name, st->index, st->id, ret,
 		 st->dp_response[0], st->dp_response[1], st->dp_response[2],
