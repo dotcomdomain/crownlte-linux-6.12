@@ -27,6 +27,7 @@
 
 #define DPU_PFX			"decon: "
 #define DPU_ST_PFX		"decon selftest: "
+#define DPU_PB_PFX		"panel-bright: "
 
 #define DPU_NR_DPP		6
 #define DPU_NR_SYSMMU		3
@@ -145,6 +146,18 @@ struct dpu_dev {
 	struct delayed_work st_work;
 	u32 st_at_ms, st_flips, st_period_ms;
 	bool stopping;
+
+	/* DSIM0 command path (dsim_cmd.c), only inside a command window */
+	void __iomem *dsim;
+	bool cmd_window;			/* hw_lock held, trigger masked, no frame */
+	u32 dsim_ntx, dsim_nrx, dsim_nerr;
+
+	/* fault-display brightness (panel_bright.c), opt-in via DT */
+	struct delayed_work pb_work;
+	u32 pb_target, pb_at_ms;
+	bool pb_enabled, pb_done, pb_has_id, pb_has_gamma;
+	u8 pb_id[3];
+	u8 pb_gamma[34];
 };
 
 /* decon_hw.c: register layer (ported from 4.9 decon_reg.c / dpp_reg.c) */
@@ -180,5 +193,20 @@ void dpu_hw_win_config(struct dpu_dev *d, int win, const struct decon_win_config
 		       bool enable);
 u32 dpu_translate_fmt_to_dpp(u32 format);
 int dpu_fmt_bpp(u32 dpp_fmt);
+
+/* decon_drv.c: DECON-side guard around panel commands */
+int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig);
+void dpu_cmd_window_end(struct dpu_dev *d, u32 trig);
+
+/* dsim_cmd.c: DSIM0 packets (4.9 dsim_write_data / dsim_read_data) */
+int dpu_dsim_check(struct dpu_dev *d);
+void dpu_dsim_clear_status(struct dpu_dev *d);
+int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len);
+int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len);
+
+/* panel_bright.c: the 4.9 brightness-44700 sequence */
+int dpu_panel_bright_init(struct dpu_dev *d);
+void dpu_panel_bright_work(struct work_struct *work);
+u32 dpu9810_panel_brightness(void);	/* also used by panel_ro.c */
 
 #endif /* __DPU9810_H__ */

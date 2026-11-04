@@ -17,6 +17,11 @@
  * wait for the update to latch at the next TE-triggered frame. Unlike 4.9
  * the trigger is then left unmasked (continuous refresh), so fbcon drawing
  * into fb0 memory stays visible.
+ *
+ * Exception, opt-in by DT (panel node samsung,fault-display-brightness):
+ * once after adopt, panel_bright.c sends the owner's 4.9 brightness-44700
+ * panel sequence through DSIM0 (dsim_cmd.c), inside a command window with
+ * the TE trigger masked and no frame in flight.
  */
 #include <linux/aperture.h>
 #include <linux/console.h>
@@ -1175,6 +1180,74 @@ static int dpu_adopt(struct dpu_dev *d)
 	return 0;
 }
 
+/* ---- panel command window --------------------------------------------- */
+
+#define DPU_CMD_IDLE_US		20000	/* > one 60 Hz frame */
+#define DPU_CMD_IDLE_TRIES	5
+
+/*
+ * Panel commands (dsim_cmd.c) go out only between frames: DECON adopted
+ * and powered, no shadow update pending, TE trigger masked (as dpu_apply()
+ * does for every update, 4.9 decon_reg_set_trigger(DISABLE)) and
+ * FRAME_COUNT unchanged for longer than one frame, so no frame transfer is
+ * in flight on the DSI link. Returns 0 with hw_lock held (no window update
+ * can start); dpu_cmd_window_end() restores the trigger bits.
+ */
+int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig)
+{
+	u32 fc0, fc1 = 0, gc;
+	int i, ret;
+
+	mutex_lock(&d->hw_lock);
+	if (d->boot_win < 0 || !d->fb) {
+		ret = -ENODEV;			/* not adopted */
+		goto err;
+	}
+	if (!dpu_hw_powered(d)) {
+		ret = -EIO;
+		goto err;
+	}
+	if (dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
+		ret = -EBUSY;
+		goto err;
+	}
+	*trig = decon_rd(d, HW_SW_TRIG_CONTROL);
+	dpu_hw_trigger(d, false);
+
+	fc0 = dpu_hw_frame_count(d);
+	for (i = 0; i < DPU_CMD_IDLE_TRIES; i++) {
+		usleep_range(DPU_CMD_IDLE_US, DPU_CMD_IDLE_US + 1000);
+		fc1 = dpu_hw_frame_count(d);
+		if (fc1 == fc0)
+			break;
+		fc0 = fc1;
+	}
+	gc = decon_rd(d, GLOBAL_CONTROL);
+	pr_info(DPU_PB_PFX "command window: TRIG %#x -> %#x, FRAME_COUNT %u %s, GLOBAL_CONTROL=%#x (idle %d, run %d)\n",
+		*trig, decon_rd(d, HW_SW_TRIG_CONTROL), fc1,
+		i < DPU_CMD_IDLE_TRIES ? "stable" : "still advancing", gc,
+		!!(gc & GLOBAL_CONTROL_IDLE_STATUS), !!(gc & GLOBAL_CONTROL_RUN_STATUS));
+	if (i == DPU_CMD_IDLE_TRIES) {
+		decon_wr_mask(d, HW_SW_TRIG_CONTROL, *trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+		ret = -EBUSY;
+		goto err;
+	}
+	d->cmd_window = true;
+	return 0;
+err:
+	mutex_unlock(&d->hw_lock);
+	return ret;
+}
+
+void dpu_cmd_window_end(struct dpu_dev *d, u32 trig)
+{
+	d->cmd_window = false;
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	pr_info(DPU_PB_PFX "command window closed: TRIG=%#x FRAME_COUNT=%u\n",
+		decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d));
+	mutex_unlock(&d->hw_lock);
+}
+
 /* ---- probe ----------------------------------------------------------- */
 
 static int dpu_parse_dt(struct dpu_dev *d)
@@ -1285,6 +1358,7 @@ static int dpu_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&d->stale);
 	init_waitqueue_head(&d->vsync_wait);
 	INIT_DELAYED_WORK(&d->st_work, dpu_st_work);
+	INIT_DELAYED_WORK(&d->pb_work, dpu_panel_bright_work);
 	d->fence_ctx = dma_fence_context_alloc(1);
 	platform_set_drvdata(pdev, d);
 
@@ -1389,6 +1463,21 @@ static int dpu_probe(struct platform_device *pdev)
 		queue_delayed_work(system_long_wq, &d->st_work,
 				   msecs_to_jiffies(d->st_at_ms > now ? d->st_at_ms - now : 0));
 	}
+
+	/* opt-in: the 4.9 fault-display brightness, sent once (panel_bright.c) */
+	ret = dpu_panel_bright_init(d);
+	if (!ret) {
+		u64 now = ktime_to_ms(ktime_get_boottime());
+
+		d->pb_enabled = true;
+		pr_info(DPU_PB_PFX "scheduled at %u ms uptime: brightness %u (4.9 PANEL_FAULT_DISPLAY_BRIGHTNESS), id check %s, gamma check %s\n",
+			d->pb_at_ms, d->pb_target, d->pb_has_id ? "on" : "off",
+			d->pb_has_gamma ? "on" : "off");
+		queue_delayed_work(system_long_wq, &d->pb_work,
+				   msecs_to_jiffies(d->pb_at_ms > now ? d->pb_at_ms - now : 0));
+	} else if (ret != -ENODEV) {
+		dev_warn(dev, "panel-bright disabled: %d\n", ret);
+	}
 	dev_info(dev, "adopt mode ready: TE irq %d, %s\n", d->te_irq,
 		 d->fb_taken ? "fb0 window owned" : "fb0 window still SBoot's");
 	return 0;
@@ -1408,6 +1497,7 @@ err_mem:
 static void dpu_stop(struct dpu_dev *d)
 {
 	WRITE_ONCE(d->stopping, true);
+	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->st_work);
 	kthread_flush_worker(d->worker);
 }

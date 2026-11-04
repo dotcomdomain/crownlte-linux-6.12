@@ -17,7 +17,10 @@ config FB_EXYNOS9810_DPU
 	  vsync from the panel TE line, and applies window configurations
 	  through the DPP channels for physically contiguous buffers.
 	  It does not control panel power, clocks or timing.
-	  See Documentation/crownlte/display-port.md.
+	  Opt-in by device tree, it can send the one S6E3HA8 brightness
+	  sequence the owner's 4.9 kernel uses (44700) through DSIM0.
+	  See Documentation/crownlte/display-port.md and
+	  Documentation/crownlte/panel-brightness.md.
 
 config FB_EXYNOS9810_PANEL_RO
 	bool "Read-only \"panel\" backlight for the Galaxy Note9"

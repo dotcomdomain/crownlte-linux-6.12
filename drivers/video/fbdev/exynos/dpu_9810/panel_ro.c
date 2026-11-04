@@ -5,37 +5,48 @@
  * The vendor light HAL and HWC look for
  * /sys/devices/platform/panel_drv@001/backlight/panel/{brightness,
  * max_brightness}. Until the S6E3HA8 panel driver is ported, this device
- * only mirrors the brightness SBoot set (4.9 boots at UI_DEF_BRIGHTNESS,
- * BRT(128) = 12800, of max 44700) and refuses changes: no DSI command, no
- * regulator, no GPIO is touched.
+ * only mirrors the panel brightness and refuses changes: no DSI command,
+ * no regulator, no GPIO is touched here. The brightness is SBoot's
+ * (4.9 boots at UI_DEF_BRIGHTNESS, BRT(128) = 12800, of max 44700) unless
+ * the DECON driver has since set the 4.9 fault-display brightness
+ * (panel_bright.c), in which case that value is reported.
  */
 #include <linux/backlight.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 
+/* panel_bright.c (CONFIG_FB_EXYNOS9810_DPU): 0 until it changed the panel */
+u32 dpu9810_panel_brightness(void);
+
 struct panel_ro {
 	struct backlight_device *bd;
 	u32 brightness;
 };
 
+static u32 panel_ro_current(struct panel_ro *p)
+{
+	u32 v = IS_ENABLED(CONFIG_FB_EXYNOS9810_DPU) ? dpu9810_panel_brightness() : 0;
+
+	return v ? v : p->brightness;
+}
+
 static int panel_ro_update_status(struct backlight_device *bd)
 {
 	struct panel_ro *p = bl_get_data(bd);
+	u32 cur = panel_ro_current(p);
 
-	if (bd->props.brightness == p->brightness)
+	if (bd->props.brightness == cur)
 		return 0;
 	dev_info_ratelimited(&bd->dev, "read-only: brightness %d refused, panel stays at %u\n",
-			     bd->props.brightness, p->brightness);
-	bd->props.brightness = p->brightness;
+			     bd->props.brightness, cur);
+	bd->props.brightness = cur;
 	return -EPERM;
 }
 
 static int panel_ro_get_brightness(struct backlight_device *bd)
 {
-	struct panel_ro *p = bl_get_data(bd);
-
-	return p->brightness;
+	return panel_ro_current(bl_get_data(bd));
 }
 
 static const struct backlight_ops panel_ro_ops = {
@@ -60,12 +71,13 @@ static int panel_ro_probe(struct platform_device *pdev)
 
 	props.type = BACKLIGHT_RAW;
 	props.max_brightness = max;
-	props.brightness = p->brightness;
+	props.brightness = min(panel_ro_current(p), max);
 	p->bd = devm_backlight_device_register(dev, "panel", dev, p, &panel_ro_ops, &props);
 	if (IS_ERR(p->bd))
 		return PTR_ERR(p->bd);
-	dev_info(dev, "read-only backlight \"panel\": %u/%u (no panel driver yet)\n",
-		 p->brightness, max);
+	dev_info(dev, "read-only backlight \"panel\": %u/%u (%s)\n", props.brightness, max,
+		 of_property_present(dev->of_node, "samsung,fault-display-brightness") ?
+		 "DECON driver sets the 4.9 fault-display brightness" : "no panel driver yet");
 	return 0;
 }
 
