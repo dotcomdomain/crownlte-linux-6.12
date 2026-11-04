@@ -17,9 +17,11 @@ and fuel-gauge settings it had when 6.12 started (bootloader settings, or the
 | `usb` | USB | online, voltage_max, current_max | CHGIN_OK and BC1.2 SDP/CDP |
 | `wireless` | Wireless | online, present, voltage_max, current_max | CHG_INT_OK.WCIN_OK |
 
-The power_supply core adds the tripless thermal zone `battery` (type "battery",
-temp in m°C = FG temperature × 100). It has no trip points, so it never
-triggers any action.
+The power_supply core adds the tripless thermal zones `battery` (temp in
+m°C = battery temperature × 100) and, with the SoC ADC wired, `ac` (charger
+thermistor × 100). They have no trip points, so they never trigger any
+action (4.9 registered them with 0 trips as well). Temperatures come from the
+SoC ADC thermistors with the 4.9 tables; see `soc-adc.md`.
 
 Units match the 4.9 sysfs that Lineage 4.9 reads: voltage in µV, temp in
 0.1 °C, charge_* in µAh, battery/online = 4.9 `sec_battery_cable` number
@@ -40,9 +42,12 @@ health_index/state_of_health. The 4.9-only supplies `ps`, `otg`,
 writing it would turn charging off.
 
 Thermal HAL (V:/etc/thermal_info_config.json) wants zones `battery`
-(SHUTDOWN at 60 °C) and `ac` (EMERGENCY at 60 °C, monitored). Only `battery`
-exists. 4.9 fed `ac` from the USB-connector thermistor (sec_battery
-`chg_temp`, SoC ADC 14230000); that needs an Exynos ADC driver (see below).
+(SHUTDOWN at 60 °C) and `ac` (EMERGENCY at 60 °C, monitored). Both exist
+when `&adc` is enabled. 4.9 `ac`/TEMP is sec_battery `chg_temp`, the
+**charger** NTC on SoC ADC ch3 (sec_battery.c:4792), not the USB-connector
+NTC (ch1, `usb_temp`). `battery` also has the read-only 4.9 attributes
+`batt_temp`, `batt_temp_adc`, `chg_temp`, `chg_temp_adc`, `usb_temp` and
+`usb_temp_adc`.
 
 ## Capacity: same pipeline as 4.9
 
@@ -150,7 +155,9 @@ the input limit itself).
    reboot does not charge, and this stage cannot turn charging on. Expect
    `cnfg00=04`, `chg=8 off` and status "Not charging" with a cable connected.
    That is safe for the battery; the battery drains slowly under load.
-2. **Battery temperature.** 4.9 used the SoC ADC (adc@14230000 channel 4,
+2. **Battery temperature (resolved by the SoC ADC stage, see soc-adc.md:
+   `battery/temp` is now the ch4 NTC; the FG TEMP register is still never
+   written and stays stale).** 4.9 used the SoC ADC (adc@14230000 channel 4,
    `battery,thermal_source = <2>`) and wrote it into the FG TEMP register with
    CONFIG.TEX=1. Under TEX=1 the gauge does not measure temperature, so the
    6.12 value is the last one 4.9 (or SBoot) wrote: plausible but stale. The
@@ -171,6 +178,6 @@ the input limit itself).
 
 ## Next stages
 
-* ADC thermistors (battery, USB, charger, coil) → real `battery`/`ac` temperatures.
+* ADC thermistors (battery, USB, charger) → real `battery`/`ac` temperatures: done (soc-adc.md).
 * Charger RW only after register-by-register parity with 4.9 (ROADMAP risk 6),
   starting with re-enabling charging after a 4.9 reboot.
