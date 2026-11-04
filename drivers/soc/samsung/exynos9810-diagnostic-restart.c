@@ -287,6 +287,9 @@ static int diagnostic_restart_probe(struct platform_device *pdev)
 	ctx->pmu = devm_ioremap(dev, res.start, resource_size(&res));
 	if (!ctx->pmu)
 		return -ENOMEM;
+	/* Read-only: the boot shim resets these to normal (0x12345678/0x12345670). */
+	dev_info(dev, "boot selection at probe: INFORM2=%#x INFORM3=%#x\n",
+		 readl(ctx->pmu + INFORM2), readl(ctx->pmu + INFORM3));
 	ctx->framework = of_parse_phandle(dev->of_node, "samsung,acpm-framework", 0);
 	if (!ctx->framework ||
 	    !of_device_is_compatible(ctx->framework, "samsung,exynos-acpm")) {
