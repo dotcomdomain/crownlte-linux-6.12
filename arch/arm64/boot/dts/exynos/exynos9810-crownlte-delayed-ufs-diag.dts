@@ -26,6 +26,17 @@
 };
 
 /*
+ * MIF/INT devfreq. The self-test runs at ~105 s uptime: tables, CMU
+ * readback, MIF/INT to max and to the lowest floor-safe level and back,
+ * ACPM MIF requests.
+ */
+&legacy_devfreq_mif {
+	samsung,devfreq-selftest;
+	status = "okay";
+};
+&legacy_devfreq_int { status = "okay"; };
+
+/*
  * ACPM TMU plugin and TMU temperature sensors (4.9 exynos_acpm_tmu +
  * exynos_tmu, crownlte_eur_open_26 DT). When the boot leaves the TMU plugin
  * detached (is_attached=0, stay_attached=1), plugins_init() loads the
