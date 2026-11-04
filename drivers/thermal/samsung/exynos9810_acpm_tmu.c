@@ -85,7 +85,17 @@ struct acpm_tmu_sensor {
 	bool trip_en;
 	int rise7_min_c;	/* lowest decoded rise7 threshold, TMU_NO_TEMP if none */
 	struct thermal_zone_device *tzd;
+	unsigned int failures;	/* consecutive get_temp failures */
 };
+
+/*
+ * A zone whose sensor stays unreadable gets no trip handling from the
+ * thermal core (get_temp errors only re-arm polling), so the software
+ * critical trip would silently stop protecting. After this many
+ * consecutive failures (~10 s at the 1 s polling interval) treat the zone
+ * as critical. The bootloader-armed TMU hardware trip stays the backstop.
+ */
+#define ACPM_TMU_MAX_FAILURES	10
 
 static struct acpm_tmu_core {
 	struct device *dev;
@@ -140,6 +150,16 @@ static int acpm_tmu_read(struct acpm_tmu_sensor *s, int *millicelsius, u32 raw[4
 		memcpy(raw, msg, sizeof(msg));
 	if (ret)
 		return ret;
+	/*
+	 * Replies are matched by a 6-bit sequence number only. A late reply to
+	 * an earlier (timed-out) request can carry a reused number, so accept
+	 * only a reply that echoes this request's type and zone.
+	 */
+	if (TMU_W1_TYPE(msg[1]) != TMU_IPC_READ_TEMP || TMU_W1_TZID(msg[1]) != s->id) {
+		pr_warn_ratelimited("acpm-tmu: %s: reply %08x does not match READ_TEMP tzid %u\n",
+				    s->name, msg[1], s->id);
+		return -EPROTO;
+	}
 	if (TMU_W1_RET(msg[1]) < 0)
 		return -EIO;
 	*millicelsius = TMU_W1_TEMP(msg[1]) * 1000;
@@ -148,7 +168,19 @@ static int acpm_tmu_read(struct acpm_tmu_sensor *s, int *millicelsius, u32 raw[4
 
 static int acpm_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 {
-	return acpm_tmu_read(thermal_zone_device_priv(tz), temp, NULL);
+	struct acpm_tmu_sensor *s = thermal_zone_device_priv(tz);
+	int ret = acpm_tmu_read(s, temp, NULL);
+
+	if (!ret) {
+		s->failures = 0;
+		return 0;
+	}
+	if (++s->failures == ACPM_TMU_MAX_FAILURES) {
+		dev_crit(s->dev, "%s: temperature unreadable %u times (last %d); treating as critical\n",
+			 s->name, s->failures, ret);
+		thermal_zone_device_critical(tz);
+	}
+	return ret;
 }
 
 static const struct thermal_zone_device_ops acpm_tmu_ops = {
@@ -253,6 +285,9 @@ static int acpm_tmu_core_probe(struct platform_device *pdev)
 		acpm_tmu.init_sent = true;
 		ret = acpm_tmu_xfer(msg);
 		memcpy(acpm_tmu.init_reply, msg, sizeof(msg));
+		/* Only a reply that echoes INIT is INIT reply (see acpm_tmu_read). */
+		if (!ret && TMU_W1_TYPE(msg[1]) != TMU_IPC_INIT)
+			ret = -EPROTO;
 		if (!ret && TMU_W1_RET(msg[1]) < 0)
 			ret = -EIO;
 		if (!ret)
