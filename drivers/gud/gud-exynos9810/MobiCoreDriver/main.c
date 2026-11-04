@@ -20,6 +20,11 @@
 #include <linux/delay.h>
 #include <linux/reboot.h>
 #include <linux/suspend.h>
+#include <linux/kthread.h>
+#include <linux/namei.h>
+#include <linux/fs.h>
+#include <linux/workqueue.h>
+#include <linux/timekeeping.h>
 
 #include "public/mc_user.h"
 #include "public/mc_admin.h"	/* MC_ADMIN_DEVNODE */
@@ -81,7 +86,34 @@ static struct {
 	struct mutex struct_counters_buf_mutex;
 	char struct_counters_buf[256];
 	int struct_counters_buf_len;
+	/* crownlte: start bookkeeping for the boot self-test (NWd only) */
+	bool tee_started;
+	bool admin_dev_ok;
+	bool user_dev_ok;
+	const char *start_stage;
+	s64 start_begin_ms;
+	s64 start_end_ms;
+	int core_switch_ret;
+	struct task_struct *start_thread;
+	struct delayed_work selftest_work;
+	u32 selftest_ms;
 } main_ctx;
+
+static inline s64 mc_uptime_ms(void)
+{
+	return ktime_to_ms(ktime_get_boottime());
+}
+
+static inline void mc_set_start_stage(const char *stage)
+{
+	WRITE_ONCE(main_ctx.start_stage, stage);
+}
+
+bool mc_tee_started(void)
+{
+	/* Pairs with smp_store_release() in mobicore_start() */
+	return smp_load_acquire(&main_ctx.tee_started);
+}
 
 static int mobicore_start(void);
 static void mobicore_stop(void);
@@ -252,6 +284,7 @@ static inline int device_user_init(void)
 		mc_dev_err("user device_create failed");
 		return PTR_ERR(dev);
 	}
+	main_ctx.user_dev_ok = true;
 
 	/* Create debugfs structs entry */
 	debugfs_create_file("structs", 0400, g_ctx.debug_dir, NULL,
@@ -262,6 +295,7 @@ static inline int device_user_init(void)
 
 static inline void device_user_exit(void)
 {
+	main_ctx.user_dev_ok = false;
 	device_destroy(main_ctx.class, main_ctx.user_dev);
 	cdev_del(&main_ctx.user_cdev);
 }
@@ -329,18 +363,22 @@ static int mobicore_start(void)
 	if (main_ctx.start_ret != TEE_START_NOT_TRIGGERED)
 		goto got_ret;
 
+	main_ctx.start_begin_ms = mc_uptime_ms();
+	mc_set_start_stage("log-mem-trace");
 	ret = mc_logging_start();
 	if (ret) {
 		mc_dev_err("Log start failed");
 		goto err_log;
 	}
 
+	mc_set_start_stage("nq");
 	ret = nq_start();
 	if (ret) {
 		mc_dev_err("NQ start failed");
 		goto err_nq;
 	}
 
+	mc_set_start_stage("threads");
 	ret = mcp_start();
 	if (ret) {
 		mc_dev_err("MCP start failed");
@@ -366,9 +404,11 @@ static int mobicore_start(void)
 	}
 
 	/* Must be called before creating the user device node to avoid race */
+	mc_set_start_stage("mcp-get-version");
 	ret = mcp_get_version(&version_info);
 	if (ret)
 		goto err_mcp_cmd;
+	mc_set_start_stage("version-check");
 
 	/* CMP version is meaningless in this case and is thus not printed */
 	mc_dev_info("\n"
@@ -391,14 +431,20 @@ static int mobicore_start(void)
 		    version_info.version_dr_api,
 		    version_info.version_nwd);
 
+	/*
+	 * crownlte: 4.9 jumps to err_version with ret == 0, so a rejected MCI
+	 * version tore everything down yet reported success. Report -EPROTO.
+	 */
 	if (MC_VERSION_MAJOR(version_info.version_mci) > 1) {
 		mc_dev_err("MCI too recent for this driver");
+		ret = -EPROTO;
 		goto err_version;
 	}
 
 	if ((MC_VERSION_MAJOR(version_info.version_mci) == 0) &&
 	    (MC_VERSION_MINOR(version_info.version_mci) < 6)) {
 		mc_dev_err("MCI too old for this driver");
+		ret = -EPROTO;
 		goto err_version;
 	}
 
@@ -459,11 +505,15 @@ static int mobicore_start(void)
 	}
 #endif
 
+	mc_set_start_stage("user-device");
 	ret = device_user_init();
 	if (ret)
 		goto err_create_dev_user;
 
 	main_ctx.start_ret = 0;
+	main_ctx.start_end_ms = mc_uptime_ms();
+	mc_set_start_stage("started");
+	smp_store_release(&main_ctx.tee_started, true);
 	goto got_ret;
 
 err_create_dev_user:
@@ -487,6 +537,7 @@ err_nq:
 	mc_logging_stop();
 err_log:
 	main_ctx.start_ret = ret;
+	main_ctx.start_end_ms = mc_uptime_ms();
 got_ret:
 	mutex_unlock(&main_ctx.start_mutex);
 	return main_ctx.start_ret;
@@ -494,6 +545,7 @@ got_ret:
 
 static void mobicore_stop(void)
 {
+	smp_store_release(&main_ctx.tee_started, false);
 	device_user_exit();
 #ifdef MC_PM_RUNTIME
 	unregister_reboot_notifier(&main_ctx.reboot_notifier);
@@ -589,6 +641,7 @@ static inline int device_admin_init(void)
 		ret = PTR_ERR(dev);
 		goto err_device;
 	}
+	main_ctx.admin_dev_ok = true;
 
 	/* Create debugfs sessions and MCP commands entries */
 	debugfs_create_file("sessions", 0400, g_ctx.debug_dir, NULL,
@@ -610,11 +663,171 @@ err_class:
 
 static inline void device_admin_exit(void)
 {
+	main_ctx.admin_dev_ok = false;
 	device_destroy(main_ctx.class, main_ctx.device);
 	cdev_del(&main_ctx.admin_cdev);
 	mc_admin_exit();
 	class_destroy(main_ctx.class);
 	unregister_chrdev_region(main_ctx.device, 2);
+}
+
+#ifndef MC_DELAYED_TEE_START
+/* crownlte: 4.9's tail of mobicore_probe(), run in its own kthread */
+static int mobicore_start_thread(void *unused)
+{
+	int ret = mobicore_start();
+
+	if (ret) {
+		mc_dev_err("TEE start failed: %d at stage %s", ret,
+			   READ_ONCE(main_ctx.start_stage));
+		WRITE_ONCE(main_ctx.core_switch_ret, -ECANCELED);
+		return 0;
+	}
+
+	/*
+	 * ExySp: for sos performance
+	 * migrate secure OS to a non-booting little core
+	 */
+	mc_set_start_stage("core-switch");
+	WRITE_ONCE(main_ctx.core_switch_ret,
+		   mc_switch_core(NONBOOT_LITTLE_CORE));
+	mc_set_start_stage("started");
+	return 0;
+}
+#endif
+
+/*
+ * crownlte boot self-test (diagnostic DT only, "samsung,tee-selftest").
+ * It only reads state the driver already has: no SMC, no MCP command, no
+ * session, no TA, no secure storage. The shared trace-buffer header is a
+ * plain read of NWd RAM.
+ */
+static const char *mc_selftest_node(const char *path, dev_t devt,
+				    bool registered, bool *wrong)
+{
+	struct path p;
+	const char *state;
+
+	if (!registered)
+		return "not-registered";
+
+	if (kern_path(path, LOOKUP_FOLLOW, &p))
+		return "registered/no-devtmpfs-node";
+
+	if (S_ISCHR(d_inode(p.dentry)->i_mode) &&
+	    d_inode(p.dentry)->i_rdev == devt) {
+		state = "ok";
+	} else {
+		state = "WRONG-NODE";
+		*wrong = true;
+	}
+	path_put(&p);
+	return state;
+}
+
+static void mc_selftest_work(struct work_struct *work)
+{
+	const u32 api = MC_VERSION(MCDRVMODULEAPI_VERSION_MAJOR,
+				   MCDRVMODULEAPI_VERSION_MINOR);
+	struct mc_logging_selftest_info lg;
+	struct nq_selftest_info nq;
+	struct mc_version_info v;
+	const char *admin_node, *user_node;
+	bool started = mc_tee_started();
+	int start_ret = READ_ONCE(main_ctx.start_ret);
+	int core_switch_ret = READ_ONCE(main_ctx.core_switch_ret);
+	bool have_version, wrong_node = false;
+	u32 fc[MC_FC_COUNT_NR];
+	u32 mcp_total, mcp_ver;
+	int sessions, clients;
+	char reasons[160] = "";
+	int i;
+
+#define SELFTEST_FAIL(why) \
+	strlcat(reasons, reasons[0] ? "," why : why, sizeof(reasons))
+
+	for (i = 0; i < MC_FC_COUNT_NR; i++)
+		fc[i] = mc_fastcall_count(i);
+	mcp_total = mcp_cmd_count(false);
+	mcp_ver = mcp_cmd_count(true);
+	have_version = !mcp_get_cached_version(&v);
+	nq_get_selftest_info(&nq);
+	mc_logging_get_selftest_info(&lg);
+	sessions = atomic_read(&g_ctx.c_sessions);
+	clients = atomic_read(&g_ctx.c_clients);
+	admin_node = mc_selftest_node("/dev/" MC_ADMIN_DEVNODE, main_ctx.device,
+				      main_ctx.admin_dev_ok, &wrong_node);
+	user_node = mc_selftest_node("/dev/" MC_USER_DEVNODE, main_ctx.user_dev,
+				     main_ctx.user_dev_ok, &wrong_node);
+
+	pr_info("tee selftest: begin uptime=%lld ms, driver api %u.%u, no SMC/MCP issued by this test\n",
+		mc_uptime_ms(), MCDRVMODULEAPI_VERSION_MAJOR,
+		MCDRVMODULEAPI_VERSION_MINOR);
+	pr_info("tee selftest: start %s ret=%d stage=%s nq_stage=%s info_polls=%u t=%lld..%lld ms core_switch=%d active_cpu=%d\n",
+		started ? "ok" : (start_ret == TEE_START_NOT_TRIGGERED ?
+				  "PENDING" : "FAILED"),
+		start_ret, READ_ONCE(main_ctx.start_stage), nq_start_stage(),
+		nq_start_info_polls(), main_ctx.start_begin_ms,
+		main_ctx.start_end_ms, core_switch_ret, mc_active_core());
+	if (have_version) {
+		pr_info("tee selftest: product_id=\"%.*s\"\n",
+			(int)strnlen(v.product_id, MC_PRODUCT_ID_LEN),
+			v.product_id);
+		pr_info("tee selftest: version mci=0x%08x so=0x%08x mclf=0x%08x container=0x%08x mc_config=0x%08x tl_api=0x%08x dr_api=0x%08x nwd=0x%08x\n",
+			v.version_mci, v.version_so, v.version_mclf,
+			v.version_container, v.version_mc_config,
+			v.version_tl_api, v.version_dr_api, v.version_nwd);
+	} else {
+		pr_info("tee selftest: version not cached (MCP GET_MOBICORE_VERSION never completed)\n");
+	}
+	pr_info("tee selftest: features lpae=%d iwp=%d monotonic=%d time=%d client_login=%d multimap=%d mem_ext=%d ta_auth=%d timeout=%d\n",
+		g_ctx.f_lpae, g_ctx.f_iwp, g_ctx.f_monotonic_time, g_ctx.f_time,
+		g_ctx.f_client_login, g_ctx.f_multimap, g_ctx.f_mem_ext,
+		g_ctx.f_ta_auth, g_ctx.f_timeout);
+	pr_info("tee selftest: mci pa=%pa order=%u (%lu bytes, GFP_USER|__GFP_ZERO); log pa=%pa size=%zu shared=%d version=%u length=%u head=%u\n",
+		&nq.mci_pa, nq.mci_order, PAGE_SIZE << nq.mci_order, &lg.pa,
+		lg.size, lg.shared, lg.version, lg.length, lg.head);
+	pr_info("tee selftest: irq virq=%d hwirq=%lu count=%u\n",
+		nq.irq, nq.hwirq, nq.irq_count);
+	pr_info("tee selftest: fastcalls init=%u info=%u mem_trace=%u nsiq=%u yield=%u swap_cpu=%u other=%u\n",
+		fc[MC_FC_COUNT_INIT], fc[MC_FC_COUNT_INFO],
+		fc[MC_FC_COUNT_MEM_TRACE], fc[MC_FC_COUNT_NSIQ],
+		fc[MC_FC_COUNT_YIELD], fc[MC_FC_COUNT_SWAP_CPU],
+		fc[MC_FC_COUNT_OTHER]);
+	pr_info("tee selftest: mcp cmds total=%u get_version=%u other=%u; clients=%d sessions=%d\n",
+		mcp_total, mcp_ver, mcp_total - mcp_ver, clients, sessions);
+	pr_info("tee selftest: /dev/%s %s (%u:%u), /dev/%s %s (%u:%u)\n",
+		MC_ADMIN_DEVNODE, admin_node, MAJOR(main_ctx.device),
+		MINOR(main_ctx.device), MC_USER_DEVNODE, user_node,
+		MAJOR(main_ctx.user_dev), MINOR(main_ctx.user_dev));
+
+	if (!started)
+		SELFTEST_FAIL("not-started");
+	if (!have_version)
+		SELFTEST_FAIL("no-version");
+	else if (v.version_nwd != api)
+		SELFTEST_FAIL("api-not-6.3");
+	if (started && core_switch_ret)
+		SELFTEST_FAIL("core-switch");
+	if (!main_ctx.admin_dev_ok || !main_ctx.user_dev_ok)
+		SELFTEST_FAIL("devices");
+	if (wrong_node)
+		SELFTEST_FAIL("wrong-devnode");
+	if (fc[MC_FC_COUNT_OTHER])
+		SELFTEST_FAIL("unexpected-fastcall");
+	if (fc[MC_FC_COUNT_INIT] > 1 || fc[MC_FC_COUNT_MEM_TRACE] > 2 ||
+	    fc[MC_FC_COUNT_SWAP_CPU] > 1)
+		SELFTEST_FAIL("fastcall-count");
+	if (mcp_total != mcp_ver || mcp_ver > 1)
+		SELFTEST_FAIL("unexpected-mcp");
+	if (sessions || clients)
+		SELFTEST_FAIL("sessions");
+
+	if (reasons[0])
+		pr_info("tee selftest: FAIL (%s)\n", reasons);
+	else
+		pr_info("tee selftest: PASS\n");
+#undef SELFTEST_FAIL
 }
 
 /*
@@ -711,17 +924,45 @@ static int mobicore_probe(struct platform_device *pdev)
 	if (err)
 		goto err_admin;
 
-#ifndef MC_DELAYED_TEE_START
-	err = mobicore_start();
-#endif
-	if (err)
-		goto err_start;
+	mc_set_start_stage("probed");
+	main_ctx.core_switch_ret = -EINPROGRESS;
+	if (pdev && of_property_read_bool(pdev->dev.of_node,
+					  "samsung,tee-selftest")) {
+		main_ctx.selftest_ms = 110000;
+		of_property_read_u32(pdev->dev.of_node, "samsung,tee-selftest-ms",
+				     &main_ctx.selftest_ms);
+		INIT_DELAYED_WORK(&main_ctx.selftest_work, mc_selftest_work);
+		schedule_delayed_work(&main_ctx.selftest_work,
+				      msecs_to_jiffies(max_t(s64,
+					(s64)main_ctx.selftest_ms - mc_uptime_ms(),
+					0)));
+	}
 
+#ifndef MC_DELAYED_TEE_START
 	/*
-	 * ExySp: for sos performance
-	 * migrate secure OS to a non-booting little core
+	 * crownlte: 4.9 calls mobicore_start() and then
+	 * mc_switch_core(NONBOOT_LITTLE_CORE) right here, inside the initcall.
+	 * The same two calls, in the same order and with the same arguments,
+	 * now run in a dedicated kthread. The SMCs are issued from the
+	 * tee_fastcall worker on CPU0 either way, so the secure world sees the
+	 * identical sequence. The difference is in the NWd only: if the TEE
+	 * never reports MC_STATUS_INITIALIZED (the 4.9 wait loop has no
+	 * timeout) the boot is not held hostage and the self-test can report
+	 * the stage it is stuck in. A failed start no longer unwinds the probe,
+	 * so the MCI and log buffers already handed to the SWd are never freed
+	 * (4.9 freed the MCI pages in that case).
 	 */
-	mc_switch_core(NONBOOT_LITTLE_CORE);
+	main_ctx.start_thread = kthread_run(mobicore_start_thread, NULL,
+					    "tee_start");
+	if (IS_ERR(main_ctx.start_thread)) {
+		err = PTR_ERR(main_ctx.start_thread);
+		main_ctx.start_thread = NULL;
+		mc_dev_err("tee_start thread creation failed: %d", err);
+		if (main_ctx.selftest_ms)
+			cancel_delayed_work_sync(&main_ctx.selftest_work);
+		goto err_start;
+	}
+#endif
 
 	return 0;
 
@@ -757,6 +998,11 @@ static struct platform_driver mc_plat_driver = {
 		.name = "mcd",
 		.owner = THIS_MODULE,
 		.of_match_table = of_match_table,
+		/*
+		 * crownlte: no remove() exists; a sysfs unbind/bind would rerun
+		 * probe and re-send MC_FC_INIT to an initialised TEE.
+		 */
+		.suppress_bind_attrs = true,
 	}
 };
 

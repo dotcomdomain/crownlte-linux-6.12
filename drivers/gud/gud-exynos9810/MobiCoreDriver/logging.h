@@ -20,4 +20,16 @@ void mc_logging_exit(void);
 int mc_logging_start(void);
 void mc_logging_stop(void);
 
+/* crownlte boot self-test helper: read-only, no SMC */
+struct mc_logging_selftest_info {
+	phys_addr_t	pa;
+	size_t		size;
+	bool		shared;
+	u32		version;
+	u32		length;
+	u32		head;
+};
+
+void mc_logging_get_selftest_info(struct mc_logging_selftest_info *info);
+
 #endif /* _MC_LOGGING_H_ */

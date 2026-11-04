@@ -280,6 +280,10 @@ static inline int wait_mcp_notification(void)
 	return -ETIME;
 }
 
+/* crownlte: MCP command counters for the boot self-test (NWd bookkeeping) */
+static atomic_t mcp_cmds_total;
+static atomic_t mcp_cmds_get_version;
+
 static int mcp_cmd(union mcp_message *cmd,
 		   /* The fields below are for debug purpose only */
 		   u32 in_session_id,
@@ -290,6 +294,10 @@ static int mcp_cmd(union mcp_message *cmd,
 	union mcp_message *msg = nq_get_mcp_message();
 	enum cmd_id cmd_id = cmd->cmd_header.cmd_id;
 	struct mcp_command_info *cmd_info;
+
+	atomic_inc(&mcp_cmds_total);
+	if (cmd_id == MC_MCP_CMD_GET_MOBICORE_VERSION)
+		atomic_inc(&mcp_cmds_get_version);
 
 	/* Initialize MCP log */
 	mutex_lock(&l_ctx.last_mcp_cmds_mutex);
@@ -432,10 +440,29 @@ out:
 	return 0;
 }
 
+static struct mc_version_info static_version_info;
+
+/*
+ * crownlte: copy the version mcp_get_version() cached at TEE start. Never
+ * sends an MCP command; -ENODATA if nothing was cached.
+ */
+int mcp_get_cached_version(struct mc_version_info *version_info)
+{
+	if (!READ_ONCE(static_version_info.version_nwd))
+		return -ENODATA;
+
+	memcpy(version_info, &static_version_info, sizeof(*version_info));
+	return 0;
+}
+
+u32 mcp_cmd_count(bool get_version_only)
+{
+	return atomic_read(get_version_only ? &mcp_cmds_get_version :
+			   &mcp_cmds_total);
+}
+
 int mcp_get_version(struct mc_version_info *version_info)
 {
-	static struct mc_version_info static_version_info;
-
 	/* If cache empty, get version from the SWd and cache it */
 	if (!static_version_info.version_nwd) {
 		u32 version = MC_VERSION(MCDRVMODULEAPI_VERSION_MAJOR,

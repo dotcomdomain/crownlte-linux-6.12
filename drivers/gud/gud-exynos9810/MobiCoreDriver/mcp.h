@@ -66,6 +66,9 @@ s32 mcp_session_exitcode(struct mcp_session *mcp_session);
 
 /* Commands */
 int mcp_get_version(struct mc_version_info *version_info);
+/* crownlte self-test helpers: never send MCP commands */
+int mcp_get_cached_version(struct mc_version_info *version_info);
+u32 mcp_cmd_count(bool get_version_only);
 int mcp_load_token(uintptr_t data, const struct mcp_buffer_map *buffer_map);
 int mcp_load_check(const struct tee_object *obj,
 		   const struct mcp_buffer_map *buffer_map);

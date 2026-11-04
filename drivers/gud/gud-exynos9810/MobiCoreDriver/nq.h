@@ -53,6 +53,19 @@ void nq_exit(void);
 int nq_start(void);
 void nq_stop(void);
 
+/* crownlte boot self-test helpers: read-only, no SMC */
+struct nq_selftest_info {
+	phys_addr_t	mci_pa;
+	unsigned int	mci_order;
+	int		irq;
+	unsigned long	hwirq;
+	u32		irq_count;
+};
+
+const char *nq_start_stage(void);
+u32 nq_start_info_polls(void);
+void nq_get_selftest_info(struct nq_selftest_info *info);
+
 /* SWd suspend/resume */
 int nq_suspend(void);
 int nq_resume(void);

@@ -268,8 +268,11 @@ static int irq_bh_worker(void *arg)
 	return 0;
 }
 
+static atomic_t nq_irq_count;
+
 static irqreturn_t irq_handler(int intr, void *arg)
 {
+	atomic_inc(&nq_irq_count);
 	/* wake up thread to continue handling this interrupt */
 	complete(&l_ctx.irq_bh_complete);
 	return IRQ_HANDLED;
@@ -535,6 +538,36 @@ void nq_reset_idle_timeout(void)
 	mutex_unlock(&l_ctx.buffer_mutex);
 }
 
+/*
+ * crownlte: boot self-test bookkeeping (NWd only, nothing here is shared
+ * with or sent to the SWd).
+ */
+static const char *nq_stage = "not-started";
+static u32 nq_info_polls;
+
+const char *nq_start_stage(void)
+{
+	return READ_ONCE(nq_stage);
+}
+
+u32 nq_start_info_polls(void)
+{
+	return READ_ONCE(nq_info_polls);
+}
+
+void nq_get_selftest_info(struct nq_selftest_info *info)
+{
+	struct irq_data *irq_d;
+
+	memset(info, 0, sizeof(*info));
+	info->mci_pa = l_ctx.base ? virt_to_phys(l_ctx.base) : 0;
+	info->mci_order = l_ctx.order;
+	info->irq = l_ctx.irq;
+	irq_d = l_ctx.irq > 0 ? irq_get_irq_data(l_ctx.irq) : NULL;
+	info->hwirq = irq_d ? irq_d->hwirq : 0;
+	info->irq_count = atomic_read(&nq_irq_count);
+}
+
 int nq_start(void)
 {
 	size_t q_len = ALIGN(2 * (sizeof(struct notification_queue_header) +
@@ -542,6 +575,7 @@ int nq_start(void)
 	int ret;
 	struct irq_data *irq_d;
 
+	WRITE_ONCE(nq_stage, "irq-map");
 	/* Make sure we have an interrupt number before going on */
 #if defined(CONFIG_OF)
 	l_ctx.irq = irq_of_parse_and_map(g_ctx.mcd->of_node, 0);
@@ -564,6 +598,7 @@ int nq_start(void)
 	nq_update_time();
 
 	/* Call the INIT fastcall to setup shared buffers */
+	WRITE_ONCE(nq_stage, "fc-init");
 	ret = mc_fc_init(
 		virt_to_phys(l_ctx.base),
 		(uintptr_t)l_ctx.mcp_buffer - (uintptr_t)l_ctx.base,
@@ -594,6 +629,7 @@ int nq_start(void)
 		MAX_IW_SESSION * sizeof(struct interworld_session);
 
 	/* First empty N-SIQ to setup of the MCI structure */
+	WRITE_ONCE(nq_stage, "first-nsiq");
 	ret = mc_fc_nsiq();
 	if (ret)
 		return ret;
@@ -602,10 +638,12 @@ int nq_start(void)
 	 * Wait until the TEE state switches to MC_STATUS_INITIALIZED
 	 * It is assumed that it always switches state at some point
 	 */
+	WRITE_ONCE(nq_stage, "wait-initialized");
 	do {
 		u32 status = 0;
 		u32 timeslot;
 
+		WRITE_ONCE(nq_info_polls, nq_info_polls + 1);
 		ret = mc_fc_info(MC_EXT_INFO_ID_MCI_VERSION, &status, NULL);
 		if (ret)
 			return ret;
@@ -641,14 +679,18 @@ int nq_start(void)
 	} while (ret == EAGAIN);
 
 	/* Set up S-SIQ interrupt handler and its bottom-half */
+	WRITE_ONCE(nq_stage, "irq-request");
 	l_ctx.irq_bh_active = true;
 	l_ctx.irq_bh_thread = kthread_run(irq_bh_worker, NULL, "tee_irq_bh");
 	if (IS_ERR(l_ctx.irq_bh_thread)) {
 		mc_dev_err("irq_bh_worker thread creation failed");
 		return PTR_ERR(l_ctx.irq_bh_thread);
 	}
-	return request_irq(l_ctx.irq, irq_handler, IRQF_TRIGGER_RISING,
-			   "trustonic", NULL);
+	ret = request_irq(l_ctx.irq, irq_handler, IRQF_TRIGGER_RISING,
+			  "trustonic", NULL);
+	if (!ret)
+		WRITE_ONCE(nq_stage, "done");
+	return ret;
 }
 
 void nq_stop(void)

@@ -214,6 +214,24 @@ void mc_logging_run(void)
 		schedule_work(&log_ctx.work);
 }
 
+/*
+ * crownlte: boot self-test view of the shared trace buffer header. Plain
+ * reads of NWd RAM, no SMC.
+ */
+void mc_logging_get_selftest_info(struct mc_logging_selftest_info *info)
+{
+	memset(info, 0, sizeof(*info));
+	if (!log_ctx.trace_page)
+		return;
+
+	info->pa = virt_to_phys((void *)log_ctx.trace_page);
+	info->size = BIT(LOG_BUF_ORDER) * PAGE_SIZE;
+	info->shared = log_ctx.buffer_is_shared;
+	info->version = READ_ONCE(log_ctx.trace_buf->version);
+	info->length = READ_ONCE(log_ctx.trace_buf->length);
+	info->head = READ_ONCE(log_ctx.trace_buf->head);
+}
+
 int mc_logging_start(void)
 {
 	int ret = mc_fc_mem_trace(virt_to_phys((void *)(log_ctx.trace_page)),
