@@ -15,11 +15,15 @@
  *    in acme get_freq().
  *
  * Samsung's DVFS Manager is not ported. When a samsung,mif-devfreq supplier
- * is present, the CPU->MIF minimum constraints are enforced through device
- * PM QoS. Without one, MIF stays at its current rate. In that case every
- * level whose ECT MINLOCK MIF requirement (acme "mif-skew", a chipset
- * guidance constraint) the current MIF rate does not meet is dropped from the
- * table, including when the MIF rate cannot be read.
+ * is present, each CPU level raises MIF through a device PM QoS minimum
+ * request before the CPU goes up, as the 4.9 DVFS Manager did: the mif-perf
+ * floor is best effort (MIF goes as far as its maximum allows and the CPU
+ * still scales), while a level whose ECT MINLOCK skew MIF cannot reach is
+ * refused (4.9 capped the CPU there). Without a supplier, MIF stays at its
+ * current rate. In that case every level whose ECT MINLOCK MIF requirement
+ * (acme "mif-skew", a chipset guidance constraint) the current MIF rate does
+ * not meet is dropped from the table, including when the MIF rate cannot be
+ * read.
  *
  * samsung,max-freq-cap is an additional hard ceiling. It is not in 4.9; it
  * keeps big at 4.9's policy-max until thermal throttling has been verified.
@@ -191,7 +195,16 @@ static struct exynos9810_domain *exynos9810_find_domain(unsigned int cpu)
 	return NULL;
 }
 
-static int exynos9810_set_mif_floor(struct exynos9810_domain *domain, u32 floor)
+/*
+ * Move this domain's MIF minimum request to @floor kHz and report the MIF
+ * rate that results, in kHz. The 4.9 DVFS Manager called the MIF scaler and
+ * ignored its result, so a failed or capped MIF update is not an error here;
+ * the caller decides what the resulting rate means. The rate is the CMU
+ * readback, or devfreq's last set rate while CAL reads 0 (mid-transition).
+ * Only a rejected QoS request (a driver bug) returns an error.
+ */
+static int exynos9810_set_mif_floor(struct exynos9810_domain *domain, u32 floor,
+				    unsigned long *mif_khz)
 {
 	struct devfreq *mif = provider->mif;
 	unsigned long actual_hz = 0;
@@ -203,13 +216,13 @@ static int exynos9810_set_mif_floor(struct exynos9810_domain *domain, u32 floor)
 	domain->mif_floor = floor;
 	mutex_lock(&mif->lock);
 	ret = update_devfreq(mif);
-	if (!ret)
-		ret = mif->profile->get_cur_freq(mif->dev.parent, &actual_hz);
+	if (mif->profile->get_cur_freq(mif->dev.parent, &actual_hz) || !actual_hz)
+		actual_hz = mif->previous_freq;
 	mutex_unlock(&mif->lock);
 	if (ret)
-		return ret;
-	if (actual_hz < (unsigned long)floor * 1000)
-		return -ERANGE;
+		dev_warn_ratelimited(provider->dev, "domain%u: MIF update for a %u kHz floor failed: %d\n",
+				     domain->id, floor, ret);
+	*mif_khz = actual_hz / 1000;
 	return 0;
 }
 
@@ -219,6 +232,7 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 	struct exynos9810_domain *domain = policy->driver_data;
 	u32 old_floor = domain->mif_floor;
 	u32 new_floor = 0;
+	unsigned long mif_khz;
 	unsigned int freq;
 	int ret;
 
@@ -229,9 +243,30 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 		new_floor = domain->mif_khz[index];
 		/* Raise dependent MIF first, then ask firmware to raise the CPU. */
 		if (new_floor > old_floor) {
-			ret = exynos9810_set_mif_floor(domain, new_floor);
+			ret = exynos9810_set_mif_floor(domain, new_floor, &mif_khz);
 			if (ret)
 				return ret;
+			/*
+			 * The ECT MINLOCK skew is chipset guidance. 4.9 turned it
+			 * into a CPU maximum derived from the MIF maximum, so it
+			 * never ran a level whose skew MIF could not reach. Refuse
+			 * such a level and drop the request back to the old floor,
+			 * so that a retry is checked again.
+			 */
+			if (mif_khz < domain->skew_khz[index]) {
+				dev_warn_ratelimited(provider->dev, "domain%u: %u kHz needs MIF >= %u kHz (ECT skew), MIF is %lu kHz\n",
+						     domain->id, freq, domain->skew_khz[index], mif_khz);
+				exynos9810_set_mif_floor(domain, old_floor, &mif_khz);
+				return -ERANGE;
+			}
+			/*
+			 * The mif-perf floor is a performance hint. 4.9 raised MIF
+			 * as far as the MIF maximum allowed and scaled the CPU
+			 * anyway. The request stays in place.
+			 */
+			if (mif_khz < new_floor)
+				dev_dbg_ratelimited(provider->dev, "domain%u: %u kHz with MIF %lu kHz below its %u kHz floor\n",
+						    domain->id, freq, mif_khz, new_floor);
 		}
 	}
 	ret = cal_dfs_set_rate(domain->cal_id, freq);
@@ -246,15 +281,13 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 	}
 	WRITE_ONCE(domain->last_khz, freq);
 	/*
-	 * The CPU transition has succeeded. Retain a conservative old floor if
-	 * releasing its MIF requirement fails; do not misreport the CPU change.
+	 * The CPU transition has succeeded. A lower floor only releases MIF;
+	 * whatever MIF does with it, the CPU change stands.
 	 */
 	if (provider->mif && new_floor < old_floor) {
-		ret = exynos9810_set_mif_floor(domain, new_floor);
-		if (ret) {
-			exynos9810_set_mif_floor(domain, old_floor);
+		ret = exynos9810_set_mif_floor(domain, new_floor, &mif_khz);
+		if (ret)
 			dev_warn_ratelimited(provider->dev, "MIF floor release failed: %d\n", ret);
-		}
 	}
 	return 0;
 }
@@ -282,6 +315,7 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 	struct exynos9810_domain *domain = exynos9810_find_domain(policy->cpu);
 	unsigned int rate, target, i;
 	bool listed = false;
+	unsigned long mif_khz;
 	u32 floor = 0;
 	int ret;
 
@@ -309,9 +343,13 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 			}
 			floor = max(floor, domain->mif_khz[i]);
 		}
-		ret = exynos9810_set_mif_floor(domain, floor);
+		/* The CPU already runs at this rate; only report a shortfall. */
+		ret = exynos9810_set_mif_floor(domain, floor, &mif_khz);
 		if (ret)
 			return ret;
+		if (mif_khz < floor)
+			dev_warn(provider->dev, "domain%u: boot rate %u kHz with MIF %lu kHz below its %u kHz floor\n",
+				 domain->id, rate, mif_khz, floor);
 	}
 	/*
 	 * Move an unlisted boot rate (e.g. above samsung,max-freq-cap) onto the
