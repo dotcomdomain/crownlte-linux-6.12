@@ -346,3 +346,175 @@ If a phase fails:
   reverse-engineered.
 - BIG-cluster CPD (4.9 0x01000000 + MAILBOX_APM2AP bit 24) is still not
   used. It only becomes relevant after the secondaries pass.
+
+## 7. Trial q40-idlec result and the q43-idled changes
+
+q40 ran on 2026-11-04 (Image 0ad1b4cf, recovery d799010d). The log is in
+`trial-acpm-q40-idlec-s2-20261104/serial-ready.bin`.
+
+### 7.1 What q40 confirmed and refuted
+
+- **The C2 hook reset works.** Before the test, `event_grp2=0xffffff00`,
+  `grp2_pend=0`, and every `inform` is 0. The CLEAR registers read back 0
+  (`grp1_clr=0x0 grp2_clr=0x0`), so PMUCAL's read-modify-write on them
+  writes only the core's own bit. The RMW race is ruled out. CONFIRMED.
+- **The stale-state explanation for -22 is refuted.** `psci_fail` with -22
+  still happens about once per 170-240 LITTLE entries (little-1 cpu1 +1,
+  little-2 cpu1 +1 and cpu2 +2) with clean hooks. It never hit the BIG
+  core, which instead gets `early` (-95, 12 times in big-1). CONFIRMED.
+  These are harmless: the core falls back to WFI and comes back.
+- **The failure needs three LITTLE secondaries.** little-1 and little-2
+  (about 430 cycles with two cores) passed. In little-3, **cpu3's very
+  first C2 entry never returned**: `c2_enter=+1 resumed=+0`, and its
+  sleeper never completed a loop (`loops=0`). So cpu3 went down right
+  after arming. CONFIRMED.
+- **`grp2_en=0x80` is cpu3's own bit**, not cpu7's: LITTLE phy N uses
+  INTR_GEN bit 4+N, and FAIL-state `grp2_en=0xe0` = cpu1+2+3. CONFIRMED.
+
+### 7.2 cpu3's sequence
+
+| when | STATUS | CONFIG | INFORM | GRP1_EN | GRP1_PEND | GRP2_EN | stage |
+|---|---|---|---|---|---|---|---|
+| FAIL (+123 ms) | 0x880000 off | 0x0 | 0x1 | 0x80 (bit7) | 0x7f (bit7 **clear**) | 0xe0 | firmware |
+| after disarm +300 ms | 0x100f0f on | 0xf | 0x1 | 0x0 | 0xff | 0x80 | firmware |
+| after PSCI CPU_ON (=0) | 0x100f0f on | 0xf | 0x1 | 0x0 | 0xff | 0x80 | firmware |
+
+What this means:
+
+1. **The APM did its half.** It powered cpu3 off (CONFIG=0) and armed its
+   GRP1 wakeup (GRP1_EN bit 7). This matches the APM core-off table
+   (`CONFIGURATION[3:0]=0`, then `GRP1_EN |= bit`). So **the wakeup was not
+   lost because GRP1 was disabled**: at the failure it was enabled.
+   `grp1_en=0x0` after the disarm is the normal state after the APM's
+   core-on sequence, which clears it. CONFIRMED.
+2. **No wake event reached the PMU for cpu3.** GRP1_PEND bit 7 stayed 0
+   for more than 100 ms, although cpu3's own 10 ms broadcast-timer IPI and
+   the ping SGI were pending for it. GRP1_PEND is a latch: bits for running
+   cores stay 1 until cleared, and the kernel's core-off sequence clears
+   the core's own bit before CPU_SUSPEND. CONFIRMED by the register values.
+   *Why* the GIC wake output for cpu3 did not latch is unknown.
+3. **A later wake did latch, the APM powered cpu3 on, and the core never
+   left EL3.** After the disarm IPIs GRP1_PEND bit 7 is 1, GRP1_EN is
+   cleared, CONFIG=0xf and STATUS is on. But the stage marker is still
+   `firmware`: `psci_cpu_suspend_enter()` never returned. INFORM is still 1
+   and GRP2_EN bit 7 is still set, so `cal_cpu_enable()` never ran.
+   `pmucal_cpu_lock` was free, so cpu3 was not spinning on a kernel lock
+   held by another core. CONFIRMED.
+4. **EL3 holds cpu3 as OFF.** PSCI CPU_ON(cpu3, cpu_resume) returned 0
+   (SUCCESS). In a standard PSCI implementation, CPU_ON on a suspended or
+   running core returns ALREADY_ON (-4). Nothing changed afterwards: the
+   core was already powered, so no new reset happened. INFERRED: the core
+   came out of reset into EL3 warm boot, EL3 found no valid suspend record
+   for it (or a record from a power-down it did not expect), and parked it
+   (WFI/WFE) as an OFF core waiting for a CPU_ON-triggered power-up.
+
+So the q22b/q40 failure has one signature on two different cores (cpu1
+in q22b, cpu3 in both): the third concurrent LITTLE power-down loses its
+wakeup, and the core that finally gets powered back on is stuck in EL3.
+The trigger is concurrency inside cluster 0 (CPU0 never in C2). The EL3
+monitor is not in the readable part of the boot LUN (sboot only prints
+"EL3 Monitor information"), so the EL3 side could not be decompiled.
+
+### 7.3 4.9 comparison for these questions (CONFIRMED from source)
+
+- **4.9 never writes GRP1_EN.** The only kernel writes to INTR_GEN group
+  enables are the per-core GRP2 bits in `flexpmu_cal_cpu_exynos9810.h` and
+  CPU0's GRP2 bit in the SICD/SLEEP system sequences
+  (`flexpmu_cal_system_exynos9810.h`). GRP1 is entirely APM-managed, as in
+  6.12.
+- **4.9 has no per-cluster C2 limit and no cluster vote for LITTLE C2.**
+  `exynos_cpu_pm_enter()` adds only CPD (BIG cluster, all BIG cores in C2)
+  and SICD (all CPUs in C2, IDLE_IP clear). `c2_lock` only serializes the
+  bookkeeping, not the CPU_SUSPEND calls.
+- **4.9 wakes idle cores differently.** The 4.9 MCT driver
+  (`drivers/clocksource/exynos_mct.c`, `percpu_mct_tick`) gives every CPU
+  its own MCT local timer: an SPI routed to that CPU. 6.12 uses one MCT
+  global comparator as tick broadcast on CPU0, so every timer wakeup of a C2
+  core is an SGI sent by CPU0, often with several targets at once.
+- **In 4.9 CPU0 enters C2 too.** The state "cpus 1-3 powered down, CPU0 in
+  plain WFI for long periods" is normal in 6.12 (CPU0 is never armed) but
+  short-lived in 4.9.
+
+The last two are the remaining environmental differences that could
+explain why 4.9 survives three concurrent LITTLE power-downs.
+INFERRED; q43 tests the CPU0 one directly.
+
+### 7.4 q43-idled changes (commit e183d6ae8)
+
+- **Mitigation, on by default:** at most 2 cluster-0 cores inside the C2
+  path at once (`samsung,c2-little-limit`, 0 = none). A third LITTLE core
+  that wants C2 runs WFI instead (counted as `guarded`). q40 passed with 2.
+- **Timeline sampler** on cpu7 for every phase that does not use cpu7.
+  For cpus 1-3 it records STATUS/CONFIG/INFORM/stage, plus the INTR_GEN
+  group bytes. It stores one entry per change: the first 128 after arming
+  and the last 256. Marks are recorded for arm, each ping round, fail,
+  disarm and recover. The timeline is dumped only when a phase fails.
+- **Recovery:** PSCI AFFINITY_INFO of the lost core and of a running one.
+  Then a new last step, "pmu-cycle", only after CPU_ON returned 0 for a
+  powered core: disarm its GRP2, request power-down through CONFIGURATION
+  (this completes only if the core sits in WFI), then power-up. That gives
+  the core the reset that EL3's recorded CPU_ON needs.
+- `PSCI_VERSION` is logged at the start (raw SMC from a helper CPU).
+
+Phases (800 ms each), in order:
+
+| # | phase | CPUs | LITTLE limit | purpose |
+|---|---|---|---|---|
+| 1 | little-1 | 1 | 2 | baseline |
+| 2 | big-1 | 4 | 2 | baseline |
+| 3 | little-2 | 1,2 | 2 | known pass |
+| 4 | little-3-lim | 1,2,3 | 2 | **the fix**: q40's failing case with the limit |
+| 5 | big-4 | 4-7 | 2 | all BIG cores at once (not run alone before) |
+| 6 | secondaries-lim | 1-7 | 2 | **the fix** for everything except CPU0 |
+| 7 | cpu3-solo | 3 | none | is it cpu3 itself? |
+| 8 | little-13 | 1,3 | none | pair with cpu3 |
+| 9 | little-23 | 2,3 | none | pair with cpu3 |
+| 10 | little-3-busy0 | 1,2,3 | none | three at once, CPU0 never in WFI |
+| 11 | little-3-raw | 1,2,3 | none | the q40 reproducer, last |
+
+Phases 7-11 are bisect phases and may lose a CPU. The first failing phase
+ends the test with the full timeline. The watchdog guard then turns the
+hung restart into a reset, as it did on q40.
+
+### 7.5 Reading q43
+
+1. `cluster-0 C2 limit 2` at probe, then `PSCI_VERSION=...` at about 90 s.
+2. Phases 1-6 must PASS. `guarded=+N` > 0 on cpus 1-3 in little-3-lim and
+   secondaries-lim shows the limit at work. If any of phases 1-6 fails, the
+   mitigation is wrong: read its timeline.
+3. `done result=PASS phases_passed=11/11`: three concurrent LITTLE C2s
+   work in every bisect variant. The q40 loss was then intermittent, or
+   it depends on timing that the timeline sampler (cpu7 busy) changes.
+   Keep the limit and rerun.
+4. `result=FAIL-IN-BISECT ... failed_phase=<p>`: phases 1-6 passed, so
+   the limit is a working mitigation. The failing phase tells what
+   matters:
+   - `cpu3-solo`: something about cpu3 itself (per-core EL3/APM data or
+     wake line), not concurrency. q22b's cpu1 loss argues against this.
+   - `little-13` or `little-23`: any pair with cpu3 is enough. Two cores
+     are fine only without cpu3.
+   - `little-3-busy0`: three at once fails even with CPU0 awake, so the
+     problem is the third concurrent LITTLE power-down itself.
+   - `little-3-raw` only (busy0 passed): it needs CPU0 to be in WFI while
+     cpus 1-3 are down. That points at a cluster-0 "all cores in WFI or
+     off" condition in the APM/PMU, which never happens in 4.9 because
+     CPU0 takes C2 there too. The next step would be to let CPU0 take C2
+     (stage C2) or to keep one LITTLE core awake.
+5. In the failing phase's timeline (`tl-first#`/`tl#`), find the lost core:
+   - its stage goes 1 → 2 (cal_off → firmware);
+   - STATUS goes off and CONFIG goes 0;
+   - its GRP1_EN bit (`g1e`) is set.
+
+   Then check whether its `g1p` bit ever becomes 1 between the `ping` marks.
+   Compare that with what the other two cores were doing at that moment
+   (stage and STATUS): which of them went down last, and how close
+   together.
+6. Recovery lines: `recover cpuN PSCI AFFINITY_INFO=<0 on|1 off>`,
+   compared with `reference cpuM ...=0`. Then `RECOVERED cpuN via
+   pmu-cycle` would show that the core was parked in EL3 and that CPU_ON
+   plus a power-cycle brings it back. That would make a self-healing
+   path possible.
+7. If a CPU is lost, the restart hangs, and the log must show
+   `restart: armed for 30 s and no longer petted` and
+   `restart with lost CPUs N: cpuidle_pause() skipped`. Then a WDT reset
+   follows, and the shim bounce returns the phone to Lineage, as on q40.
