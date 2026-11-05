@@ -830,18 +830,38 @@ static const struct iio_chan_spec exynos_adc_iio_channels[] = {
  * DT-gated self-test (samsung,adc-selftest-ms): convert every channel five
  * times through the normal read path and log the raw codes. Only the
  * conversion registers are written (9 writes per conversion on Exynos9810).
+ *
+ * Other consumers (the MAX77705 battery monitor) may convert concurrently;
+ * their conversions are counted too. The counters are sampled under
+ * info->lock, which every conversion holds across all of its register
+ * writes, so the 9-per-conversion check never sees half a conversion
+ * (trial q34: 804 writes for 90 conversions, snapshot taken mid-conversion).
+ * Channels that read 0 or full scale on every sample are unwired on this
+ * board (q34: ch5/6/7/9 read 0); they are reported, not counted as errors.
  */
 #define EXYNOS_ADC_SELFTEST_SAMPLES	5
+
+static void exynos_adc_selftest_counters(struct exynos_adc *info,
+					 unsigned long *w, unsigned long *c,
+					 unsigned long *t)
+{
+	mutex_lock(&info->lock);
+	*w = info->reg_writes;
+	*c = info->conversions;
+	*t = info->timeouts;
+	mutex_unlock(&info->lock);
+}
 
 static void exynos_adc_selftest_work(struct work_struct *work)
 {
 	struct exynos_adc *info = container_of(to_delayed_work(work),
 					       struct exynos_adc, selftest);
 	struct iio_dev *indio_dev = dev_get_drvdata(info->dev);
-	unsigned long w0 = info->reg_writes, c0 = info->conversions;
-	unsigned long t0 = info->timeouts;
+	unsigned long w0, c0, t0, w1, c1, t1;
 	int ch, i, errors = 0, stuck = 0, distinct = 0, first = -1;
 	bool pass;
+
+	exynos_adc_selftest_counters(info, &w0, &c0, &t0);
 
 	dev_info(info->dev,
 		 "adc selftest: regs before: CON1=%08x CON2=%08x DAT=%08x INT_EN=%08x INT_ST=%08x VER=%08x\n",
@@ -870,7 +890,9 @@ static void exynos_adc_selftest_work(struct work_struct *work)
 				 ch, i, ret);
 			continue;
 		}
-		if (lo == 0 || hi == ADC_DATX_MASK)
+		/* unwired: every sample at a rail; informational only */
+		if ((lo == 0 && hi == 0) ||
+		    (lo == ADC_DATX_MASK && hi == ADC_DATX_MASK))
 			stuck++;
 		if (first < 0)
 			first = v[0];
@@ -881,20 +903,18 @@ static void exynos_adc_selftest_work(struct work_struct *work)
 			 ch, v[0], v[1], v[2], v[3], v[4], hi - lo, us);
 	}
 
-	pass = !errors && info->timeouts == t0 && distinct > 0 &&
-	       (!info->data->init_per_read ||
-		info->reg_writes - w0 == 9 * (info->conversions - c0));
+	exynos_adc_selftest_counters(info, &w1, &c1, &t1);
+	pass = !errors && t1 == t0 && distinct > 0 &&
+	       (!info->data->init_per_read || w1 - w0 == 9 * (c1 - c0));
 	dev_info(info->dev,
 		 "adc selftest: regs after: CON1=%08x CON2=%08x INT_EN=%08x INT_ST=%08x\n",
 		 readl(ADC_V2_CON1(info->regs)), readl(ADC_V2_CON2(info->regs)),
 		 readl(ADC_V2_INT_EN(info->regs)), readl(ADC_V2_INT_ST(info->regs)));
 	dev_info(info->dev,
-		 "adc selftest: conversions=%lu (total %lu) timeouts=%lu errors=%d rail-codes=%d mux-varies=%d reg_writes=%lu (%lu per conversion, total %lu) -> %s\n",
-		 info->conversions - c0, info->conversions, info->timeouts - t0,
-		 errors, stuck, distinct > 0, info->reg_writes - w0,
-		 info->conversions - c0 ?
-			(info->reg_writes - w0) / (info->conversions - c0) : 0,
-		 info->reg_writes, pass ? "PASS" : "FAIL");
+		 "adc selftest: conversions=%lu (total %lu) timeouts=%lu errors=%d unwired(rail-code)=%d mux-varies=%d reg_writes=%lu (%lu per conversion, total %lu) -> %s\n",
+		 c1 - c0, c1, t1 - t0, errors, stuck, distinct > 0, w1 - w0,
+		 c1 - c0 ? (w1 - w0) / (c1 - c0) : 0, w1,
+		 pass ? "PASS" : "FAIL");
 }
 
 
