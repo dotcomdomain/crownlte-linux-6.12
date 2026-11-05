@@ -45,6 +45,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/sync_file.h>
+#include <linux/time.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 
@@ -235,6 +236,8 @@ static int dpu_bounce_copy_vmap(struct dpu_buf *b, void *dst)
  * target takes 2 x 17.3 MB, bars a few hundred KiB each; a window whose slot
  * cannot be allocated fails the frame with a log line.
  */
+static void dpu_bisect_pattern(const struct decon_win_config *w, void *dst);
+
 static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 {
 	int i, ret;
@@ -265,10 +268,18 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 			dev_info(d->dev, "win%d bounce buffer %d: %zu bytes at %pad\n",
 				 i, d->bounce_next[i], t->size, &t->dma);
 		}
-		ret = b->sgt ? dpu_bounce_copy_sg(d, b, t->vaddr, &inval_us) : -ENOENT;
-		if (ret == -ENOENT) {
-			path = "dma_buf_vmap";
-			ret = dpu_bounce_copy_vmap(b, t->vaddr);
+		if (c->pattern_win & BIT(i)) {
+			/* hwc-bisect variant B: linear pattern instead of the AFBC data */
+			path = "bisect test pattern";
+			c->cfg[i].compression = 0;
+			dpu_bisect_pattern(&c->cfg[i], t->vaddr);
+			ret = 0;
+		} else {
+			ret = b->sgt ? dpu_bounce_copy_sg(d, b, t->vaddr, &inval_us) : -ENOENT;
+			if (ret == -ENOENT) {
+				path = "dma_buf_vmap";
+				ret = dpu_bounce_copy_vmap(b, t->vaddr);
+			}
 		}
 		if (ret) {
 			dev_err_ratelimited(d->dev, "win%d: bounce copy (%s) failed: %d\n",
@@ -519,6 +530,87 @@ out:
 	return ret;
 }
 
+/* ---- HWC black-screen bisect ------------------------------------------- */
+
+/*
+ * For the first @hwc_bisect_ms of HWC frames, cycle the client target (the
+ * AFBC window on VGF0) through three variants, 2 s each, and log every
+ * switch with the wall-clock time so a camera recording can be matched:
+ *  A  as HWC sent it: AFBC on VGF0 (channel 1);
+ *  B  the same window and channel, but a kernel-drawn linear test pattern
+ *     (white/red/green/blue quarters, top to bottom) instead of the AFBC
+ *     buffer: tests the VGF0 window/channel path without AFBC;
+ *  C  HWC's AFBC buffer on VGF1 (channel 2) instead: tests VGF0 itself.
+ * Diagnostic default for the ROM-in-RAM trials; 0 disables it
+ * (exynos9810_dpu.hwc_bisect_ms=0 or /sys/module/.../parameters).
+ */
+static unsigned int hwc_bisect_ms = 20000;
+module_param(hwc_bisect_ms, uint, 0644);
+MODULE_PARM_DESC(hwc_bisect_ms, "cycle the HWC client target through AFBC/VGF0, test pattern, AFBC/VGF1 for this long (0 = off)");
+
+enum { DPU_BIS_A, DPU_BIS_B, DPU_BIS_C, DPU_BIS_N };
+static const char * const dpu_bisect_name[DPU_BIS_N] = {
+	"A (HWC AFBC on VGF0, as sent)",
+	"B (kernel linear test pattern on VGF0: white/red/green/blue)",
+	"C (HWC AFBC moved to VGF1)",
+};
+
+static void dpu_bisect(struct dpu_dev *d, struct dpu_commit *c)
+{
+	unsigned long used = 0;
+	int i, tw = -1, v;
+	s64 ms;
+
+	if (!READ_ONCE(hwc_bisect_ms) || d->bisect_done || c->internal)
+		return;
+	for (i = 0; i < DECON_MAX_WIN; i++) {
+		const struct decon_win_config *w = &c->cfg[i];
+
+		if (w->state != DECON_WIN_STATE_BUFFER)
+			continue;
+		__set_bit(w->idma_type, &used);
+		if (tw < 0 && w->compression && w->idma_type == DECON_IDMA_VGF0 &&
+		    c->buf[i].bounce)
+			tw = i;
+	}
+	if (tw < 0)
+		return;
+	if (!d->bisect_started) {
+		d->bisect_started = true;
+		d->bisect_t0 = ktime_get();
+		d->bisect_var = -1;
+	}
+	ms = ktime_ms_delta(ktime_get(), d->bisect_t0);
+	if (ms >= READ_ONCE(hwc_bisect_ms)) {
+		d->bisect_done = true;
+		dev_info(d->dev, "hwc-bisect: done after %lld ms, back to variant A for good\n", ms);
+		return;
+	}
+	v = (ms / 2000) % DPU_BIS_N;
+	if (v == DPU_BIS_C && test_bit(DECON_IDMA_VGF1, &used))
+		v = DPU_BIS_A;		/* VGF1 busy with another layer */
+	if (v == DPU_BIS_C)
+		c->cfg[tw].idma_type = DECON_IDMA_VGF1;
+	if (v == DPU_BIS_B)
+		c->pattern_win = BIT(tw);
+	c->bisect_var = v;
+	if (v != d->bisect_var) {
+		d->bisect_var = v;
+		c->bisect_log = true;
+	}
+}
+
+/* B: four horizontal bands, linear XBGR8888 (memory bytes X,B,G,R) */
+static void dpu_bisect_pattern(const struct decon_win_config *w, void *dst)
+{
+	static const u32 band[4] = { 0xffffffff, 0xff0000ff, 0x00ff00ff, 0x0000ffff };
+	u32 rows = w->src.f_h / 4, b;
+
+	for (b = 0; b < 4; b++)
+		memset32(dst + (size_t)b * rows * w->src.f_w * 4, band[b],
+			 (size_t)(b == 3 ? w->src.f_h - 3 * rows : rows) * w->src.f_w);
+}
+
 /* ---- content / register diagnostics ----------------------------------- */
 
 /* latched copy of a DECON SFR (4.9 decon_dump(): regs + SHADOW_OFFSET) */
@@ -595,7 +687,7 @@ static void dpu_diag_regs(struct dpu_dev *d, struct dpu_commit *c, int win, cons
 	u32 in = dpu_hw_dma_rd(d, dpp, IDMA_IN_CON);
 	u32 ain = dpu_hw_dma_active_rd(d, dpp, IDMA_IN_CON);
 
-	dev_info(d->dev, "diag %s win%d: state %u pa %d blend %u comp %u fmt %u->dpp %u | DECON SFR/active: DP0 %#x/%#x DP1 %#x/%#x WIN_CTL0 %#x/%#x WIN_CTL1 %#x/%#x START %#x/%#x END %#x/%#x CMAP %#x,%#x/%#x,%#x BG_SIZE %#x/%#x BG_COL %#x,%#x/%#x,%#x\n",
+	dev_info(d->dev, "diag %s win%d: state %u pa %d blend %u comp %u fmt %u->dpp %u | DECON SFR/active: DP0 %#x/%#x DP1 %#x/%#x WIN_CTL0 %#x/%#x WIN_CTL1 %#x/%#x START %#x/%#x END %#x/%#x CMAP %#x,%#x/%#x,%#x BG_SIZE %#x/%#x BG_COL %#x,%#x/%#x,%#x | out CRC ctl %#x data0 %#x data2 %#x\n",
 		 tag, win, w->state, w->plane_alpha, w->blending, w->compression, w->format,
 		 c->dpp_fmt[win],
 		 decon_rd(d, DATA_PATH_CONTROL_0), decon_rd_shd(d, DATA_PATH_CONTROL_0),
@@ -609,7 +701,8 @@ static void dpu_diag_regs(struct dpu_dev *d, struct dpu_commit *c, int win, cons
 		 decon_rd(d, BLENDER_BG_IMAGE_SIZE_0), decon_rd_shd(d, BLENDER_BG_IMAGE_SIZE_0),
 		 decon_rd(d, BLENDER_BG_IMAGE_COLOR_0), decon_rd(d, BLENDER_BG_IMAGE_COLOR_1),
 		 decon_rd_shd(d, BLENDER_BG_IMAGE_COLOR_0),
-		 decon_rd_shd(d, BLENDER_BG_IMAGE_COLOR_1));
+		 decon_rd_shd(d, BLENDER_BG_IMAGE_COLOR_1),
+		 decon_rd(d, CRC_CONTROL), decon_rd(d, CRC_DATA_0), decon_rd(d, CRC_DATA_2));
 	if (w->state != DECON_WIN_STATE_BUFFER)
 		return;
 	dev_info(d->dev, "diag %s win%d: IDMA%d SFR/active IN_CON %#x/%#x (afbc %d/%d, fmt %u/%u) BASE %#x/%#x (want %pad) SRC %#x/%#x IMG %#x/%#x RECOVERY %#x | DPP IN_CON %#x IMG %#x\n",
@@ -635,13 +728,37 @@ static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
 	bool sample = c->bounced && (d->nr_bounces <= 3 || !(d->nr_bounces % 100));
 	int i;
 
-	if (!first && !sample)
+	if (!first && !sample && !c->bisect_log)
 		return;
+	if (first) {
+		/*
+		 * Output CRC (4.9 decon_reg_set_start_crc(), "DECON CRC for
+		 * ASB"): a passive checksum of what DECON sends to DSIM, latched
+		 * with the next shadow update. A constant value across frames
+		 * whose content differs would mean the output does not follow
+		 * the input.
+		 */
+		mutex_lock(&d->hw_lock);
+		decon_wr_mask(d, CRC_CONTROL, CRC_START, CRC_START);
+		mutex_unlock(&d->hw_lock);
+	}
 	d->diag_latched = true;
+	if (c->bisect_log) {
+		struct timespec64 ts;
+		struct tm tm;
+
+		ktime_get_real_ts64(&ts);
+		time64_to_tm(ts.tv_sec, 0, &tm);
+		dev_info(d->dev, "hwc-bisect: variant %s from wall %02d:%02d:%02d.%03ld UTC, %lld ms after the first HWC frame, FRAME_COUNT %u\n",
+			 dpu_bisect_name[c->bisect_var], tm.tm_hour, tm.tm_min, tm.tm_sec,
+			 ts.tv_nsec / NSEC_PER_MSEC,
+			 ktime_ms_delta(ktime_get(), d->bisect_t0), dpu_hw_frame_count(d));
+	}
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		if (c->cfg[i].state == DECON_WIN_STATE_DISABLED)
 			continue;
-		dpu_diag_regs(d, c, i, first ? "first HWC latch" : "sample");
+		dpu_diag_regs(d, c, i, first ? "first HWC latch" :
+			      c->bisect_log ? "bisect" : "sample");
 		if (sample && c->buf[i].bounce)
 			dpu_diag_content(d, c, i);
 	}
@@ -662,12 +779,15 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		c->acq[i] = NULL;
 	}
 
+	dpu_bisect(d, c);
 	c->result = dpu_bounce(d, c);
 	if (!c->result)
 		c->result = dpu_apply(d, c);
 	d->nr_commits++;
 	if (!c->result && !c->internal)
 		dpu_diag(d, c);		/* before bounce_next moves on */
+	else if (c->bisect_log)
+		d->bisect_var = -1;	/* not latched: log the variant on the next frame */
 	/* the bounce buffer just written is now (or may be) scanned */
 	if (c->result == 0 || c->result == -ETIMEDOUT)
 		for_each_set_bit(i, &c->bounced, DECON_MAX_WIN)
