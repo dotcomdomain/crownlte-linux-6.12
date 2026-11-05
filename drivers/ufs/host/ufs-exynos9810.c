@@ -907,7 +907,8 @@ static void exynos_ufs_setup_xfer_req(struct ufs_hba *hba, int tag,
 		struct scsi_cmnd *cmd = scsi_host_find_tag(hba->host, tag);
 
 		if (cmd) {
-			struct ufshcd_lrb *lrbp = scsi_cmd_priv(cmd);
+			/* 6.12 keeps the LRBs in hba->lrb[]; scsi_cmd_priv() is 6.13+ */
+			struct ufshcd_lrb *lrbp = &hba->lrb[tag];
 			int len = le16_to_cpu(lrbp->utr_descriptor_ptr->prd_table_length);
 			int segs = hba->quirks & UFSHCD_QUIRK_PRDT_BYTE_GRAN ?
 				   len / (int)ufshcd_sg_entry_size(hba) : len;
