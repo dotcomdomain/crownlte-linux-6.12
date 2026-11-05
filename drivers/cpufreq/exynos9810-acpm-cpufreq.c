@@ -536,20 +536,32 @@ static int exynos9810_policy_offline(struct cpufreq_policy *policy)
 		.old = policy->cur,
 		.new = domain->table[low].frequency,
 	};
-	unsigned long mif_khz;
-	int ret = 0;
+	unsigned long mif_khz, rate;
+	int ret;
 
 	exynos9810_domain_stop_retry(domain);
-	if (freqs.new != freqs.old) {
+	/*
+	 * Always send the request: after a failed FREQ_REQ the core puts
+	 * policy->cur back to the old rate although the hardware may have
+	 * moved, so policy->cur cannot show that the cluster is already low.
+	 */
+	if (freqs.new != freqs.old)
 		cpufreq_freq_transition_begin(policy, &freqs);
-		ret = cal_dfs_set_rate(domain->cal_id, freqs.new);
-		if (!ret)
-			WRITE_ONCE(domain->last_khz, freqs.new);
+	ret = cal_dfs_set_rate(domain->cal_id, freqs.new);
+	if (!ret)
+		WRITE_ONCE(domain->last_khz, freqs.new);
+	if (freqs.new != freqs.old)
 		cpufreq_freq_transition_end(policy, &freqs, ret);
-	}
 	if (ret) {
 		pr_err("exynos9810-cpufreq: domain%u offline: FREQ_REQ %u kHz failed: %d; MIF floors kept\n",
 		       domain->id, freqs.new, ret);
+		return 0;
+	}
+	/* and the CMU readback must confirm it (CAL reads 0 mid-change) */
+	rate = cal_dfs_get_rate(domain->cal_id);
+	if (rate != freqs.new) {
+		pr_err("exynos9810-cpufreq: domain%u offline: CMU reads %lu kHz after FREQ_REQ %u kHz; MIF floors kept\n",
+		       domain->id, rate, freqs.new);
 		return 0;
 	}
 	if (provider->mif)
