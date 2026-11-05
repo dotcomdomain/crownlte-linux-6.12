@@ -2654,9 +2654,18 @@ static int dpu_iommu_fault(struct iommu_domain *dom, struct device *dev,
 			   unsigned long iova, int flags, void *token)
 {
 	struct dpu_dev *d = token;
-	unsigned int n = atomic_inc_return(&d->iommu_faults);
-	bool stopped = dpu_hw_trigger_stop_atomic(d);
+	unsigned int n;
+	bool stopped;
 
+	/*
+	 * iommu_set_fault_handler() writes the callback and the token one
+	 * after the other; dpu_iommu_set_handler() keeps the fault IRQs off
+	 * meanwhile, and a NULL token is ignored anyway.
+	 */
+	if (!d)
+		return 0;
+	n = atomic_inc_return(&d->iommu_faults);
+	stopped = dpu_hw_trigger_stop_atomic(d);
 	WRITE_ONCE(d->last_fault_iova, iova);
 	if (stopped)
 		d->fault_trigger_stops++;
@@ -2757,21 +2766,34 @@ out:
 	return ret;
 }
 
-/* wait for SysMMU fault handlers already running on another CPU */
-static void dpu_sysmmu_sync_irqs(struct dpu_dev *d)
+/*
+ * Install or remove the SysMMU fault callback. iommu_set_fault_handler()
+ * stores the callback and its token separately and report_iommu_fault()
+ * reads them without a lock, so the three SysMMU fault IRQs (requested by
+ * exynos-iommu) are disabled meanwhile; disable_irq() also waits for a
+ * handler already running on another CPU.
+ */
+static void dpu_iommu_set_handler(struct dpu_dev *d, struct iommu_domain *dom,
+				  iommu_fault_handler_t fn, void *token)
 {
 	struct device_node *mmu;
-	int i, irq;
+	int irq[DPU_NR_SYSMMU];
+	int i;
 
 	for (i = 0; i < DPU_NR_SYSMMU; i++) {
+		irq[i] = 0;
 		mmu = of_parse_phandle(d->dev->of_node, "iommus", i);
 		if (!mmu)
 			continue;
-		irq = of_irq_get(mmu, 0);
+		irq[i] = of_irq_get(mmu, 0);
 		of_node_put(mmu);
-		if (irq > 0)
-			synchronize_irq(irq);
+		if (irq[i] > 0)
+			disable_irq(irq[i]);
 	}
+	iommu_set_fault_handler(dom, fn, token);
+	for (i = 0; i < DPU_NR_SYSMMU; i++)
+		if (irq[i] > 0)
+			enable_irq(irq[i]);
 }
 
 /*
@@ -2787,8 +2809,7 @@ static void dpu_iommu_release(struct dpu_dev *d)
 {
 	if (!d->iommu)
 		return;
-	iommu_set_fault_handler(d->iommu, NULL, NULL);
-	dpu_sysmmu_sync_irqs(d);
+	dpu_iommu_set_handler(d, d->iommu, NULL, NULL);
 	if (d->rpm_held) {
 		pm_runtime_put_sync(d->dev);
 		pm_runtime_disable(d->dev);
@@ -2887,7 +2908,7 @@ static int dpu_iommu_init(struct dpu_dev *d)
 	}
 	/* handed back by dpu_iommu_release() if probe fails after this */
 	d->trig_boot = decon_rd(d, HW_SW_TRIG_CONTROL);
-	iommu_set_fault_handler(dom, dpu_iommu_fault, d);
+	dpu_iommu_set_handler(d, dom, dpu_iommu_fault, d);
 	dev_info(d->dev, DPU_IOMMU_PFX "DMA domain attached: dma-bufs map to cached IOVAs, no bounce copies\n");
 	return 0;
 }
