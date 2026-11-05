@@ -1,84 +1,153 @@
-# crownlte display IOMMU (DPU SysMMU) — plan and skeleton
+# crownlte display IOMMU (DPU SysMMU)
 
-Status: **DT skeleton only, disabled, no driver change.** Nothing here runs.
+Branch `crownlte-followups`: the SysMMU work of `crownlte-dpu-iommu` (404c42dd6..d41526fcb, on
+display-s2 0263a2095) ported onto the HWC display driver of `crownlte-display-flipfix`
+(23b0b1202: adopt mode, WIN_CONFIG for HWC, AFBC, per-window bounce copies into decon-pool).
+**Build-only, not run on the phone.**
+
+- **Opt-in by DT.** The SysMMU path is used only when decon_f has `iommus` (and the three
+  `sysmmu_dpu` nodes are enabled). No shipped DTB does that. Without `iommus` the driver runs the
+  default path unchanged: contiguous buffers scanned directly, scattered ones bounce-copied into
+  decon-pool (per-window slot pairs).
+- Test DTB (not in the tree, derived from the ROM-in-RAM v18 DTB):
+  `panel-bright-work/dtb/exynos9810-crownlte-romram-iommu.dtb`. Its diff against v18 is listed
+  below.
+- `CONFIG_EXYNOS_IOMMU=y` is in `crownlte_android_defconfig`. It binds nothing without the DT
+  nodes (they stay `disabled` in exynos9810.dtsi).
 
 ## Why the display needs it
 
-- The vendor gralloc allocates HWC layers from `/dev/dma_heap/system` (VENDOR-ABI.md),
-  which hands out scattered pages. A DPP channel takes one base address per plane, so
-  such a buffer can only be scanned through the DPU SysMMU.
-- The adopt-mode DECON driver (`drivers/video/fbdev/exynos/dpu_9810/`) therefore accepts
-  only buffers that map to one contiguous run below 4 GiB (CMA heap, the `decon-pool`
-  reserved pool, the SBoot framebuffer). Scattered buffers are rejected with -EINVAL and
-  the log line `buffer not contiguous (segment N); needs the DPU SysMMU`.
-- SBoot scans 0xcc000000 with the SysMMUs in bypass. The stage 1 and stage 2 drivers
-  read `CTRL` and refuse to adopt if bit 0 is set.
+- The vendor gralloc allocates HWC layers from `/dev/dma_heap/system` (VENDOR-ABI.md), which
+  hands out scattered pages. A DPP channel takes one 32-bit base address per plane.
+- Without the SysMMU the DECON driver copies every scattered layer into a contiguous decon-pool
+  buffer on each frame (about 11.5 ms for the 17.3 MB client target on ROM-in-RAM v12, a 192 MiB
+  pool at 0xe4000000 for the keyguard's four layers). With the SysMMU the DPP fetches the
+  gralloc buffer in place: no copy, no pool budget.
 
-## Hardware (4.9 crownlte_eur_open_26 DT + 4.9 drivers/iommu/exynos-iommu.[ch])
+## Hardware (4.9 crownlte_eur_open_26 DT + 4.9 drivers/iommu/exynos-iommu*.{c,h})
 
-| Instance | Non-secure SFR | Secure SFR | IRQ (NS, secure) | Ports | 4.9 clock |
+| Instance | Non-secure SFR | Secure SFR (never touched) | IRQ NS (secure) | Ports | 4.9 qos |
 |---|---|---|---|---|---|
-| sysmmu_dpu0 | 0x160a0000 (0x9000) | 0x160d0000 | SPI 211, 210 | VGRF, VGF | vclk 854 (GATE_SYSMMU_DPUD0) |
-| sysmmu_dpu1 | 0x160b0000 (0x9000) | 0x160e0000 | SPI 213, 212 | G0, VG0 | vclk 855 (GATE_SYSMMU_DPUD1) |
-| sysmmu_dpu2 | 0x160c0000 (0x9000) | 0x160f0000 | SPI 215, 214 | G1, VG1, WB | vclk 856 (GATE_SYSMMU_DPUD2) |
+| sysmmu_dpu0 | 0x160a0000 (0x9000) | 0x160d0000 | SPI 211 (210) | VGRF, VGF | 15 |
+| sysmmu_dpu1 | 0x160b0000 (0x9000) | 0x160e0000 | SPI 213 (212) | G0, VG0 | 15 |
+| sysmmu_dpu2 | 0x160c0000 (0x9000) | 0x160f0000 | SPI 215 (214) | G1, VG1, WB | 15 |
 
-In 4.9 all three are listed in `iommus` of the DSIM device, which calls `iovmm_activate()`.
-DECON maps buffers through that one shared IOVA space. In 4.9 the DPU clocks are HWACG
-Q-channel gates whose enable/disable are no-ops, and the same holds in the 6.12 legacy
-clock driver.
+In 4.9 all three are in the DSIM device's `iommus` (`iovmm_activate()`), and DECON maps buffers
+through that one IOVA space. Here all three are in decon_f's `iommus` and share one DMA domain.
 
-## Does mainline exynos-iommu fit? (6.12 tree, `drivers/iommu/exynos-iommu.c`)
+## `samsung,exynos9810-sysmmu` in exynos-iommu (commit "iommu/exynos: Exynos9810 SysMMU v7 mode")
 
-| Item | 4.9 (9810) | mainline | Verdict |
+| Item | 4.9 (9810) | mainline exynos-iommu | 9810 mode |
 |---|---|---|---|
-| VERSION decode | `(reg >> 17) & 0x7fff`, major = `>> 11`, minor = `(>> 4) & 0x7f`, i.e. major bits 31:28, minor 27:21 | `reg >> 21`, major = `>> 7`, minor = `& 0x7f`: same bits | same |
-| Variant selection | — | major < 5: v1; < 7: v5; ≥ 7: v7, VM layout only if CAPA0 bit 11 and CAPA1 bit 14 (VCR) | 9810 expected to read major 7 (4.9 has the CAPA0/1_V7 registers at 0x870/0x874) |
-| PT base / flush / INT / fault regs | PT_BASE_PPN 0x0c, FLUSH 0x10, FLUSH_ENTRY 0x14, FLUSH_RANGE 0x18, RANGE_START/END 0x20/0x24, INT_STATUS/CLEAR 0x60/0x64, FAULT_AR 0x70/0x78 | `sysmmu_v7_variant`: identical offsets | match (non-VM) |
-| Page table | 4096 × 1 MiB lv1, 256 × 4 KiB lv2, `PG_ENT_SHIFT 4`, 36-bit PA | same format for v5+ (`PG_ENT_SHIFT` 4) | match. Prot bits: mainline uses `SYSMMU_V5_LV1/LV2_PROT`; 4.9 has no access-protection bits, so verify on hardware with a read fault test |
-| CTRL enable | 0x5 enable, 0x7 block, 0x0 disable | v5+: `CTRL_ENABLE` 0x5 / `CTRL_BLOCK` 0x7 | match |
-| CFG | `CFG_ACGEN`, FLPD cache, QoS 15 (`qos = <15>`), no access-protection check | `CFG_QOS(15) \| CFG_FLPDCACHE \| CFG_ACGEN \| CFG_EAP` | QoS matches. `CFG_EAP` enables PTE access-protection checks that 4.9 never used: if the 9810 interprets the v5 prot bits differently, reads fault. Test first; if needed, skip EAP for this SoC |
-| TLB way config | `sysmmu,tlb_property` → public/private way registers 0x120/0x200+ | not configured | performance only. Defaults work but may underrun at 1 GB/s. Port as an optional DT property |
-| Fault IRQ | index 0 NS; index 1 secure (`sysmmu,secure-irq`, via SMC) | index 0 only | fine. Never map the secure SFR block |
-| Clocks | "aclk" (no-op HWACG gate) | `devm_clk_get_optional("sysmmu"/"aclk"/"pclk"/"master")` | omit clocks or pass the GATE_SYSMMU_DPUDn vclks (no-ops) |
-| Power | DPU PD + runtime PM | runtime PM with device links to the master | DECON must use runtime PM (`pm_runtime_enable` + `get_sync` at probe) so that the link resumes the SysMMUs |
-| Reserved direct maps | n/a (4.9 re-allocates fb0) | **no `.get_resv_regions`**: DT `iommu-addresses` in reserved-memory is ignored | **patch needed** (see step 2) |
+| Register layout | v7 non-VM: PT_BASE 0x0c, FLUSH 0x10, FLUSH_RANGE 0x18, START/END 0x20/0x24, INT 0x60/0x64, FAULT 0x70/0x78 | `sysmmu_v7_variant`, same offsets | same offsets; probe refuses unless VERSION major = 7 without VCR (VM layout) |
+| CFG | `(CFG & ~0x301F1F8C) \| QOS_OVERRIDE(bit 11) \| QOS(15)<<7` | `QOS(15) \| FLPDCACHE \| ACGEN \| EAP` | **4.9 value**, non-mask bits from the CFG the bootloader left |
+| CFG_EAP / PTE prot bits | off / none | on / v5 encoding | **off / none** (4.9 PTEs bit for bit) |
+| TLB invalidation | FLUSH_RANGE, no block | block + FLUSH_ENTRY | **4.9 range flush, no block** |
+| Fault IRQ | panics | panics unless a handler accepts | **never panics**; rate-limited 4.9 fault decoding; the master's handler is called |
+| Power | DPU genpd | runtime PM via device links | runtime PM via device links; PMU DPU_STATUS (0x14064024) must read 0xf (`samsung,pd-status`) before any SFR access |
+| Bootloader state | n/a | ignored | logged; **an instance SBoot left translating (CTRL bit 0) is refused** |
+| Reserved direct maps | n/a | none | `.get_resv_regions = iommu_dma_get_resv_regions` |
+| IOVA aperture | 32 bit | `~0UL` | `U32_MAX` |
+| TLB way/port tuning | applied | n/a | not applied (performance only) |
 
-Conclusion: mainline `exynos-iommu` with `sysmmu_v7_variant` should drive the 9810 DPU
-SysMMUs with no new register layout. It still needs (a) a reserved-region hook for the
-handover, (b) a check of `CFG_EAP` against the 9810's PTE protection bits, (c) optional
-TLB-way tuning, and (d) the DECON driver switching to runtime PM. The VERSION value is logged by both the stage 1 handover helper
-(`display handover: sysmmu_dpuN … VERSION=`) and the stage 2 driver
-(`decon: sysmmu_dpuN CTRL= VERSION=`). Confirm major = 7 from trial q25 before
-enabling anything.
+## Handover: the SBoot splash never fetches through an unmapped IOVA
 
-## The handover problem
+1. DT: `iommu-addresses = <&decon_f 0x0 0xcc000000 0x1400000>` on SBoot's `lcd_buffer`
+   reservation (framebuffer@cc000000, no-map), which is listed as decon_f's second
+   `memory-region` (index 0 stays decon-pool, the CMA pool). IOVA == PA, so the IOMMU core treats
+   it as a direct mapping.
+2. SysMMU probe: PMU check, bootloader-state log/refusal, version check. No SFR writes.
+3. decon_f `dma_configure` → `iommu_setup_default_domain()` allocates the DMA domain, **maps
+   0xcc000000..0xcd3fffff 1:1 before attaching it**, then attaches. The driver core has already
+   runtime-resumed the SysMMUs for the probe (fw_devlink supplier pre-activation), so the attach
+   most likely enables translation here, while SBoot's window keeps scanning 0xcc000000:
+   identity, same memory.
+4. DECON probe, `dpu_iommu_init()`: takes the DMA domain, sets the max segment size to UINT_MAX
+   (one IOVA run per buffer), checks `iommu_iova_to_phys()` over every MiB of fb0 and **refuses
+   to probe unless every probe is 1:1**, then installs the fault handler. If probe fails, the
+   driver core drops the suppliers and the SysMMUs go back to bypass; SBoot's scanout is untouched.
+5. `dpu_adopt()`: an enabled SysMMU is accepted only with the IOMMU (without it, CTRL bit 0
+   still refuses adoption as before). `dpu_iommu_enable()`: if the SysMMUs are still in bypass
+   and the TE trigger runs, mask it and wait 34 ms (4.9 `decon_reg_init()`), then
+   `pm_runtime_enable` + `pm_runtime_resume_and_get` (DECON keeps this reference, so the
+   SysMMUs stay on after probe), read CTRL of all three back through read-only views of the
+   `iommus` nodes and refuse unless all translate; unmask the trigger if it was masked.
+6. fb0 takeover commits the boot window at 0xcc000000 = identity IOVA.
 
-When a DPU SysMMU is enabled, every DPP fetch is translated. DECON is still scanning
-SBoot's buffer at 0xcc000000 (and, after takeover, fb0 at the same address). An empty
-page table would make the very next frame fault (garbage on screen plus a fault-IRQ
-storm). The IOVA 0xcc000000 must be identity-mapped **before** the first enable:
+## Buffers
 
-1. Add `iommu-addresses = <&decon_f 0x0 0xcc000000 0x1400000>;` to the
-   `framebuffer@cc000000` reserved-memory node (DT schema `reserved-memory.yaml`).
-2. Give exynos-iommu `.get_resv_regions = iommu_dma_get_resv_regions` (a few lines). The
-   IOMMU core then creates an `IOMMU_RESV_DIRECT` mapping in the default DMA domain
-   when the device attaches, before the driver probes.
-3. Only then add `iommus = <&sysmmu_dpu0>, <&sysmmu_dpu1>, <&sysmmu_dpu2>;` to `decon_f`,
-   drop its read-only `sysmmu0..2` reg entries (they would collide with the SysMMU
-   driver's `devm_ioremap_resource`), and enable the three nodes.
-4. In the DECON driver, replace the "contiguous below 4 GiB" check with "one contiguous
-   IOVA run" (`dma_set_max_seg_size(dev, UINT_MAX)` so iommu-dma merges the list). The
-   check in `dpu_buf_import()` already tests DMA-address contiguity, which holds for IOVAs
-   as well.
+- **HWC dma-bufs (`dpu_iova_get()`)**: attached and mapped once on decon_f, kept in a per-dma-buf
+  IOVA cache (LRU, at most 32 entries). Every later frame that scans the same dma-buf reuses the
+  IOVA (4.9 did the same through `ion_iovmm_map()`). A commit counts as a user of the entry
+  until it is freed, which happens only after a later update latched (d->active / d->stale), so
+  an IOVA is never unmapped while a window may still fetch it. An unused entry is unmapped when
+  the cache holds the last reference to its dma-buf (everyone else closed it) or when it falls
+  off the LRU. CPU writers keep the dma-buf contract: the exporter syncs every mapped attachment
+  at `DMA_BUF_IOCTL_SYNC` end.
+- If a dma-buf cannot be mapped to one IOVA run below 4 GiB, that frame falls back to the old
+  per-commit import and the bounce copy (bounce slots then come from iommu-dma, also fine).
+- In-kernel buffers (fb0 wrap, self-test and display-matrix buffers) are not cached; they hand
+  out their existing DMA address: identity IOVA for fb0, the IOVA `dma_alloc_wc()` returned for
+  the others.
+- Fault handler (`dpu_iommu_fault`, hard IRQ): count, remember the IOVA, mask the TE trigger
+  under `trig_lock` (all trigger read-modify-writes, including the panel command window, now
+  take it), log. The next commit unmasks the trigger.
 
-## Steps and tests
+## Test DTB: exynos9810-crownlte-romram-iommu.dtb vs exynos9810-crownlte-romram-v18.dtb
 
-| Step | Change | Test (diag DT gated) | Risk |
-|---|---|---|---|
-| I-1 | this skeleton (disabled nodes) | none | none |
-| I-2 | trial q25 logs: CTRL/VERSION of all three | read-only | none |
-| I-3 | exynos-iommu `.get_resv_regions`, DT `iommu-addresses`, enable **sysmmu_dpu1 only** (G0 port, the window SBoot scans if the survey shows dpp0) on decon_f | DECON keeps showing fb0; a fault IRQ would be logged by exynos-iommu | display garbage on a wrong map, no damage. A fault IRQ storm is possible: bounded by the 120 s diag reboot |
-| I-4 | all three, self-test flips scattered system-heap buffers | `decon selftest:` with `/dev/dma_heap/system` buffers | as above |
-| I-5 | TLB way config from `sysmmu,tlb_property` | underrun counter (`EXTRA_INTERRUPT` resource conflict) under load | none |
+- `sysmmu@160a0000/160b0000/160c0000`: compatible `"samsung,exynos9810-sysmmu",
+  "samsung,exynos-sysmmu"`, `samsung,qos = <15>`, `samsung,pmu-syscon` = PMU,
+  `samsung,pd-status = <0x4024 0xf 0xf>`, `status = "okay"`, phandles 0x40..0x42.
+- decon_f: `reg`/`reg-names` without the sysmmu0..2 windows (exynos-iommu requests the whole
+  SFR windows; a nested decon_f resource blocks that request), `iommus = <0x40 0x41 0x42>`,
+  `memory-region = <decon-pool framebuffer@cc000000>`, phandle 0x44.
+- reserved-memory `framebuffer@cc000000`: `iommu-addresses = <0x44 0x0 0xcc000000 0x1400000>`,
+  phandle 0x43.
+- Nothing else. decon_f is the only device with `iommus`.
 
-Panel/power safety: none of this touches DSIM, the panel, regulators or clocks rates.
+## Expected log (test DTB)
+
+```
+exynos-sysmmu 160a0000.sysmmu: bootloader state: CTRL=0x0 CFG=0x… … VERSION=0x7…
+exynos-sysmmu 160a0000.sysmmu: Exynos9810 SysMMU v7.x registered: 4.9 CFG 0x…f80 (QoS 15), …
+exynos-sysmmu 160a0000.sysmmu: enable #1 for 16030000.decon_f: … readback CTRL=0x5 …   (×3)
+exynos9810-decon 16030000.decon_f: decon iommu: boot fb 0x00000000cc000000+0x1042800 identity map: 18/18 probes 1:1
+exynos9810-decon 16030000.decon_f: decon iommu: DMA domain attached: dma-bufs map to cached IOVAs, no bounce copies
+exynos9810-decon 16030000.decon_f: sysmmu_dpuN CTRL=0x5 VERSION=…
+exynos9810-decon 16030000.decon_f: decon iommu: SysMMUs 0x7 already translating at probe (…)
+exynos9810-decon 16030000.decon_f: decon iommu: sysmmu_dpuN after runtime resume: CTRL=0x5 …
+exynos9810-decon 16030000.decon_f: decon iommu: SysMMUs translating (0x7 -> 0x7), FRAME_COUNT …
+exynos9810-decon 16030000.decon_f: fb0 takeover: … : 0, latched …
+… once HWC runs:
+exynos9810-decon 16030000.decon_f: decon iommu: map #1: 17305600-byte dma-buf, N physical chunks -> IOVA 0x… (cached 1, hits 0, unmapped 0)
+```
+
+The bounce lines (`scattered buffer (… segments …) copied to …`, `bounce buffer N: … bytes`)
+must not appear. Screen: identical to ROM-in-RAM v16 (SBoot splash, boot animation, setup
+wizard), with no copy latency.
+
+## Failure reading
+
+| Log | Meaning |
+|---|---|
+| `power domain off (PMU 0x4024 …)` | DPU domain off at SysMMU probe; no SFR touched |
+| `translation already enabled by the bootloader` | SBoot used a SysMMU: refused, decon_f then has no IOMMU |
+| `decon iommu: boot fb IOVA … not identity` | `iommu-addresses` not applied: DECON refuses to probe, SysMMUs return to bypass, splash stays |
+| `decon iommu: SysMMUs 0x… of 0x7 translating` | runtime PM/device link did not enable all three: DECON refuses |
+| `decon iommu: SysMMU read fault #n at IOVA …` + `TE trigger masked` | a buffer was unmapped while scanned (lifetime bug); the panel freezes on its last frame until the next commit |
+| `decon iommu: no IOVA for a …-byte dma-buf (…)` | mapping failed; that frame bounces as before |
+
+## Not ported from crownlte-dpu-iommu
+
+- The `samsung,dpu-iommu-selftest` scattered-page/system-heap/CMA flip test (~250 lines, built
+  on the old stage 2 self-test helpers). The HWC path of the ROM-in-RAM boot is the test now; the
+  old self-test can be ported if a kernel-only check is wanted.
+- `DMA_ATTR_FORCE_CONTIGUOUS` for in-kernel buffers: not needed, they work at any IOVA.
+- The display-s2-iommu diagnostic DTS (the old stage 2 DT had the dpp/dpp-dma names swapped).
+
+## Limits / follow-ups
+
+- TLB way/port tuning (`sysmmu,tlb_property`) not ported: risk of underruns under heavy load.
+- The secure fault IRQs (SPI 210/212/214) are not requested (they belong to the secure world).
+- Orphaned cache entries (the app freed the buffer) are dropped at the next import or commit
+  release; while the display is idle they keep their pages for that long.
