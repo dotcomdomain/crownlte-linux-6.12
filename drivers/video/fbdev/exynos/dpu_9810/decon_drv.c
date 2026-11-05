@@ -757,7 +757,8 @@ static __printf(2, 3) void dpu_txt_add(struct dpu_diag_txt *t, const char *fmt, 
 
 static struct dpu_diag_txt *dpu_txt_new(struct list_head *list)
 {
-	struct dpu_diag_txt *t = kmalloc(sizeof(*t), GFP_KERNEL);
+	/* Sol review S4: never reclaim in the commit worker; no memory, no dump */
+	struct dpu_diag_txt *t = kmalloc(sizeof(*t), GFP_NOWAIT | __GFP_NOWARN);
 
 	if (!t)
 		return NULL;
@@ -789,9 +790,22 @@ static void dpu_diag_emit(struct work_struct *work)
 	}
 }
 
-/* print the texts on @list from system_wq; @list is left empty */
+/*
+ * Print the texts on @list from system_wq; @list is left empty. Once
+ * dpu_stop() began (Sol review S5) the texts are dropped instead, so
+ * nothing is queued behind its final flush.
+ */
 static void dpu_diag_post(struct dpu_dev *d, struct list_head *list)
 {
+	struct dpu_diag_txt *t, *n;
+
+	if (READ_ONCE(d->stopping)) {
+		list_for_each_entry_safe(t, n, list, node) {
+			list_del(&t->node);
+			kfree(t);
+		}
+		return;
+	}
 	if (list_empty(list))
 		return;
 	spin_lock(&d->diag_lock);
@@ -809,6 +823,8 @@ static void dpu_diag_post(struct dpu_dev *d, struct list_head *list)
  */
 static void dpu_rate_start(struct dpu_dev *d, const char *what)
 {
+	if (READ_ONCE(d->stopping))
+		return;		/* Sol review S5: not after dpu_stop() began */
 	if (test_and_set_bit_lock(0, &d->rate_busy)) {
 		dev_info(d->dev, "diag %s: frame rate not measured (another measurement running)\n",
 			 what);
@@ -1160,8 +1176,11 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	LIST_HEAD(txt);
 	int i, ret;
 
-	/* fb0 as the panel showed it until now, before HWC replaces it */
-	if (!c->internal && !d->fb_snap_hwc) {
+	/*
+	 * fb0 as the panel showed it until now, before HWC replaces it. The
+	 * commit-path diagnostics stop with d->stopping (Sol review S5).
+	 */
+	if (!c->internal && !d->fb_snap_hwc && !READ_ONCE(d->stopping)) {
 		d->fb_snap_hwc = true;
 		dpu_diag_fb(d, "before the first HWC commit", true, &txt);
 	}
@@ -1210,7 +1229,7 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 			c->result = dpu_apply(d, c);
 	}
 	d->nr_commits++;
-	if (!c->result && !c->internal)
+	if (!c->result && !c->internal && !READ_ONCE(d->stopping))
 		dpu_diag(d, c, &txt);	/* before bounce_next moves on */
 	/* the bounce buffer just written is now (or may be) scanned */
 	if (c->result == 0 || c->result == -ETIMEDOUT)
@@ -2756,8 +2775,14 @@ static void dpu_stop(struct dpu_dev *d)
 		put_task_struct(d->mx_thread);
 		d->mx_thread = NULL;
 	}
+	/*
+	 * Diagnostic producers (dpu_process(), dpu_idle_snap(),
+	 * dpu_fb_snap_work()) admitted before d->stopping was set finish in
+	 * the drained worker or the cancelled work above; later ones see it
+	 * and neither re-arm, start a rate count nor post text. Only then
+	 * the rate count and the text queue are retired.
+	 */
 	kthread_flush_worker(d->worker);
-	/* commits processed from here on see d->stopping and do not re-arm */
 	kthread_cancel_delayed_work_sync(&d->idle_work);
 	cancel_delayed_work_sync(&d->rate_work);
 	flush_work(&d->diag_emit_work);		/* prints and frees queued texts */
