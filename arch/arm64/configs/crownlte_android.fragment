@@ -393,7 +393,10 @@ CONFIG_PRINTK_TIME=y
 # CONFIG_ARM_EXYNOS_BUS_DEVFREQ is not set
 # CONFIG_PM_DEVFREQ_EVENT is not set
 # CONFIG_INTERCONNECT is not set
-# CONFIG_IOMMU_SUPPORT is not set
+# DPU SysMMUs (exynos-iommu, "samsung,exynos9810-sysmmu"). Inert unless a DTB
+# enables the sysmmu_dpu nodes and puts "iommus" on decon_f
+# (Documentation/crownlte/display-iommu.md); no shipped DTB does.
+CONFIG_EXYNOS_IOMMU=y
 # Exynos9810 CL0 watchdog (guarded s3c2410 variant): kernel pings until
 # userspace opens it, so a hung kernel resets to the normal BOOT image.
 CONFIG_WATCHDOG=y
