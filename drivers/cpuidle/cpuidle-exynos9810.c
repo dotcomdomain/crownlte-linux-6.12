@@ -152,6 +152,9 @@ static const char * const e9810_stage_name[] = {
 /* Self-test timing. The diag PID1 restarts the phone at about 120 s. */
 /* After the MCT report (86-90 s); the BIG ramp and soak end at about 106 s. */
 #define E9810_SELFTEST_MS		90000
+/* big-4-soak length; DT samsung,cpuidle-selftest-soak-ms (1000..10000) */
+#define E9810_SOAK_MS_DEFAULT		10000
+#define E9810_SOAK_MS_MIN		1000
 #define E9810_PHASE_MS			800
 #define E9810_POLL_MS			20
 #define E9810_PING_TIMEOUT_MS		100
@@ -1745,6 +1748,8 @@ static void e9810_add_phase(struct e9810_phase *ph, const char *name,
 	ph->bisect = bisect;
 }
 
+static u32 e9810_soak_ms = E9810_SOAK_MS_DEFAULT;
+
 static void e9810_selftest(struct work_struct *work)
 {
 	struct e9810_phase phases[11];
@@ -1839,7 +1844,8 @@ static void e9810_selftest(struct work_struct *work)
 	e9810_add_phase(&phases[nphases++], "big-2", 0x30, lim, false, false, 1000);
 	e9810_add_phase(&phases[nphases++], "big-3", 0x70, lim, false, false, 1000);
 	e9810_add_phase(&phases[nphases++], "big-4", 0xf0, lim, false, false, 2000);
-	e9810_add_phase(&phases[nphases++], "big-4-soak", 0xf0, lim, false, false, 10000);
+	e9810_add_phase(&phases[nphases++], "big-4-soak", 0xf0, lim, false, false,
+			e9810_soak_ms);
 
 	for (i = 0; i < nphases; i++) {
 		bool entered_all;
@@ -1958,11 +1964,17 @@ static int e9810_cpuidle_probe(struct platform_device *pdev)
 
 	e9810_keep_armed = of_property_read_bool(np,
 					"samsung,cpuidle-selftest-keep-armed");
+	if (!of_property_read_u32(np, "samsung,cpuidle-selftest-soak-ms",
+				  &e9810_soak_ms))
+		e9810_soak_ms = clamp_t(u32, e9810_soak_ms, E9810_SOAK_MS_MIN,
+					E9810_SOAK_MS_DEFAULT);
 	if (of_property_read_bool(np, "samsung,cpuidle-selftest")) {
 		unsigned long now = jiffies - INITIAL_JIFFIES;
 		unsigned long at = msecs_to_jiffies(E9810_SELFTEST_MS);
 
 		INIT_DELAYED_WORK(&e9810_selftest_work, e9810_selftest);
+		pr_info("cpuidle selftest: scheduled at %u ms, big-4-soak %u ms\n",
+			E9810_SELFTEST_MS, e9810_soak_ms);
 		/* CPU0 must drive the test: it is never armed. */
 		queue_delayed_work_on(0, system_long_wq, &e9810_selftest_work,
 				      at > now ? at - now : 0);
