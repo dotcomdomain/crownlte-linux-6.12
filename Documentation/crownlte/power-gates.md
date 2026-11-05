@@ -48,11 +48,15 @@ any other register, value or mask. The G3D rail exception is unchanged.
    power-on, one power cycle (off, 30 ms as 4.9 `sec_ts_reset_work`, on).
 7. Off (LDO43 0x00, 4 ms, LDO35 0x00 only if 0x74 reads off) on any probe failure
    and in `.shutdown` (4.9 shutdown -> remove -> `sec_ts_power(off)`).
-   Unbind/rebind via sysfs is disabled (`suppress_bind_attrs`).
+   Unbind/rebind via sysfs is disabled (`suppress_bind_attrs`). The self-test
+   cleanup is registered before the rails go on, so no early probe return can
+   leave them on.
 8. At most 2 power-on sequences per boot (driver counter and transport counter).
 
-The power path is compiled only for a built-in driver with `CONFIG_EXYNOS_ACPM`
-(the ACPM accessors are not exported); otherwise the property only logs an error.
+The power path, including the policy query, is compiled only for a built-in
+driver with `CONFIG_EXYNOS_ACPM` (the ACPM accessors are not exported). Otherwise
+a stub logs an error and the IC stays unpowered; that branch has no ACPM
+references, so a module build links.
 
 ### Expected log
 
@@ -82,7 +86,9 @@ DT opt-in: `samsung,charger-wdt-kick` on `battery-monitor@36`
 
 `mx_chg_wdt_kick_write()` in `max77705-ro-battery.c`, defined before the
 `#pragma GCC poison` block, with fixed slave 0x69, register CNFG_06 0xBD and value
-`(cnfg06 & ~0x03) | 0x01`. Before it, CNFG_06 is read and bits 7:2 must equal the
+`(cnfg06 & ~0x03) | 0x01`. Before it, CNFG_06 is read; CHGPROT (bits 3:2) must read
+11 = unlocked, as 4.9 init leaves it (`max77705_charger.c:1008-1012`; no unlock
+write is ever sent), the sample must still be younger than 20 s, and bits 7:2 must equal the
 probe value; after it, read back and bits 7:2 must still match. A mismatch stops
 kicking for the rest of the boot. Every other write API stays poisoned.
 
@@ -93,15 +99,20 @@ A kick is sent only if all of these hold; otherwise no kick, and the first stop
 
 | check | limit |
 |---|---|
-| FG + charger reads, both SoC ADC NTCs | all read in this poll, no ADC "previous value" fallback, sample < 20 s old |
+| FG + charger reads, both SoC ADC NTCs | all read in this poll, no ADC "previous value" fallback; the sample's first read < 20 s ago, checked again right before the write |
 | battery NTC (ch4), charger NTC (ch3) | ADC code inside its 4.9 table (not clamped) |
-| battery present | FG STATUS.BST = 0 |
-| battery temperature | 0.0 <= T < 45.0 C (after a stop: resume below 43.0 C / at 2.0 C or more) |
+| battery present | FG STATUS.BST = 0 and charger INT_OK.BATP_OK or !DTLS_00.BATP_DTLS (4.9 `max77705_check_battery()`) |
+| battery temperature | 0.0 <= T < 41.0 C (after a stop: resume below 39.0 C / at 2.0 C or more). 41/39 C are 4.9's swelling block/recovery; above 41 C 4.9 drops CV to 4.15 V, which a kick cannot |
 | charger NTC | T < 44.0 C (resume below 42.0 C) |
 | VCELL and AvgVCELL | 3000..4400 mV (CV 4350 + 50) |
-| battery health | not overvoltage, dead, overheat (50 C) or cold (0 C) |
+| health | GOOD only: input under- or overvoltage, dead, overheat or cold stop the kick (4.9 `sec_bat_ovp_uvlo_result()` turns charging off on UV/OV) |
+| charger state | CHG_DTLS a known code; no charging state (0x0-0x3) without CHGIN/WCIN |
 | CNFG_00 | WDTEN set, value unchanged since probe |
 | CNFG_02 / CNFG_04 | unchanged since probe; CC <= 1500 mA, CV <= 4350 mV |
+| CNFG_06 | CHGPROT = 11; bits 7:2 unchanged since probe (a mismatch or locked CHGPROT stops kicking for the boot) |
+
+Shutdown (`.shutdown`) and unbind stop the kicks and all three works
+synchronously; no charger register is written then.
 
 The first poll (and kick) runs at probe. If the watchdog had already expired
 (CHG_DTLS 0xB) the driver says so once: a kick does not restart charging, and the
@@ -110,7 +121,7 @@ The first poll (and kick) runs at probe. If the watchdog had already expired
 ### Expected log
 
 ```
-max77705-ro-battery ...-0036: charger wdt kick enabled: CNFG_06 xx at probe, every 10000 ms while batt 0.0..45.0 C, chg < 44.0 C, 3000..4400 mV, CV <= 4350 mV, CC <= 1500 mA
+max77705-ro-battery ...-0036: charger wdt kick enabled: CNFG_06 xx at probe, every 10000 ms while batt 0.0..41.0 C, chg < 44.0 C, 3000..4400 mV, CV <= 4350 mV, CC <= 1500 mA
 max77705-ro-battery ...-0036: charger wdt kick: started (batt 30.1C chg 31.0C vcell 3950mV cv 4350mV cc 450mA chg_dtls 1 cc)
 battery selftest: charger wdt kick on: kicking, kicks=11 stops=0 last kick 3000 ms ago
 battery selftest: ... writes=11 (CNFG_06 WDTCLR kicks only) ... chg_cnfg_changed=0 ... -> PASS
@@ -130,7 +141,10 @@ The self-test compares CNFG_06 with bits 1:0 masked while kicking (WDTCLR is a s
 * The charger watchdog period (~80 s) is inferred from logs, not from a datasheet.
 * Option A only keeps the charging state; on a 500 mA SDP port the battery still
   drains (decision 3, "net charge").
-* 41-45 C: 4.9 lowers CV to 4.15 V and the current in this range (swelling); the
-  kick cannot, so charging continues at SBoot's CV/CC up to 45 C.
+* Below 15 C 4.9 also limits the current ("swelling low": 950 mA, a second,
+  lower tier below 5 C). SBoot's CC (450 mA seen) is under the first tier; the
+  second tier's value was not checked.
+* If SBoot leaves CHGPROT locked, there is no kick at all (and no charging past
+  the watchdog); the first trial log shows CNFG_06 at probe.
 * LDO35 mode 0b10 is "on while PWREN_MIF" (4.9 parity); harmless while 6.12 has
   no suspend.
