@@ -163,6 +163,18 @@ struct dpu_dev {
 	u32 nr_idle_snaps;
 	struct delayed_work fb_snap_work;	/* fb0 picture at 5 s */
 	bool fb_snap_hwc;			/* fb0 logged before HWC's first commit */
+	ktime_t thumb_at[DECON_MAX_WIN];	/* last sampled window thumbnail */
+	/* diagnostic text, printed from system_wq (decon_drv.c dpu_diag_post) */
+	spinlock_t diag_lock;
+	struct list_head diag_txt;
+	struct work_struct diag_emit_work;
+	/* FRAME_COUNT/TE count between two callbacks (dpu_rate_start) */
+	struct delayed_work rate_work;
+	unsigned long rate_busy;
+	u32 rate_fc0;
+	int rate_te0;
+	ktime_t rate_t0;
+	char rate_tag[40];
 	u32 hwc_ver;
 	/* ioctl numbers seen, each logged once with its first result */
 	spinlock_t ioc_lock;

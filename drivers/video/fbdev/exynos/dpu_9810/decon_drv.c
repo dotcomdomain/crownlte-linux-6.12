@@ -732,6 +732,107 @@ struct dpu_thumb_src {
 	bool alpha;			/* mark transparent cells */
 };
 
+/*
+ * Sol review S3: thumbnail text is built where it is sampled (in the
+ * update worker before the commit fence signals) and printed afterwards
+ * by dpu_diag_emit() on system_wq, so the dump delays neither the fence
+ * nor the next commit.
+ */
+#define DPU_TXT_SIZE	2048
+
+struct dpu_diag_txt {
+	struct list_head node;
+	size_t len;
+	char buf[DPU_TXT_SIZE];
+};
+
+static __printf(2, 3) void dpu_txt_add(struct dpu_diag_txt *t, const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	t->len += vscnprintf(t->buf + t->len, sizeof(t->buf) - t->len, fmt, ap);
+	va_end(ap);
+}
+
+static struct dpu_diag_txt *dpu_txt_new(struct list_head *list)
+{
+	struct dpu_diag_txt *t = kmalloc(sizeof(*t), GFP_KERNEL);
+
+	if (!t)
+		return NULL;
+	t->len = 0;
+	t->buf[0] = '\0';
+	list_add_tail(&t->node, list);
+	return t;
+}
+
+static void dpu_diag_emit(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(work, struct dpu_dev, diag_emit_work);
+	struct dpu_diag_txt *t;
+	char *p, *line;
+
+	for (;;) {
+		spin_lock(&d->diag_lock);
+		t = list_first_entry_or_null(&d->diag_txt, struct dpu_diag_txt, node);
+		if (t)
+			list_del(&t->node);
+		spin_unlock(&d->diag_lock);
+		if (!t)
+			break;
+		p = t->buf;
+		while ((line = strsep(&p, "\n")))
+			if (*line)
+				dev_info(d->dev, "%s\n", line);
+		kfree(t);
+	}
+}
+
+/* print the texts on @list from system_wq; @list is left empty */
+static void dpu_diag_post(struct dpu_dev *d, struct list_head *list)
+{
+	if (list_empty(list))
+		return;
+	spin_lock(&d->diag_lock);
+	list_splice_tail_init(list, &d->diag_txt);
+	spin_unlock(&d->diag_lock);
+	schedule_work(&d->diag_emit_work);
+}
+
+#define DPU_RATE_MS	250
+
+/*
+ * Sol review S1: FRAME_COUNT and TE counted between two callbacks
+ * DPU_RATE_MS apart (the second on system_wq), never by sleeping in the
+ * update worker. One measurement at a time.
+ */
+static void dpu_rate_start(struct dpu_dev *d, const char *what)
+{
+	if (test_and_set_bit_lock(0, &d->rate_busy)) {
+		dev_info(d->dev, "diag %s: frame rate not measured (another measurement running)\n",
+			 what);
+		return;
+	}
+	strscpy(d->rate_tag, what, sizeof(d->rate_tag));
+	d->rate_t0 = ktime_get();
+	d->rate_fc0 = dpu_hw_frame_count(d);
+	d->rate_te0 = atomic_read(&d->te_count);
+	schedule_delayed_work(&d->rate_work, msecs_to_jiffies(DPU_RATE_MS));
+}
+
+static void dpu_rate_work(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(work, struct dpu_dev, rate_work.work);
+	u32 fc1 = dpu_hw_frame_count(d);
+	int te1 = atomic_read(&d->te_count);
+
+	dev_info(d->dev, "diag %s: in %lld ms FRAME_COUNT %u -> %u (+%u), TE %d -> %d (+%d)\n",
+		 d->rate_tag, ktime_ms_delta(ktime_get(), d->rate_t0), d->rate_fc0, fc1,
+		 fc1 - d->rate_fc0, d->rate_te0, te1, te1 - d->rate_te0);
+	clear_bit_unlock(0, &d->rate_busy);
+}
+
 static u32 dpu_luma_digit(u64 l1000)
 {
 	return min_t(u32, 9, l1000 * 10 / 256000);
@@ -744,15 +845,16 @@ static u32 dpu_th_pos(u32 a, u32 b, u32 i)
 }
 
 /*
- * A coarse picture: the crop split into an 8 x 16 grid, one line per grid
- * row, one character per cell: mean luma (0.299 R + 0.587 G + 0.114 B) as
- * 0-9, '.' where the mean alpha is below 16 (transparent, @t->alpha only),
- * '?' outside the buffer; after '|' the brightest sample of each cell on
- * the same scale, so small bright details (text, a logo) show up too.
- * 16 x 16 samples per cell (every ~11 px on 1440x2960): ~32k uncached
- * reads, so only on sampled frames.
+ * A coarse picture, appended to @txt: the crop split into an 8 x 16 grid,
+ * one line per grid row, one character per cell: mean luma (0.299 R +
+ * 0.587 G + 0.114 B) as 0-9, '.' where the mean alpha is below 16
+ * (transparent, @t->alpha only), '?' outside the buffer; after '|' the
+ * brightest sample of each cell on the same scale, so small bright
+ * details (text, a logo) show up too. 16 x 16 samples per cell (every
+ * ~11 px on 1440x2960): ~32k uncached reads.
  */
-static void dpu_thumb(struct dpu_dev *d, const struct dpu_thumb_src *t, const char *what)
+static void dpu_thumb(const struct dpu_thumb_src *t, const char *what,
+		      struct dpu_diag_txt *txt)
 {
 	const u8 *pos = dpu_fmt_pos[t->fmt];
 	char mean[DPU_TH_COLS + 1], peak[DPU_TH_COLS + 1];
@@ -797,48 +899,58 @@ static void dpu_thumb(struct dpu_dev *d, const struct dpu_thumb_src *t, const ch
 			}
 		}
 		mean[DPU_TH_COLS] = peak[DPU_TH_COLS] = '\0';
-		dev_info(d->dev, "diag %s thumb %02u: %s | %s\n", what, cy, mean, peak);
+		dpu_txt_add(txt, "diag %s thumb %02u: %s | %s\n", what, cy, mean, peak);
 	}
 }
 
 /*
  * Window geometry and a thumbnail of the window's source crop, read from
- * the write-combined CPU copy the DPU scans (@vaddr).
+ * the write-combined CPU copy the DPU scans (@vaddr), as a text on @list.
  */
 static void dpu_diag_thumb(struct dpu_dev *d, const struct dpu_commit *c, int win,
-			   const void *vaddr, const char *tag)
+			   const void *vaddr, const char *tag, struct list_head *list)
 {
 	const struct decon_win_config *w = &c->cfg[win];
 	const struct decon_frame *s = &w->src, *t = &w->dst;
+	struct dpu_diag_txt *txt = dpu_txt_new(list);
 	u32 fmt = c->dpp_fmt[win];
 	struct dpu_thumb_src ts;
 	char what[40];
 
+	if (!txt)
+		return;
 	if (w->state != DECON_WIN_STATE_BUFFER) {
-		dev_info(d->dev, "diag %s win%d geometry: colour %#x dst %ux%u@%d,%d blend %u plane alpha %d\n",
-			 tag, win, w->color, t->w, t->h, t->x, t->y, w->blending,
-			 w->plane_alpha);
+		dpu_txt_add(txt, "diag %s win%d geometry: colour %#x dst %ux%u@%d,%d blend %u plane alpha %d\n",
+			    tag, win, w->color, t->w, t->h, t->x, t->y, w->blending,
+			    w->plane_alpha);
 		return;
 	}
-	dev_info(d->dev, "diag %s win%d geometry: dst %ux%u@%d,%d src %ux%u@%d,%d of %ux%u fmt %u->dpp %u blend %u plane alpha %d idma %u -> ch %u%s\n",
-		 tag, win, t->w, t->h, t->x, t->y, s->w, s->h, s->x, s->y, s->f_w, s->f_h,
-		 w->format, fmt, w->blending, w->plane_alpha, w->idma_type,
-		 dpu_hw_dpp_to_channel(w->idma_type < DPU_NR_DPP ? w->idma_type : 0),
-		 w->compression ? " AFBC" : "");
+	dpu_txt_add(txt, "diag %s win%d geometry: dst %ux%u@%d,%d src %ux%u@%d,%d of %ux%u fmt %u->dpp %u blend %u plane alpha %d idma %u -> ch %u%s\n",
+		    tag, win, t->w, t->h, t->x, t->y, s->w, s->h, s->x, s->y, s->f_w, s->f_h,
+		    w->format, fmt, w->blending, w->plane_alpha, w->idma_type,
+		    dpu_hw_dpp_to_channel(w->idma_type < DPU_NR_DPP ? w->idma_type : 0),
+		    w->compression ? " AFBC" : "");
 	if (!vaddr || w->compression || !DPU_FMT_IS_RGB32(fmt) ||
 	    s->w < DPU_TH_COLS || s->h < DPU_TH_ROWS) {
-		dev_info(d->dev, "diag %s win%d thumbnail: n/a (%s)\n", tag, win,
-			 !vaddr ? "no CPU copy" : w->compression ? "AFBC" :
-			 !DPU_FMT_IS_RGB32(fmt) ? "not RGB32" : "too small");
+		dpu_txt_add(txt, "diag %s win%d thumbnail: n/a (%s)\n", tag, win,
+			    !vaddr ? "no CPU copy" : w->compression ? "AFBC" :
+			    !DPU_FMT_IS_RGB32(fmt) ? "not RGB32" : "too small");
 		return;
 	}
 	ts = (struct dpu_thumb_src){
 		.mem = vaddr, .len = c->buf[win].len, .stride = s->f_w * 4,
 		.x = s->x, .y = s->y, .w = s->w, .h = s->h, .fmt = fmt,
-		.alpha = fmt <= DECON_PIXEL_FORMAT_BGRA_8888,
+		/*
+		 * Sol review S2: pixel alpha only hides a pixel when the
+		 * window blends with it; with DECON_BLENDING_NONE (and for
+		 * the X formats) the RGB is shown whatever the alpha byte.
+		 */
+		.alpha = fmt <= DECON_PIXEL_FORMAT_BGRA_8888 &&
+			 (w->blending == DECON_BLENDING_PREMULT ||
+			  w->blending == DECON_BLENDING_COVERAGE),
 	};
 	snprintf(what, sizeof(what), "%s win%d", tag, win);
-	dpu_thumb(d, &ts, what);
+	dpu_thumb(&ts, what, txt);
 }
 
 /* window @i of @c scans this CPU copy, NULL if the DPU reads the dma-buf */
@@ -847,17 +959,21 @@ static const void *dpu_diag_copy(struct dpu_dev *d, const struct dpu_commit *c, 
 	return (c->bounced & BIT(i)) ? d->bounce[i][c->slot[i]].vaddr : NULL;
 }
 
+#define DPU_THUMB_PERIOD_MS	5000
+
 /*
  * Tell "HWC frames are dark" from "the DPU shows black": registers at the
  * first latched user commit, content + registers for the first 3 bounces
- * and every 100th after, each with the frame/TE counters, the window
- * geometry and a thumbnail of every window.
+ * and every 100th after, each with the frame/TE counters. Window geometry
+ * and thumbnails go to @list (printed after the fence signals), for the
+ * first latch and then at most once per window every DPU_THUMB_PERIOD_MS.
  */
-static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
+static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c, struct list_head *list)
 {
 	bool first = !d->diag_latched;
 	bool sample = c->bounced && (d->nr_bounces <= 3 || !(d->nr_bounces % 100));
 	const char *tag = first ? "first HWC latch" : "sample";
+	ktime_t now = ktime_get();
 	int i;
 
 	if (!first && !sample)
@@ -870,77 +986,71 @@ static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
 		dpu_diag_regs(d, c, i, tag);
 		if (sample && c->buf[i].bounce)
 			dpu_diag_content(d, c, i);
-		dpu_diag_thumb(d, c, i, dpu_diag_copy(d, c, i), tag);
+		if (!first && d->thumb_at[i] &&
+		    ktime_ms_delta(now, d->thumb_at[i]) < DPU_THUMB_PERIOD_MS)
+			continue;
+		d->thumb_at[i] = now;
+		dpu_diag_thumb(d, c, i, dpu_diag_copy(d, c, i), tag, list);
 	}
 }
 
 #define DPU_IDLE_SNAP_MS	3000
 #define DPU_IDLE_SNAP_MAX	32
-#define DPU_IDLE_RATE_MS	250
 #define DPU_FB_SNAP_MS		5000
 
 /*
  * HWC stops committing while the screen is static, so the sampled frames
  * above can miss the one left on the panel. Once no user commit has come
  * for DPU_IDLE_SNAP_MS, log the frame being scanned (d->active): frame and
- * TE rate over DPU_IDLE_RATE_MS, registers, geometry and thumbnails. Runs
- * in the update worker, so d->active and its bounce slots are stable.
+ * TE rate over DPU_RATE_MS, registers, geometry and thumbnails. Runs in
+ * the update worker, so d->active and its bounce slots are stable while
+ * they are read; nothing in here sleeps.
  */
 static void dpu_idle_snap(struct kthread_work *work)
 {
 	struct dpu_dev *d = container_of(work, struct dpu_dev, idle_work.work);
 	struct dpu_commit *c = d->active;
-	u32 fc0, fc1;
-	int te0, te1, i;
+	LIST_HEAD(txt);
 	char tag[16];
+	int i;
 
 	if (!c || c->internal || READ_ONCE(d->stopping) ||
 	    d->nr_idle_snaps >= DPU_IDLE_SNAP_MAX)
 		return;
 	snprintf(tag, sizeof(tag), "idle #%u", ++d->nr_idle_snaps);
-	fc0 = dpu_hw_frame_count(d);
-	te0 = atomic_read(&d->te_count);
-	msleep(DPU_IDLE_RATE_MS);
-	fc1 = dpu_hw_frame_count(d);
-	te1 = atomic_read(&d->te_count);
-	dev_info(d->dev, "diag %s: no commit for %u ms; in %u ms FRAME_COUNT %u -> %u (+%u), TE %d -> %d (+%d)\n",
-		 tag, DPU_IDLE_SNAP_MS, DPU_IDLE_RATE_MS, fc0, fc1, fc1 - fc0, te0, te1,
-		 te1 - te0);
+	dev_info(d->dev, "diag %s: no commit for %u ms\n", tag, DPU_IDLE_SNAP_MS);
+	dpu_rate_start(d, tag);
 	dpu_diag_hdr(d, tag);
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		if (c->cfg[i].state == DECON_WIN_STATE_DISABLED)
 			continue;
 		dpu_diag_regs(d, c, i, tag);
-		dpu_diag_thumb(d, c, i, dpu_diag_copy(d, c, i), tag);
+		dpu_diag_thumb(d, c, i, dpu_diag_copy(d, c, i), tag, &txt);
 	}
+	dpu_diag_post(d, &txt);
 }
 
 /*
  * fb0 (the buffer SBoot left at 0xcc000000, then our fb0): is it black
- * before HWC starts, and does DECON keep sending it? @rate also counts
- * frames and TE pulses over DPU_IDLE_RATE_MS (sleeps). fb0 is scanned
- * with blending off, so its alpha byte does not matter: cells show luma.
+ * before HWC starts, and does DECON keep sending it? @rate also starts a
+ * frame/TE count over DPU_RATE_MS. The thumbnail goes to @list. fb0 is
+ * scanned with blending off, so its alpha byte does not matter: cells
+ * show luma.
  */
-static void dpu_diag_fb(struct dpu_dev *d, const char *when, bool rate)
+static void dpu_diag_fb(struct dpu_dev *d, const char *when, bool rate,
+			struct list_head *list)
 {
 	struct dpu_thumb_src ts = {
 		.io = d->fb ? (const u8 __iomem *)d->fb->screen_base : NULL,
 		.len = d->fb_size, .stride = d->fb_stride,
 		.w = d->lcd.xres, .h = d->lcd.yres, .fmt = d->fb_dpp_fmt,
 	};
+	struct dpu_diag_txt *txt;
 	char what[40];
 
 	snprintf(what, sizeof(what), "fb0 %s", when);
-	if (rate) {
-		u32 fc0 = dpu_hw_frame_count(d), fc1;
-		int te0 = atomic_read(&d->te_count), te1;
-
-		msleep(DPU_IDLE_RATE_MS);
-		fc1 = dpu_hw_frame_count(d);
-		te1 = atomic_read(&d->te_count);
-		dev_info(d->dev, "diag %s: in %u ms FRAME_COUNT %u -> %u (+%u), TE %d -> %d (+%d)\n",
-			 what, DPU_IDLE_RATE_MS, fc0, fc1, fc1 - fc0, te0, te1, te1 - te0);
-	}
+	if (rate)
+		dpu_rate_start(d, what);
 	dpu_diag_hdr(d, what);
 	if (!ts.io || !DPU_FMT_IS_RGB32(ts.fmt) || ts.stride < ts.w * 4 ||
 	    (size_t)ts.stride * ts.h > ts.len) {
@@ -948,21 +1058,27 @@ static void dpu_diag_fb(struct dpu_dev *d, const char *when, bool rate)
 			 !ts.io ? "not registered" : "layout unexpected");
 		return;
 	}
-	dev_info(d->dev, "diag %s: %pa %ux%u stride %u DPP format %u, window %s, HWC %s; win%d IDMA base %#x active %#x\n",
-		 what, &d->fb_phys, ts.w, ts.h, ts.stride, ts.fmt,
-		 d->fb_taken ? "taken over" : "SBoot's",
-		 d->diag_latched ? "started" : "not started",
-		 d->boot_win, dpu_hw_dma_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y),
-		 dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y));
-	dpu_thumb(d, &ts, what);
+	txt = dpu_txt_new(list);
+	if (!txt)
+		return;
+	dpu_txt_add(txt, "diag %s: %pa %ux%u stride %u DPP format %u, window %s, HWC %s; win%d IDMA base %#x active %#x\n",
+		    what, &d->fb_phys, ts.w, ts.h, ts.stride, ts.fmt,
+		    d->fb_taken ? "taken over" : "SBoot's",
+		    d->diag_latched ? "started" : "not started",
+		    d->boot_win, dpu_hw_dma_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y),
+		    dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y));
+	dpu_thumb(&ts, what, txt);
 }
 
 static void dpu_fb_snap_work(struct work_struct *work)
 {
 	struct dpu_dev *d = container_of(work, struct dpu_dev, fb_snap_work.work);
+	LIST_HEAD(txt);
 
-	if (!READ_ONCE(d->stopping))
-		dpu_diag_fb(d, "at 5 s", true);
+	if (READ_ONCE(d->stopping))
+		return;
+	dpu_diag_fb(d, "at 5 s", true, &txt);
+	dpu_diag_post(d, &txt);
 }
 
 /*
@@ -1041,12 +1157,13 @@ static void dpu_check_fb_reservation(struct dpu_dev *d)
 static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
+	LIST_HEAD(txt);
 	int i, ret;
 
 	/* fb0 as the panel showed it until now, before HWC replaces it */
 	if (!c->internal && !d->fb_snap_hwc) {
 		d->fb_snap_hwc = true;
-		dpu_diag_fb(d, "before the first HWC commit", true);
+		dpu_diag_fb(d, "before the first HWC commit", true, &txt);
 	}
 
 	for (i = 0; i < DECON_MAX_WIN; i++) {
@@ -1094,7 +1211,7 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	}
 	d->nr_commits++;
 	if (!c->result && !c->internal)
-		dpu_diag(d, c);		/* before bounce_next moves on */
+		dpu_diag(d, c, &txt);	/* before bounce_next moves on */
 	/* the bounce buffer just written is now (or may be) scanned */
 	if (c->result == 0 || c->result == -ETIMEDOUT)
 		for_each_set_bit(i, &c->bounced, DECON_MAX_WIN)
@@ -1110,6 +1227,7 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 			dma_fence_set_error(c->fence, c->result);
 		dma_fence_signal(c->fence);
 	}
+	dpu_diag_post(d, &txt);		/* thumbnails, printed from system_wq */
 
 	/*
 	 * Once the new configuration latched, the previous buffers are no
@@ -2445,6 +2563,10 @@ static int dpu_probe(struct platform_device *pdev)
 	spin_lock_init(&d->queue_lock);
 	spin_lock_init(&d->fence_lock);
 	spin_lock_init(&d->ioc_lock);
+	spin_lock_init(&d->diag_lock);
+	INIT_LIST_HEAD(&d->diag_txt);
+	INIT_WORK(&d->diag_emit_work, dpu_diag_emit);
+	INIT_DELAYED_WORK(&d->rate_work, dpu_rate_work);
 	INIT_LIST_HEAD(&d->queue);
 	INIT_LIST_HEAD(&d->stale);
 	init_waitqueue_head(&d->vsync_wait);
@@ -2596,11 +2718,13 @@ static int dpu_probe(struct platform_device *pdev)
 	}
 	/* fb0: reservation, picture and counters at adopt, again at 5 s */
 	dpu_check_fb_reservation(d);
-	dpu_diag_fb(d, "at adopt", false);	/* also the pending-bit baseline */
 	{
 		u64 now = ktime_to_ms(ktime_get_boottime());
 		u64 left = now < DPU_FB_SNAP_MS ? DPU_FB_SNAP_MS - now : 0;
+		LIST_HEAD(txt);
 
+		dpu_diag_fb(d, "at adopt", false, &txt);	/* + pending-bit baseline */
+		dpu_diag_post(d, &txt);
 		schedule_delayed_work(&d->fb_snap_work, msecs_to_jiffies(left));
 	}
 	dev_info(dev, "adopt mode ready: TE irq %d, %s\n", d->te_irq,
@@ -2635,6 +2759,8 @@ static void dpu_stop(struct dpu_dev *d)
 	kthread_flush_worker(d->worker);
 	/* commits processed from here on see d->stopping and do not re-arm */
 	kthread_cancel_delayed_work_sync(&d->idle_work);
+	cancel_delayed_work_sync(&d->rate_work);
+	flush_work(&d->diag_emit_work);		/* prints and frees queued texts */
 }
 
 static void dpu_shutdown(struct platform_device *pdev)
