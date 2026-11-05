@@ -786,12 +786,43 @@ static int dpu_fb_set_par(struct fb_info *info)
 static int dpu_fb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 			    u_int transp, struct fb_info *info)
 {
+	const struct fb_var_screeninfo *v = &info->var;
 	u32 *pal = info->pseudo_palette;
 
 	if (regno >= 16)
 		return -EINVAL;
-	pal[regno] = 0xff000000 | ((red >> 8) << 16) | ((green >> 8) << 8) | (blue >> 8);
+	pal[regno] = ((red >> 8) << v->red.offset) | ((green >> 8) << v->green.offset) |
+		     ((blue >> 8) << v->blue.offset) |
+		     (v->transp.length ? 0xffU << v->transp.offset : 0);
 	return 0;
+}
+
+/*
+ * fb0 pixel layout for a DPP-level 32-bit format. The IDMA format names give
+ * the byte order in memory: the q47 self-test drew 0xAARRGGBB words (bytes
+ * B,G,R,A) with DPP BGRA_8888 and the owner saw the intended colours, and
+ * the SBoot buffer (IDMA ARGB8888) holds bytes A,R,G,B.
+ */
+static void dpu_fb_layout(u32 dpp_fmt, struct fb_var_screeninfo *v)
+{
+	/* memory byte index of R, G, B, A */
+	static const u8 pos[8][4] = {
+		[DECON_PIXEL_FORMAT_ARGB_8888] = { 1, 2, 3, 0 },
+		[DECON_PIXEL_FORMAT_ABGR_8888] = { 3, 2, 1, 0 },
+		[DECON_PIXEL_FORMAT_RGBA_8888] = { 0, 1, 2, 3 },
+		[DECON_PIXEL_FORMAT_BGRA_8888] = { 2, 1, 0, 3 },
+		[DECON_PIXEL_FORMAT_XRGB_8888] = { 1, 2, 3, 0 },
+		[DECON_PIXEL_FORMAT_XBGR_8888] = { 3, 2, 1, 0 },
+		[DECON_PIXEL_FORMAT_RGBX_8888] = { 0, 1, 2, 3 },
+		[DECON_PIXEL_FORMAT_BGRX_8888] = { 2, 1, 0, 3 },
+	};
+	const u8 *p = pos[dpp_fmt < 8 ? dpp_fmt : DECON_PIXEL_FORMAT_BGRA_8888];
+	bool alpha = dpp_fmt <= DECON_PIXEL_FORMAT_BGRA_8888;
+
+	v->red = (struct fb_bitfield){ 8 * p[0], 8, 0 };
+	v->green = (struct fb_bitfield){ 8 * p[1], 8, 0 };
+	v->blue = (struct fb_bitfield){ 8 * p[2], 8, 0 };
+	v->transp = (struct fb_bitfield){ 8 * p[3], alpha ? 8 : 0, 0 };
 }
 
 static int dpu_fb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
@@ -819,15 +850,23 @@ static const struct fb_ops dpu_fb_ops = {
 	.fb_ioctl	= dpu_fb_ioctl,
 };
 
-/* fb0 window, as 4.9 decon_fb init: DPP BGRA_8888 (= user ARGB_8888) */
-static void dpu_fb_window(struct dpu_dev *d, struct decon_win_config_data *wd)
+/*
+ * Full-screen window on the boot DPP. @dpp_fmt is the DPP-level format; the
+ * user-level format in the config is its 4.9 translation (an involution).
+ * fb0 itself uses d->fb_dpp_fmt, the IDMA format SBoot left: the boot buffer
+ * keeps its byte order (SBoot: IDMA ARGB8888, bytes A,R,G,B), so taking the
+ * window over does not change a pixel on the panel. 4.9 decon_fb init used
+ * DPP BGRA_8888, which showed the SBoot logo with swapped channels (v4).
+ */
+static void dpu_fb_window(struct dpu_dev *d, struct decon_win_config_data *wd,
+			  u32 dpp_fmt)
 {
 	struct decon_win_config *w = &wd->config[d->boot_win];
 
 	memset(wd, 0, sizeof(*wd));
 	w->state = DECON_WIN_STATE_BUFFER;
 	w->idma_type = d->boot_dpp;
-	w->format = DECON_PIXEL_FORMAT_ARGB_8888;
+	w->format = dpu_translate_fmt_to_dpp(dpp_fmt);
 	w->blending = DECON_BLENDING_NONE;
 	w->plane_alpha = 0xff;
 	w->src.w = w->src.f_w = w->dst.w = w->dst.f_w = d->lcd.xres;
@@ -973,13 +1012,13 @@ static int dpu_fb_takeover(struct dpu_dev *d)
 		kfree(wd);
 		return PTR_ERR(db);
 	}
-	dpu_fb_window(d, wd);
+	dpu_fb_window(d, wd, d->fb_dpp_fmt);
 	fc0 = dpu_hw_frame_count(d);
 	ret = dpu_kcommit(d, wd, db, &us);
 	dma_buf_put(db);
 	kfree(wd);
-	dev_info(d->dev, "fb0 takeover: win%d dpp%d DPP BGRA_8888 at %pa: %d, latched after %u us, FRAME_COUNT %u -> %u, active IDMA base %#x IN_CON %#x (SFR IN_CON %#x)\n",
-		 d->boot_win, d->boot_dpp, &d->fb_phys, ret, us, fc0,
+	dev_info(d->dev, "fb0 takeover: win%d dpp%d DPP format %u (SBoot IDMA format %u kept) at %pa: %d, latched after %u us, FRAME_COUNT %u -> %u, active IDMA base %#x IN_CON %#x (SFR IN_CON %#x)\n",
+		 d->boot_win, d->boot_dpp, d->fb_dpp_fmt, d->boot_fmt, &d->fb_phys, ret, us, fc0,
 		 dpu_hw_frame_count(d),
 		 dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y),
 		 dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_CON),
@@ -1074,7 +1113,8 @@ static void dpu_st_work(struct work_struct *work)
 		dma_addr_t want = ((struct dpu_kbuf *)buf[i & 1]->priv)->dma;
 		u32 fc, te, act, sfr;
 
-		dpu_fb_window(d, wd);
+		/* A/B are drawn as 0xAARRGGBB words: DPP BGRA_8888 */
+		dpu_fb_window(d, wd, DECON_PIXEL_FORMAT_BGRA_8888);
 		ret = dpu_kcommit(d, wd, buf[i & 1], &us);
 		fc = dpu_hw_frame_count(d);
 		te = atomic_read(&d->te_count);
@@ -1102,7 +1142,7 @@ out:
 		u32 act;
 
 		if (!IS_ERR(fb)) {
-			dpu_fb_window(d, wd);
+			dpu_fb_window(d, wd, d->fb_dpp_fmt);
 			ret = dpu_kcommit(d, wd, fb, &us);
 			dma_buf_put(fb);
 			act = dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y);
@@ -1206,8 +1246,20 @@ static int dpu_adopt(struct dpu_dev *d)
 			&d->fb_phys, d->lcd.xres, d->lcd.yres);
 		return -ENODEV;
 	}
-	dev_info(d->dev, "adopted: win%d dpp%d IDMA format %u at %pa\n",
-		 d->boot_win, d->boot_dpp, d->boot_fmt, &d->fb_phys);
+	{
+		/* IDMA_IMG_FORMAT_* 0..7 -> DPP-level DECON format (dpp_set_format) */
+		static const u32 idma_to_dpp[8] = {
+			DECON_PIXEL_FORMAT_ARGB_8888, DECON_PIXEL_FORMAT_ABGR_8888,
+			DECON_PIXEL_FORMAT_RGBA_8888, DECON_PIXEL_FORMAT_BGRA_8888,
+			DECON_PIXEL_FORMAT_XRGB_8888, DECON_PIXEL_FORMAT_XBGR_8888,
+			DECON_PIXEL_FORMAT_RGBX_8888, DECON_PIXEL_FORMAT_BGRX_8888,
+		};
+
+		/* adopt accepted only formats <= IDMA_IMG_FORMAT_BGRX8888 */
+		d->fb_dpp_fmt = idma_to_dpp[d->boot_fmt & 7];
+	}
+	dev_info(d->dev, "adopted: win%d dpp%d IDMA format %u at %pa; fb0 keeps it (DPP format %u)\n",
+		 d->boot_win, d->boot_dpp, d->boot_fmt, &d->fb_phys, d->fb_dpp_fmt);
 
 	/* Stage 1 / 4.9 decon_reg_set_trigger(HW, ENABLE): continuous TE refresh */
 	if ((trig & (HW_TRIG_EN | HW_TRIG_MASK_DECON)) != HW_TRIG_EN) {
@@ -1362,10 +1414,7 @@ static int dpu_register_fb(struct dpu_dev *d)
 	info->var.xres = info->var.xres_virtual = d->lcd.xres;
 	info->var.yres = info->var.yres_virtual = d->lcd.yres;
 	info->var.bits_per_pixel = 32;
-	info->var.red = (struct fb_bitfield){ 16, 8, 0 };
-	info->var.green = (struct fb_bitfield){ 8, 8, 0 };
-	info->var.blue = (struct fb_bitfield){ 0, 8, 0 };
-	info->var.transp = (struct fb_bitfield){ 24, 8, 0 };
+	dpu_fb_layout(d->fb_dpp_fmt, &info->var);
 	info->var.width = d->lcd.mm_w;
 	info->var.height = d->lcd.mm_h;
 	info->var.activate = FB_ACTIVATE_NOW;

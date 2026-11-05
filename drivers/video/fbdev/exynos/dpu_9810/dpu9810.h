@@ -114,7 +114,8 @@ struct dpu_dev {
 
 	/* adopted SBoot state */
 	int boot_win, boot_dpp;
-	u32 boot_fmt;
+	u32 boot_fmt;				/* IDMA_IMG_FORMAT_* SBoot left */
+	u32 fb_dpp_fmt;				/* fb0 window, DPP level (= boot) */
 	bool trig_written;
 	u32 trig_orig;
 	bool continuous;			/* TE trigger left unmasked */
