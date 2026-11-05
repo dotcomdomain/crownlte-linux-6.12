@@ -159,7 +159,13 @@ struct dpu_dev {
 	u8 bounce_next[DECON_MAX_WIN];
 	u32 nr_bounces, bounce_max_us, nr_afbc;
 	bool diag_latched;			/* first user commit logged */
+	struct kthread_delayed_work idle_work;	/* diag of the frame HWC left up */
+	u32 nr_idle_snaps;
 	u32 hwc_ver;
+	/* ioctl numbers seen, each logged once with its first result */
+	spinlock_t ioc_lock;
+	u32 ioc_seen[32];
+	unsigned int ioc_nseen;
 
 	/* vsync (TE EINT, as 4.9 decon_ext_irq_handler) */
 	int te_irq;

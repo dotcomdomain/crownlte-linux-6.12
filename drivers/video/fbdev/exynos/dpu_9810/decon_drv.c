@@ -685,38 +685,187 @@ static void dpu_diag_regs(struct dpu_dev *d, struct dpu_commit *c, int win, cons
 		 decon_rd_shd(d, BLENDER_BG_IMAGE_COLOR_1));
 	if (w->state != DECON_WIN_STATE_BUFFER)
 		return;
-	dev_info(d->dev, "diag %s win%d: IDMA%d SFR/active IN_CON %#x/%#x (afbc %d/%d, fmt %u/%u) BASE %#x/%#x (want %pad) SRC %#x/%#x IMG %#x/%#x RECOVERY %#x | DPP IN_CON %#x IMG %#x\n",
+	dev_info(d->dev, "diag %s win%d: IDMA%d SFR/active IN_CON %#x/%#x (afbc %d/%d, fmt %u/%u) BASE %#x/%#x (want %pad) SRC %#x/%#x OFFSET %#x/%#x IMG %#x/%#x RECOVERY %#x IRQ %#x | DPP IN_CON %#x IMG %#x\n",
 		 tag, win, dpp, in, ain, !!(in & IDMA_AFBC_EN), !!(ain & IDMA_AFBC_EN),
 		 (in >> 11) & 0x1f, (ain >> 11) & 0x1f,
 		 dpu_hw_dma_rd(d, dpp, IDMA_IN_BASE_ADDR_Y),
 		 dpu_hw_dma_active_rd(d, dpp, IDMA_IN_BASE_ADDR_Y), &c->buf[win].addr,
 		 dpu_hw_dma_rd(d, dpp, IDMA_SRC_SIZE), dpu_hw_dma_active_rd(d, dpp, IDMA_SRC_SIZE),
+		 dpu_hw_dma_rd(d, dpp, IDMA_SRC_OFFSET),
+		 dpu_hw_dma_active_rd(d, dpp, IDMA_SRC_OFFSET),
 		 dpu_hw_dma_rd(d, dpp, IDMA_IMG_SIZE), dpu_hw_dma_active_rd(d, dpp, IDMA_IMG_SIZE),
-		 dpu_hw_dma_rd(d, dpp, IDMA_RECOVERY_CTRL),
+		 dpu_hw_dma_rd(d, dpp, IDMA_RECOVERY_CTRL), dpu_hw_dma_rd(d, dpp, IDMA_IRQ),
 		 readl(d->dpp_regs + dpp * 0x1000 + DPP_IN_CON),
 		 readl(d->dpp_regs + dpp * 0x1000 + DPP_IMG_SIZE));
 }
 
 /*
+ * Is DECON still sending frames? FRAME_COUNT advances per frame sent, TE
+ * per panel tearing-effect pulse; with the trigger unmasked both move at
+ * 60 Hz. The pending bits are never cleared by this driver (no DECON
+ * interrupt handler), so a set bit means "at least once since SBoot".
+ */
+static void dpu_diag_hdr(struct dpu_dev *d, const char *tag)
+{
+	dev_info(d->dev, "diag %s: FRAME_COUNT %u TE %d TRIG %#x GLOBAL_CONTROL %#x INT_PEND %#x EXTRA_INT_PEND %#x | commits %u latch timeouts %u rejects %u bounces %u\n",
+		 tag, dpu_hw_frame_count(d), atomic_read(&d->te_count),
+		 decon_rd(d, HW_SW_TRIG_CONTROL), decon_rd(d, GLOBAL_CONTROL),
+		 decon_rd(d, INTERRUPT_PENDING), decon_rd(d, EXTRA_INTERRUPT_PENDING),
+		 d->nr_commits, d->nr_latch_timeouts, d->nr_rejects, d->nr_bounces);
+}
+
+#define DPU_TH_COLS	8
+#define DPU_TH_ROWS	16
+#define DPU_TH_SAMPLES	16	/* per cell and axis */
+
+/*
+ * Window geometry and a coarse picture of what the DPU is fed: the
+ * window's source crop split into an 8 x 16 grid, one line per grid row,
+ * one character per cell: mean luma (0.299 R + 0.587 G + 0.114 B) as 0-9,
+ * '.' where the mean alpha is below 16 (transparent), '?' outside the
+ * buffer. 16 x 16 samples per cell (every ~11 px on a 1440x2960 window),
+ * read from the write-combined CPU copy the DPU scans (@vaddr): ~32k
+ * uncached reads, so only on sampled frames.
+ */
+static void dpu_diag_thumb(struct dpu_dev *d, const struct dpu_commit *c, int win,
+			   const void *vaddr, const char *tag)
+{
+	const struct decon_win_config *w = &c->cfg[win];
+	const struct decon_frame *s = &w->src, *t = &w->dst;
+	u32 fmt = c->dpp_fmt[win], cx, cy, sx, sy;
+	size_t len = c->buf[win].len;
+	char row[DPU_TH_COLS + 1];
+	const u8 *pos;
+	bool alpha;
+
+	if (w->state != DECON_WIN_STATE_BUFFER) {
+		dev_info(d->dev, "diag %s win%d geometry: colour %#x dst %ux%u@%d,%d blend %u plane alpha %d\n",
+			 tag, win, w->color, t->w, t->h, t->x, t->y, w->blending,
+			 w->plane_alpha);
+		return;
+	}
+	dev_info(d->dev, "diag %s win%d geometry: dst %ux%u@%d,%d src %ux%u@%d,%d of %ux%u fmt %u->dpp %u blend %u plane alpha %d idma %u -> ch %u%s\n",
+		 tag, win, t->w, t->h, t->x, t->y, s->w, s->h, s->x, s->y, s->f_w, s->f_h,
+		 w->format, fmt, w->blending, w->plane_alpha, w->idma_type,
+		 dpu_hw_dpp_to_channel(w->idma_type < DPU_NR_DPP ? w->idma_type : 0),
+		 w->compression ? " AFBC" : "");
+	if (!vaddr || w->compression || !DPU_FMT_IS_RGB32(fmt) ||
+	    s->w < DPU_TH_COLS || s->h < DPU_TH_ROWS) {
+		dev_info(d->dev, "diag %s win%d thumbnail: n/a (%s)\n", tag, win,
+			 !vaddr ? "no CPU copy" : w->compression ? "AFBC" :
+			 !DPU_FMT_IS_RGB32(fmt) ? "not RGB32" : "too small");
+		return;
+	}
+	pos = dpu_fmt_pos[fmt];
+	alpha = fmt <= DECON_PIXEL_FORMAT_BGRA_8888;
+
+	for (cy = 0; cy < DPU_TH_ROWS; cy++) {
+		u32 y0 = s->h * cy / DPU_TH_ROWS, y1 = s->h * (cy + 1) / DPU_TH_ROWS;
+
+		for (cx = 0; cx < DPU_TH_COLS; cx++) {
+			u32 x0 = s->w * cx / DPU_TH_COLS, x1 = s->w * (cx + 1) / DPU_TH_COLS;
+			u64 lsum = 0, asum = 0;
+			u32 n = 0;
+
+			for (sy = 0; sy < DPU_TH_SAMPLES; sy++) {
+				u32 y = y0 + (y1 - y0) * (2 * sy + 1) / (2 * DPU_TH_SAMPLES);
+
+				for (sx = 0; sx < DPU_TH_SAMPLES; sx++) {
+					u32 x = x0 + (x1 - x0) * (2 * sx + 1) / (2 * DPU_TH_SAMPLES);
+					size_t off = (((size_t)(s->y + y) * s->f_w) + s->x + x) * 4;
+					u32 px;
+					const u8 *b = (const u8 *)&px;
+
+					if (off + 4 > len)
+						continue;
+					px = READ_ONCE(*(const u32 *)((const u8 *)vaddr + off));
+					lsum += 299 * b[pos[0]] + 587 * b[pos[1]] + 114 * b[pos[2]];
+					asum += b[pos[3]];
+					n++;
+				}
+			}
+			if (!n)
+				row[cx] = '?';
+			else if (alpha && div_u64(asum, n) < 16)
+				row[cx] = '.';
+			else
+				row[cx] = '0' + min_t(u32, 9, div_u64(lsum, n) * 10 / 256000);
+		}
+		row[DPU_TH_COLS] = '\0';
+		dev_info(d->dev, "diag %s win%d thumb %02u: %s\n", tag, win, cy, row);
+	}
+}
+
+/* window @i of @c scans this CPU copy, NULL if the DPU reads the dma-buf */
+static const void *dpu_diag_copy(struct dpu_dev *d, const struct dpu_commit *c, int i)
+{
+	return (c->bounced & BIT(i)) ? d->bounce[i][c->slot[i]].vaddr : NULL;
+}
+
+/*
  * Tell "HWC frames are dark" from "the DPU shows black": registers at the
  * first latched user commit, content + registers for the first 3 bounces
- * and every 100th after.
+ * and every 100th after, each with the frame/TE counters, the window
+ * geometry and a thumbnail of every window.
  */
 static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
 {
 	bool first = !d->diag_latched;
 	bool sample = c->bounced && (d->nr_bounces <= 3 || !(d->nr_bounces % 100));
+	const char *tag = first ? "first HWC latch" : "sample";
 	int i;
 
 	if (!first && !sample)
 		return;
 	d->diag_latched = true;
+	dpu_diag_hdr(d, tag);
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		if (c->cfg[i].state == DECON_WIN_STATE_DISABLED)
 			continue;
-		dpu_diag_regs(d, c, i, first ? "first HWC latch" : "sample");
+		dpu_diag_regs(d, c, i, tag);
 		if (sample && c->buf[i].bounce)
 			dpu_diag_content(d, c, i);
+		dpu_diag_thumb(d, c, i, dpu_diag_copy(d, c, i), tag);
+	}
+}
+
+#define DPU_IDLE_SNAP_MS	3000
+#define DPU_IDLE_SNAP_MAX	32
+#define DPU_IDLE_RATE_MS	250
+
+/*
+ * HWC stops committing while the screen is static, so the sampled frames
+ * above can miss the one left on the panel. Once no user commit has come
+ * for DPU_IDLE_SNAP_MS, log the frame being scanned (d->active): frame and
+ * TE rate over DPU_IDLE_RATE_MS, registers, geometry and thumbnails. Runs
+ * in the update worker, so d->active and its bounce slots are stable.
+ */
+static void dpu_idle_snap(struct kthread_work *work)
+{
+	struct dpu_dev *d = container_of(work, struct dpu_dev, idle_work.work);
+	struct dpu_commit *c = d->active;
+	u32 fc0, fc1;
+	int te0, te1, i;
+	char tag[16];
+
+	if (!c || c->internal || READ_ONCE(d->stopping) ||
+	    d->nr_idle_snaps >= DPU_IDLE_SNAP_MAX)
+		return;
+	snprintf(tag, sizeof(tag), "idle #%u", ++d->nr_idle_snaps);
+	fc0 = dpu_hw_frame_count(d);
+	te0 = atomic_read(&d->te_count);
+	msleep(DPU_IDLE_RATE_MS);
+	fc1 = dpu_hw_frame_count(d);
+	te1 = atomic_read(&d->te_count);
+	dev_info(d->dev, "diag %s: no commit for %u ms; in %u ms FRAME_COUNT %u -> %u (+%u), TE %d -> %d (+%d)\n",
+		 tag, DPU_IDLE_SNAP_MS, DPU_IDLE_RATE_MS, fc0, fc1, fc1 - fc0, te0, te1,
+		 te1 - te0);
+	dpu_diag_hdr(d, tag);
+	for (i = 0; i < DECON_MAX_WIN; i++) {
+		if (c->cfg[i].state == DECON_WIN_STATE_DISABLED)
+			continue;
+		dpu_diag_regs(d, c, i, tag);
+		dpu_diag_thumb(d, c, i, dpu_diag_copy(d, c, i), tag);
 	}
 }
 
@@ -775,6 +924,11 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	if (c->result == 0 || c->result == -ETIMEDOUT)
 		for_each_set_bit(i, &c->bounced, DECON_MAX_WIN)
 			d->bounce_next[i] ^= 1;
+	/* (re)start the idle snapshot of the frame HWC leaves up */
+	if ((c->result == 0 || c->result == -ETIMEDOUT) && !c->internal &&
+	    d->nr_idle_snaps < DPU_IDLE_SNAP_MAX && !READ_ONCE(d->stopping))
+		kthread_mod_delayed_work(d->worker, &d->idle_work,
+					 msecs_to_jiffies(DPU_IDLE_SNAP_MS));
 
 	if (c->fence) {
 		if (c->result)
@@ -1063,7 +1217,7 @@ out:
 	return ret;
 }
 
-static int dpu_fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
+static int dpu_fb_ioctl_cmd(struct fb_info *info, unsigned int cmd, unsigned long arg)
 {
 	struct dpu_dev *d = info->par;
 	void __user *argp = (void __user *)arg;
@@ -1134,7 +1288,7 @@ static int dpu_fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long ar
 		if (get_user(v, (u32 __user *)argp))
 			return -EFAULT;
 		/* doze needs the panel driver; 4.9 ignores other modes too */
-		dev_dbg(d->dev, "power mode %u ignored in adopt mode\n", v);
+		dev_info(d->dev, "power mode %u ignored in adopt mode\n", v);
 		return 0;
 
 	case DECON_WIN_CURSOR_POS:
@@ -1195,6 +1349,32 @@ static int dpu_fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long ar
 	}
 }
 
+/*
+ * Which driver ioctls HWC uses and what each got: every command number is
+ * logged once, at its first call, with that call's result (the fb core
+ * handles FBIOGET/FBIOPUT_VSCREENINFO, FBIOBLANK etc. before this).
+ */
+static int dpu_fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
+{
+	struct dpu_dev *d = info->par;
+	int ret = dpu_fb_ioctl_cmd(info, cmd, arg);
+	bool first = true;
+	unsigned int i;
+
+	spin_lock(&d->ioc_lock);
+	for (i = 0; i < d->ioc_nseen && first; i++)
+		first = d->ioc_seen[i] != cmd;
+	if (first && d->ioc_nseen < ARRAY_SIZE(d->ioc_seen))
+		d->ioc_seen[d->ioc_nseen++] = cmd;
+	else
+		first = false;
+	spin_unlock(&d->ioc_lock);
+	if (first)
+		dev_info(d->dev, "ioctl %#x (type %#x nr %u size %u) first call by %s: %d\n",
+			 cmd, _IOC_TYPE(cmd), _IOC_NR(cmd), _IOC_SIZE(cmd), current->comm, ret);
+	return ret;
+}
+
 /* ---- fbdev ----------------------------------------------------------- */
 
 static int dpu_fb_check_var(struct fb_var_screeninfo *var, struct fb_info *info)
@@ -1246,7 +1426,7 @@ static int dpu_fb_blank(int mode, struct fb_info *info)
 	struct dpu_dev *d = info->par;
 
 	/* panel power is not ours yet: blanking is accepted and ignored */
-	dev_info_once(d->dev, "blank %d ignored (adopt mode, no panel driver)\n", mode);
+	dev_info(d->dev, "blank %d ignored (adopt mode, no panel driver)\n", mode);
 	return 0;
 }
 
@@ -2089,6 +2269,7 @@ static int dpu_probe(struct platform_device *pdev)
 	mutex_init(&d->hw_lock);
 	spin_lock_init(&d->queue_lock);
 	spin_lock_init(&d->fence_lock);
+	spin_lock_init(&d->ioc_lock);
 	INIT_LIST_HEAD(&d->queue);
 	INIT_LIST_HEAD(&d->stale);
 	init_waitqueue_head(&d->vsync_wait);
@@ -2169,6 +2350,7 @@ static int dpu_probe(struct platform_device *pdev)
 	}
 	sched_set_fifo(d->worker->task);
 	kthread_init_work(&d->work, dpu_update_work);
+	kthread_init_delayed_work(&d->idle_work, dpu_idle_snap);
 
 	ret = dpu_register_fb(d);
 	if (ret)
@@ -2236,6 +2418,7 @@ static int dpu_probe(struct platform_device *pdev)
 	} else if (ret != -ENODEV) {
 		dev_warn(dev, "panel-bright disabled: %d\n", ret);
 	}
+	dpu_diag_hdr(d, "adopt");	/* baseline for the pending bits */
 	dev_info(dev, "adopt mode ready: TE irq %d, %s\n", d->te_irq,
 		 d->fb_taken ? "fb0 window owned" : "fb0 window still SBoot's");
 	return 0;
@@ -2244,6 +2427,7 @@ err_fb:
 	unregister_framebuffer(d->fb);
 	framebuffer_release(d->fb);
 err_worker:
+	kthread_cancel_delayed_work_sync(&d->idle_work);
 	kthread_destroy_worker(d->worker);
 	dpu_commit_free(d->active);
 	d->active = NULL;
@@ -2264,6 +2448,8 @@ static void dpu_stop(struct dpu_dev *d)
 		d->mx_thread = NULL;
 	}
 	kthread_flush_worker(d->worker);
+	/* commits processed from here on see d->stopping and do not re-arm */
+	kthread_cancel_delayed_work_sync(&d->idle_work);
 }
 
 static void dpu_shutdown(struct platform_device *pdev)
