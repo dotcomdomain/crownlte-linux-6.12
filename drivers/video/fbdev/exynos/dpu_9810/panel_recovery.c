@@ -607,7 +607,7 @@ static int pr_window_off_on(struct dpu_dev *d, struct pb_status *sb, struct pb_c
 		pr_note_err(r, r->reset);
 	}
 	pr_run(d, "init", pr_tbl_init, ARRAY_SIZE(pr_tbl_init), r);
-	r->ret_bl = pb_send_bl(d, c);
+	r->ret_bl = pb_send_bl(d, c, true);	/* every packet tried (R1 #3) */
 	pr_note_err(r, r->ret_bl);
 	pr_run(d, "copr", pr_tbl_copr, ARRAY_SIZE(pr_tbl_copr), r);
 	d->pr_active = false;

@@ -542,24 +542,39 @@ fail:
 	return ret ? ret : ret2;
 }
 
-/* Step 4: the 4.9 set-bl sequence for d->pb_target, with pb_prepare()'s values */
-int pb_send_bl(struct dpu_dev *d, const struct pb_calib *c)
+/*
+ * Step 4: the 4.9 set-bl sequence for d->pb_target, with pb_prepare()'s
+ * values. One-shot brightness (@all false): stop at the first error. The
+ * panel recovery (@all true, Sol review R1 #3) has just re-initialised the
+ * panel, so it tries every remaining packet (voltages, ACL, IRC, gamma
+ * update) and the key off, and returns the first error.
+ */
+int pb_send_bl(struct dpu_dev *d, const struct pb_calib *c, bool all)
 {
 	struct pb_pkt pkt[16];
-	int i, n, ret = 0;
+	int i, n, r, ret = 0;
+	bool key_off_ok = false;
 
 	n = pb_build(pkt, c->gamma, c->et1);
-	pb_dbg("sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets)\n",
-		d->pb_target, n);
+	pb_dbg("sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets%s)\n",
+		d->pb_target, n, all ? ", all tried" : "");
 	/* packet 0 is the key on: from its attempt on, key off is owed */
 	for (i = 0; i < n; i++) {
 		pb_dbg("step %d/%d: %s\n", i + 1, n, pkt[i].what);
-		ret = pb_write(d, pkt[i].ofs, pkt[i].data, pkt[i].len);
-		if (ret)
-			break;
+		r = pb_write(d, pkt[i].ofs, pkt[i].data, pkt[i].len);
+		if (r) {
+			pr_err(DPU_PB_PFX "set-bl step %d/%d (%s): %d\n", i + 1, n, pkt[i].what, r);
+			if (!ret)
+				ret = r;
+			if (!all)
+				break;
+			continue;
+		}
+		if (i == n - 1)
+			key_off_ok = true;	/* the last packet is the key off */
 	}
-	/* the last packet is the key off; after any error send it (again) */
-	if (ret && pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
+	/* after any error, unless the final key off itself went out: send it (again) */
+	if (ret && !key_off_ok && pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
 		pr_err(DPU_PB_PFX "could not send level 2 key off\n");
 	return ret;
 }
@@ -616,7 +631,7 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 
 	ret = pb_prepare(d, sb, &c);
 	if (!ret)
-		ret = pb_send_bl(d, &c);
+		ret = pb_send_bl(d, &c, false);
 	if (!ret)
 		pb_readback(d, sa, &c);
 	return ret;

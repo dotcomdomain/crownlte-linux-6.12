@@ -44,7 +44,7 @@ int pb_status_read(struct dpu_dev *d, struct pb_status *s);
 int pb_status_read_keyed(struct dpu_dev *d, struct pb_status *s);
 void pb_status_log(const char *when, const struct pb_status *s);
 int pb_prepare(struct dpu_dev *d, struct pb_status *sb, struct pb_calib *c);
-int pb_send_bl(struct dpu_dev *d, const struct pb_calib *c);
+int pb_send_bl(struct dpu_dev *d, const struct pb_calib *c, bool all);
 void pb_readback(struct dpu_dev *d, struct pb_status *sa, const struct pb_calib *c);
 void pb_publish(u32 v);
 
