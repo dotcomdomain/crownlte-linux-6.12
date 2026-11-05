@@ -18,6 +18,10 @@
  *  - MIF->INT minimum lock from the ECT MINLOCK dvfs_mif table (4.9 DVFS
  *    manager guidance constraint); INT is raised before MIF goes up and
  *    lowered after MIF goes down.
+ *  - CPU->MIF ECT skew (the 4.9 DVFS Manager's "guidance" constraint) as a
+ *    hard floor per CPU cluster (exynos9810_mif_hard_floor(), set by the
+ *    Exynos9810 cpufreq driver): MIF is never programmed below it, whatever
+ *    the governor, a MAX QoS request or OPP availability ask.
  *  - The MIF level/constraint table is sent to the firmware FVP on ACPM
  *    channel 1 (DATA_INIT/SET_CONST), sleep entry/exit are announced with
  *    DATA_INIT/RELEASE, suspend runs at CAL's resume rate, reboot at
@@ -47,6 +51,7 @@
 #include <soc/samsung/acpm_ipc_ctrl.h>
 #include <soc/samsung/cal-if.h>
 #include <soc/samsung/ect_parser.h>
+#include <soc/samsung/exynos9810-devfreq.h>
 #include "governor.h"
 
 #define XDF_GOV_NAME		"exynos9810-qos"
@@ -90,6 +95,9 @@ struct xdf_bus {
 	unsigned long changed_at;	/* jiffies of the last rate change */
 	unsigned long dep_floor_hz;	/* INT: floor imposed by MIF */
 	unsigned long forced_hz;	/* suspend / reboot rate */
+	/* MIF: CPU cluster ECT skew floors (exynos9810_mif_hard_floor()) */
+	unsigned long hard_floor_hz[EXYNOS9810_MIF_HARD_SLOTS];
+	u32 hard_floor_raises;		/* targets the hard floor lifted */
 
 	struct xdf_bus *dep;		/* MIF: the INT bus */
 	struct delayed_work hold_work;
@@ -210,14 +218,49 @@ static int xdf_target(struct device *dev, unsigned long *freq, u32 flags)
 {
 	struct xdf_bus *bus = dev_get_drvdata(dev);
 	struct dev_pm_opp *opp;
-	unsigned long hz, old;
-	int ret;
+	unsigned long hz, old, floor;
+	int i, ret;
 
 	opp = devfreq_recommended_opp(dev, freq, flags);
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 	hz = dev_pm_opp_get_freq(opp);
 	dev_pm_opp_put(opp);
+
+	/*
+	 * CPU skew floors win over the governor, MAX QoS requests and OPP
+	 * availability; MIF is never programmed below an active one: the
+	 * lowest available OPP at or above it; if a disabled OPP is the only
+	 * one that reaches it, the lowest table level at or above it anyway;
+	 * if the floor is above every level, no lower than now. Each CPU
+	 * cluster lowers its own floor only after it moved down.
+	 */
+	floor = 0;
+	for (i = 0; i < EXYNOS9810_MIF_HARD_SLOTS; i++)
+		floor = max(floor, bus->hard_floor_hz[i]);
+	if (hz < floor) {
+		unsigned long f = floor;
+
+		opp = dev_pm_opp_find_freq_ceil(dev, &f);
+		if (!IS_ERR(opp)) {
+			f = dev_pm_opp_get_freq(opp);
+			dev_pm_opp_put(opp);
+		} else {
+			/* levels[] are all the OPPs, descending, available or not */
+			f = 0;
+			for (i = 0; i < bus->nr_levels; i++)
+				if ((unsigned long)bus->levels[i].khz * 1000 >= floor)
+					f = (unsigned long)bus->levels[i].khz * 1000;
+			if (!f)
+				f = max(hz, bus->cur_hz);
+			dev_warn_ratelimited(dev, "CPU hard floor %lu kHz: no available OPP reaches it, %lu kHz\n",
+					     floor / 1000, f / 1000);
+		}
+		if (f > hz) {
+			hz = f;
+			bus->hard_floor_raises++;
+		}
+	}
 
 	old = bus->cur_hz;
 	*freq = old;
@@ -268,6 +311,53 @@ static struct xdf_bus *xdf_df_bus(struct devfreq *df)
 		return NULL;
 	return dev_get_drvdata(parent);
 }
+
+/**
+ * exynos9810_mif_hard_floor - set a CPU cluster's hard MIF floor
+ * @df: the MIF devfreq (samsung,mif-devfreq of the cpufreq node)
+ * @slot: the CPU cluster, below EXYNOS9810_MIF_HARD_SLOTS
+ * @khz: the ECT skew of the level the cluster runs or is about to run; 0 none
+ * @now_khz: if not NULL, the MIF rate afterwards (CMU readback, else the
+ *	last rate set)
+ *
+ * Applied synchronously under the MIF devfreq lock: MIF is updated (also
+ * when the floor did not change, which retries a failed MIF/INT FREQ_REQ)
+ * before this returns, and xdf_target() never programs MIF below the floor
+ * whatever the governor or a MAX QoS request asks. A failed MIF update is
+ * logged here; the caller judges @now_khz.
+ *
+ * Return: 0, -EPROBE_DEFER if MIF is not up yet, -ENODEV if @df is not the
+ * Exynos9810 MIF devfreq, -EINVAL for a bad slot.
+ */
+int exynos9810_mif_hard_floor(struct devfreq *df, unsigned int slot,
+			      unsigned long khz, unsigned long *now_khz)
+{
+	struct xdf_bus *bus = df ? xdf_df_bus(df) : NULL;
+	unsigned long hz = 0;
+	int ret;
+
+	if (!bus || bus->type != XDF_MIF)
+		return -ENODEV;
+	/* pairs with the smp_store_release() in xdf_probe() */
+	if (!smp_load_acquire(&bus->ready))
+		return -EPROBE_DEFER;
+	if (slot >= EXYNOS9810_MIF_HARD_SLOTS)
+		return -EINVAL;
+	mutex_lock(&df->lock);
+	bus->hard_floor_hz[slot] = khz * 1000;
+	ret = update_devfreq(df);
+	if (now_khz) {
+		if (df->profile->get_cur_freq(df->dev.parent, &hz) || !hz)
+			hz = df->previous_freq;
+		*now_khz = hz / 1000;
+	}
+	mutex_unlock(&df->lock);
+	if (ret)
+		dev_warn_ratelimited(bus->dev, "MIF update with CPU%u hard floor %lu kHz failed: %d\n",
+				     slot, khz, ret);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(exynos9810_mif_hard_floor);
 
 static int xdf_gov_get_target_freq(struct devfreq *df, unsigned long *freq)
 {

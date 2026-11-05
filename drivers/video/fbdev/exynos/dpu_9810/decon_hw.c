@@ -89,9 +89,110 @@ int dpu_hw_channel_to_dpp(u32 ch)
  */
 void dpu_hw_trigger(struct dpu_dev *d, bool enable)
 {
-	decon_wr_mask(d, HW_SW_TRIG_CONTROL,
-		      enable ? HW_TRIG_EN : HW_TRIG_MASK_DECON,
-		      HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	dpu_hw_trigger_restore(d, enable ? HW_TRIG_EN : HW_TRIG_MASK_DECON);
+}
+
+/*
+ * Write the HW_TRIG_EN / HW_TRIG_MASK_DECON bits of @trig. The read-modify-
+ * write is under trig_lock because the DPU SysMMU fault handler (hard IRQ,
+ * only with the SysMMU) masks the trigger too.
+ */
+void dpu_hw_trigger_restore(struct dpu_dev *d, u32 trig)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	/*
+	 * After a SysMMU fault only a commit may unmask (the faulting buffer
+	 * may still be programmed): any other restore, e.g. the end of a
+	 * panel command window that saved an enabled trigger, keeps it masked.
+	 * Never set without the SysMMU.
+	 */
+	if (d->trig_fault_inhibit && (trig & HW_TRIG_EN)) {
+		trig = (trig & ~HW_TRIG_EN) | HW_TRIG_MASK_DECON;
+		d->fault_inhibit_holds++;
+	}
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+}
+
+/* a commit's own unmask (dpu_apply()): it replaced the faulting buffers */
+void dpu_hw_trigger_commit(struct dpu_dev *d)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	d->trig_fault_inhibit = false;
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, HW_TRIG_EN, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+}
+
+/*
+ * Recovery for a shadow update that a fault left pending behind the masked
+ * trigger: one controlled unmask so that it latches at the next TE. Only if
+ * a fault inhibited the trigger; returns true if it unmasked.
+ */
+bool dpu_hw_trigger_fault_unmask(struct dpu_dev *d)
+{
+	unsigned long flags;
+	bool done = false;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	if (d->trig_fault_inhibit) {
+		d->trig_fault_inhibit = false;
+		decon_wr_mask(d, HW_SW_TRIG_CONTROL, HW_TRIG_EN,
+			      HW_TRIG_EN | HW_TRIG_MASK_DECON);
+		d->fault_recoveries++;
+		done = true;
+	}
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+	return done;
+}
+
+bool dpu_hw_fault_inhibited(struct dpu_dev *d)
+{
+	unsigned long flags;
+	bool v;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	v = d->trig_fault_inhibit;
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+	return v;
+}
+
+/*
+ * Probe failure after the fault handler was removed and synchronised: no
+ * commit will ever clear the inhibit, so drop it and write @trig back.
+ */
+void dpu_hw_trigger_reset_fault(struct dpu_dev *d, u32 trig)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	d->trig_fault_inhibit = false;
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+}
+
+/*
+ * From the DPU SysMMU fault IRQ: stop TE-triggered frames so that no new
+ * frame fetches a faulting buffer; the frame in progress completes. Returns
+ * true if the trigger was running.
+ */
+bool dpu_hw_trigger_stop_atomic(struct dpu_dev *d)
+{
+	bool was;
+	u32 v;
+
+	spin_lock(&d->trig_lock);
+	/* latched even if masked now: a saved enabled value must not undo it */
+	d->trig_fault_inhibit = true;
+	v = decon_rd(d, HW_SW_TRIG_CONTROL);
+	was = (v & (HW_TRIG_EN | HW_TRIG_MASK_DECON)) == HW_TRIG_EN;
+	if (was)
+		decon_wr(d, HW_SW_TRIG_CONTROL, (v & ~HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+	spin_unlock(&d->trig_lock);
+	return was;
 }
 
 /* 4.9 decon_reg_wait_for_update_timeout(): 0 once the shadow update latched */

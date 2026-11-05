@@ -9,9 +9,17 @@
  * ABI the vendor HWC (libexynosdisplay.so) uses, the 16030000.decon_f
  * "vsync" and "psr_info" sysfs files, TE-EINT vsync events, and applies
  * S3CFB_WIN_CONFIG(_OLD) window configurations through the DPP channels for
- * physically contiguous dma-bufs (no SysMMU yet), including AFBC on the VGF
- * channels. A scattered buffer (gralloc's dma-buf system heap) is copied
- * into a contiguous decon-pool buffer per frame until the DPU SysMMU lands.
+ * physically contiguous dma-bufs, including AFBC on the VGF channels. By
+ * default a scattered buffer (gralloc's dma-buf system heap) is copied into
+ * a contiguous decon-pool buffer per frame.
+ *
+ * Opt-in by DT ("iommus" on decon_f, see Documentation/crownlte/
+ * display-iommu.md): the three DPU SysMMUs translate for DECON, dma-bufs
+ * are mapped to one IOVA run each and the mapping is cached per dma-buf
+ * (dpu_iova_get()), so scattered buffers are scanned in place, without a
+ * copy. SBoot's framebuffer is identity-mapped (reserved-memory
+ * "iommu-addresses", IOMMU_RESV_DIRECT) before translation starts, so the
+ * splash keeps reading the same memory. Without "iommus" nothing changes.
  *
  * Register sequences follow 4.9 __decon_update_regs(): wait for the
  * previous shadow update, mask the TE trigger, program the DPPs, then the
@@ -37,14 +45,17 @@
 #include <linux/file.h>
 #include <linux/font.h>
 #include <linux/interrupt.h>
+#include <linux/iommu.h>
 #include <linux/kthread.h>
 #include <linux/memblock.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_irq.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/sync_file.h>
@@ -88,8 +99,173 @@ static struct dma_fence *dpu_fence_create(struct dpu_dev *d)
 
 /* ---- buffers -------------------------------------------------------- */
 
+/* ---- DPU SysMMU: per-dma-buf IOVA cache -------------------------------- */
+
+/*
+ * With the DPU SysMMU a dma-buf is mapped once and its IOVA is reused for
+ * every frame that scans it, as 4.9 did through ion_iovmm_map(). HWC cycles
+ * a few buffers per layer; mapping and unmapping the ~4200 pages of a
+ * full-screen buffer every frame (page-table writes, a TLB flush per unmap)
+ * would cost more than the copy it replaces.
+ *
+ * An entry holds its own dma-buf reference, attachment and mapping; commits
+ * that scan or will scan it count as users. An entry no commit uses is
+ * dropped once the cache holds the last reference to its dma-buf (every
+ * other user closed it), or when it falls off the LRU beyond
+ * DPU_IOVA_CACHE_MAX. A commit stays referenced until a later update has
+ * latched (d->active, d->stale, dpu_process()), so an IOVA is never unmapped
+ * while a window may still fetch it.
+ *
+ * CPU writers keep the dma-buf contract (DMA_BUF_IOCTL_SYNC): the exporter
+ * syncs every mapped attachment, this one included, at end_cpu_access.
+ * In-kernel buffers (fb0, self-tests) are not cached.
+ */
+#define DPU_IOVA_CACHE_MAX	32
+
+static void dpu_iova_free_list(struct list_head *dead)
+{
+	struct dpu_iova *e, *t;
+
+	list_for_each_entry_safe(e, t, dead, node) {
+		list_del(&e->node);
+		dma_buf_unmap_attachment_unlocked(e->att, e->sgt, DMA_BIDIRECTIONAL);
+		dma_buf_detach(e->dmabuf, e->att);
+		dma_buf_put(e->dmabuf);
+		kfree(e);
+	}
+}
+
+/* iova_lock held: unlink unused entries that are orphaned or beyond the cap */
+static void dpu_iova_prune(struct dpu_dev *d, struct list_head *dead)
+{
+	struct dpu_iova *e, *t;
+	unsigned int pos = 0;
+
+	list_for_each_entry_safe(e, t, &d->iova_lru, node) {
+		pos++;
+		if (e->users)
+			continue;
+		if (pos <= DPU_IOVA_CACHE_MAX && file_count(e->dmabuf->file) > 1)
+			continue;
+		list_move(&e->node, dead);
+		d->iova_nr--;
+		d->iova_unmaps++;
+		pos--;
+	}
+}
+
+/* one IOVA run below 4 GiB covering @need bytes */
+static int dpu_iova_usable(const struct dpu_iova *e, u64 need)
+{
+	return e->len >= need && e->addr + need <= SZ_4G ? 0 : -ERANGE;
+}
+
+/*
+ * Map @db for DECON, or reuse its cached mapping; on success @b scans it
+ * through the SysMMU (b->iova). On failure nothing is held and the caller
+ * falls back to the per-commit import (and the bounce copy).
+ */
+static int dpu_iova_get(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf *b,
+			u64 need)
+{
+	struct scatterlist *sg;
+	struct dpu_iova *e;
+	LIST_HEAD(dead);
+	bool hit = false;
+	u64 len = 0;
+	int i, ret = 0;
+
+	mutex_lock(&d->iova_lock);
+	list_for_each_entry(e, &d->iova_lru, node) {
+		if (e->dmabuf == db) {
+			hit = true;
+			break;
+		}
+	}
+	if (hit) {
+		ret = dpu_iova_usable(e, need);
+		if (ret)
+			goto out;
+		list_move(&e->node, &d->iova_lru);
+		d->iova_hits++;
+		goto found;
+	}
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	e->d = d;
+	e->att = dma_buf_attach(db, d->dev);
+	if (IS_ERR(e->att)) {
+		ret = PTR_ERR(e->att);
+		kfree(e);
+		goto out;
+	}
+	e->sgt = dma_buf_map_attachment_unlocked(e->att, DMA_BIDIRECTIONAL);
+	if (IS_ERR(e->sgt)) {
+		ret = PTR_ERR(e->sgt);
+		dma_buf_detach(db, e->att);
+		kfree(e);
+		goto out;
+	}
+	e->addr = sg_dma_address(e->sgt->sgl);
+	for_each_sgtable_dma_sg(e->sgt, sg, i) {
+		if (sg_dma_address(sg) != e->addr + len)
+			ret = -EINVAL;
+		len += sg_dma_len(sg);
+	}
+	e->len = len;
+	e->nsegs = e->sgt->orig_nents;
+	if (!ret)
+		ret = dpu_iova_usable(e, need);
+	if (ret) {
+		dev_warn_ratelimited(d->dev, DPU_IOMMU_PFX "%zu-byte dma-buf: %u DMA segments, %llu bytes at %pad, not one usable IOVA run (%d)\n",
+				     db->size, e->sgt->nents, len, &e->addr, ret);
+		dma_buf_unmap_attachment_unlocked(e->att, e->sgt, DMA_BIDIRECTIONAL);
+		dma_buf_detach(db, e->att);
+		kfree(e);
+		goto out;
+	}
+	get_dma_buf(db);
+	e->dmabuf = db;
+	list_add(&e->node, &d->iova_lru);
+	d->iova_nr++;
+	if (++d->iova_maps <= 16 || !(d->iova_maps % 256))
+		dev_info(d->dev, DPU_IOMMU_PFX "map #%u: %zu-byte dma-buf, %u physical chunks -> IOVA %pad (cached %u, hits %u, unmapped %u)\n",
+			 d->iova_maps, db->size, e->nsegs, &e->addr, d->iova_nr,
+			 d->iova_hits, d->iova_unmaps);
+found:
+	e->users++;
+	b->iova = e;
+	b->addr = e->addr;
+	b->len = e->len;
+	b->nsegs = e->nsegs;
+out:
+	dpu_iova_prune(d, &dead);
+	mutex_unlock(&d->iova_lock);
+	dpu_iova_free_list(&dead);
+	return ret;
+}
+
+static void dpu_iova_put(struct dpu_iova *e)
+{
+	struct dpu_dev *d = e->d;
+	LIST_HEAD(dead);
+
+	mutex_lock(&d->iova_lock);
+	if (!WARN_ON(!e->users))
+		e->users--;
+	dpu_iova_prune(d, &dead);
+	mutex_unlock(&d->iova_lock);
+	dpu_iova_free_list(&dead);
+}
+
 static void dpu_buf_release(struct dpu_buf *b)
 {
+	struct dpu_iova *e = b->iova;
+
 	if (b->sgt)
 		dma_buf_unmap_attachment_unlocked(b->att, b->sgt, DMA_BIDIRECTIONAL);
 	if (b->att)
@@ -97,6 +273,9 @@ static void dpu_buf_release(struct dpu_buf *b)
 	if (b->dmabuf)
 		dma_buf_put(b->dmabuf);
 	memset(b, 0, sizeof(*b));
+	/* after the commit's own reference, so an orphaned mapping goes now */
+	if (e)
+		dpu_iova_put(e);
 }
 
 /*
@@ -127,6 +306,14 @@ static int dpu_buf_import(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf 
 	if (db->size < need) {
 		*why = "dma-buf smaller than the frame";
 		return -EINVAL;
+	}
+	/* DPU SysMMU: scan the buffer in place through a cached IOVA */
+	if (d->iommu && may_bounce) {
+		ret = dpu_iova_get(d, db, b, need);
+		if (!ret)
+			return 0;
+		dev_warn_ratelimited(d->dev, DPU_IOMMU_PFX "no IOVA for a %zu-byte dma-buf (%d): per-frame import and bounce copy\n",
+				     db->size, ret);
 	}
 	b->att = dma_buf_attach(db, d->dev);
 	if (IS_ERR(b->att)) {
@@ -504,6 +691,59 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 
 /* ---- update worker -------------------------------------------------- */
 
+#define DPU_FAULT_TRIES		3	/* controlled unmasks per held update */
+
+/*
+ * hw_lock held. 0 once no shadow update is pending, else -EBUSY.
+ *
+ * SysMMU only: a fault masked the TE trigger while an update waited for it,
+ * so that update cannot latch and every later commit or panel command
+ * window would stop here. Such an update gets at most DPU_FAULT_TRIES
+ * controlled unmasks (commits and command windows together), each followed
+ * by a wait of up to DPU_LATCH_US. A fault after the latch masks the
+ * trigger again; the next commit replaces the frame. If the update still
+ * does not latch, DECON is quiesced (logged once): the trigger stays
+ * masked and every commit and command window gets -EBUSY until a latch is
+ * seen here or the driver stops; the command-mode panel keeps its last
+ * GRAM frame. No register is rewritten while that update is pending (4.9
+ * __decon_update_regs() also aborts until shadow requests have cleared).
+ * Nothing is freed here: the held frame is d->active and the frame before
+ * it stays on d->stale, mapped, until a latch.
+ */
+static int dpu_pending_resolve(struct dpu_dev *d, const char *who)
+{
+	int ret = dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US);
+
+	if (!ret) {
+		if (d->fault_quiesced)
+			dev_info(d->dev, DPU_IOMMU_PFX "%s: no update pending any more, quiesce over\n",
+				 who);
+		d->fault_quiesced = false;
+		return 0;
+	}
+	if (d->fault_quiesced || !dpu_hw_fault_inhibited(d))
+		return -EBUSY;
+	if (d->fault_try_seq != d->update_seq) {
+		d->fault_try_seq = d->update_seq;
+		d->fault_tries = 0;
+	}
+	if (d->fault_tries >= DPU_FAULT_TRIES) {
+		d->fault_quiesced = true;
+		d->fault_quiesces++;
+		dev_err(d->dev, DPU_IOMMU_PFX "%s: update #%u still held after %u unmasks: quiesced, TE trigger masked, commits and command windows refused until it latches\n",
+			who, d->update_seq, DPU_FAULT_TRIES);
+		return -EBUSY;
+	}
+	if (!dpu_hw_trigger_fault_unmask(d))
+		return -EBUSY;
+	d->fault_tries++;
+	ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
+	dev_warn(d->dev, DPU_IOMMU_PFX "%s: update #%u held by a SysMMU fault mask: unmask %u/%u, %s\n",
+		 who, d->update_seq, d->fault_tries, DPU_FAULT_TRIES,
+		 ret ? "still pending" : "latched");
+	return ret ? -EBUSY : 0;
+}
+
 static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 {
 	ktime_t t0;
@@ -540,7 +780,8 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 				  c->cfg[i].state != DECON_WIN_STATE_DISABLED);
 
 	dpu_hw_update_req(d);
-	dpu_hw_trigger(d, true);
+	d->update_seq++;
+	dpu_hw_trigger_commit(d);	/* also ends a SysMMU fault inhibit */
 	t0 = ktime_get();
 	ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
 	c->latch_us = ktime_us_delta(ktime_get(), t0);
@@ -550,6 +791,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 		dev_warn_ratelimited(d->dev, "shadow update did not latch in %u us (FRAME_COUNT %u -> %u)\n",
 				     DPU_LATCH_US, c->fc_before, c->fc_after);
 	} else {
+		d->fault_quiesced = false;
 		/* "latched" must mean the IDMA now scans the new buffer */
 		for (i = 0; i < DECON_MAX_WIN; i++) {
 			u32 act;
@@ -1174,6 +1416,7 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
 	LIST_HEAD(txt);
+	bool quiesced;
 	int i, ret;
 
 	/*
@@ -1204,10 +1447,14 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	 * copied, nothing programmed).
 	 */
 	mutex_lock(&d->hw_lock);
-	ret = dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US);
+	/* SysMMU: also the bounded recovery of an update a fault mask holds */
+	ret = dpu_pending_resolve(d, "commit");
+	quiesced = d->fault_quiesced;
 	mutex_unlock(&d->hw_lock);
 	if (ret) {
-		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");
+		/* quiesced: logged once by dpu_pending_resolve() */
+		if (!quiesced)
+			dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");
 		c->result = -EBUSY;
 	} else {
 		struct dpu_commit *p, *n;
@@ -1784,20 +2031,35 @@ struct dpu_kbuf {
 	dma_addr_t dma;
 	size_t size;
 	bool owned;		/* allocated with dma_alloc_wc */
+	bool iova;		/* DPU SysMMU: @dma is already DECON's IOVA */
 };
 
 static struct sg_table *dpu_kbuf_map(struct dma_buf_attachment *att,
 				     enum dma_data_direction dir)
 {
 	struct dpu_kbuf *kb = att->dmabuf->priv;
-	struct sg_table *sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	struct sg_table *sgt;
 	int ret;
 
+	if (kb->iova && att->dev != kb->dev)
+		return ERR_PTR(-EINVAL);
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
 	if (!sgt)
 		return ERR_PTR(-ENOMEM);
 	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
 	if (ret)
 		goto err;
+	if (kb->iova) {
+		/*
+		 * DPU SysMMU: the identity-mapped boot framebuffer, or the
+		 * IOVA dma_alloc_wc() returned. Only DECON attaches these, so
+		 * the existing address is handed out unchanged.
+		 */
+		sg_dma_address(sgt->sgl) = kb->dma;
+		sg_dma_len(sgt->sgl) = kb->size;
+		sgt->nents = 1;
+		return sgt;
+	}
 	/*
 	 * No IOMMU and no dma-ranges on this device: DMA address == physical
 	 * address. The fb0 region is no-map, so only CPU-sync-free mappings
@@ -1819,7 +2081,10 @@ err:
 static void dpu_kbuf_unmap(struct dma_buf_attachment *att, struct sg_table *sgt,
 			   enum dma_data_direction dir)
 {
-	dma_unmap_sgtable(att->dev, sgt, dir, DMA_ATTR_SKIP_CPU_SYNC);
+	struct dpu_kbuf *kb = att->dmabuf->priv;
+
+	if (!kb->iova)
+		dma_unmap_sgtable(att->dev, sgt, dir, DMA_ATTR_SKIP_CPU_SYNC);
 	sg_free_table(sgt);
 	kfree(sgt);
 }
@@ -1851,6 +2116,7 @@ static struct dma_buf *dpu_kbuf_create(struct dpu_dev *d, size_t size, dma_addr_
 		return ERR_PTR(-ENOMEM);
 	kb->dev = d->dev;
 	kb->size = PAGE_ALIGN(size);
+	kb->iova = !!d->iommu;
 	if (dma) {
 		kb->dma = dma;
 	} else {
@@ -2301,6 +2567,318 @@ out:
 
 /* ---- adopt ----------------------------------------------------------- */
 
+/* ---- DPU SysMMUs (IOMMU API), opt-in ----------------------------------- */
+
+#define DPU_FRAME_DRAIN_MS	34	/* two frames at 60 Hz */
+
+/* bitmask of the read-only SysMMU views whose CTRL bit 0 (enable) is set */
+static unsigned int dpu_sysmmu_enabled(struct dpu_dev *d)
+{
+	unsigned int m = 0;
+	int i;
+
+	for (i = 0; i < DPU_NR_SYSMMU; i++)
+		if (d->sysmmu[i] && (readl(d->sysmmu[i] + DPU_SYSMMU_CTRL) & 1))
+			m |= BIT(i);
+	return m;
+}
+
+static unsigned int dpu_sysmmu_present(struct dpu_dev *d)
+{
+	unsigned int m = 0;
+	int i;
+
+	for (i = 0; i < DPU_NR_SYSMMU; i++)
+		if (d->sysmmu[i])
+			m |= BIT(i);
+	return m;
+}
+
+static void dpu_sysmmu_dump(struct dpu_dev *d, const char *when)
+{
+	int i;
+
+	for (i = 0; i < DPU_NR_SYSMMU; i++) {
+		void __iomem *s = d->sysmmu[i];
+
+		if (!s)
+			continue;
+		dev_info(d->dev, DPU_IOMMU_PFX "sysmmu_dpu%d %s: CTRL=%#x CFG=%#x STATUS=%#x PT_BASE=%#x INT_STATUS=%#x\n",
+			 i, when, readl(s + DPU_SYSMMU_CTRL), readl(s + DPU_SYSMMU_CFG),
+			 readl(s + DPU_SYSMMU_STATUS), readl(s + DPU_SYSMMU_PT_BASE),
+			 readl(s + DPU_SYSMMU_INT_STATUS));
+	}
+}
+
+/*
+ * SysMMU fault (hard IRQ, called by exynos-iommu, which never panics on the
+ * 9810): stop TE-triggered frames so that a faulting buffer is fetched at
+ * most until the end of the current frame. In command mode the panel keeps
+ * its last frame in GRAM. The next commit unmasks the trigger.
+ */
+static int dpu_iommu_fault(struct iommu_domain *dom, struct device *dev,
+			   unsigned long iova, int flags, void *token)
+{
+	struct dpu_dev *d = token;
+	unsigned int n;
+	bool stopped;
+
+	/*
+	 * iommu_set_fault_handler() writes the callback and the token one
+	 * after the other; dpu_iommu_set_handler() keeps the fault IRQs off
+	 * meanwhile, and a NULL token is ignored anyway.
+	 */
+	if (!d)
+		return 0;
+	n = atomic_inc_return(&d->iommu_faults);
+	stopped = dpu_hw_trigger_stop_atomic(d);
+	WRITE_ONCE(d->last_fault_iova, iova);
+	if (stopped)
+		d->fault_trigger_stops++;
+	if (n <= 8 || stopped)
+		dev_err_ratelimited(d->dev, DPU_IOMMU_PFX "SysMMU %s fault #%u at IOVA %#lx: %s\n",
+				    (flags & IOMMU_FAULT_WRITE) ? "write" : "read", n, iova,
+				    stopped ? "TE trigger masked until the next commit" :
+					      "trigger already masked");
+	return 0;
+}
+
+/* every 1 MiB of the boot framebuffer (and its last byte) must map 1:1 */
+static int dpu_iommu_check_identity(struct dpu_dev *d)
+{
+	unsigned int n = 0, bad = 0;
+	dma_addr_t iova;
+	phys_addr_t pa;
+	u64 off;
+
+	for (off = 0; off < (u64)d->fb_size + SZ_1M; off += SZ_1M) {
+		iova = d->fb_phys + min_t(u64, off, d->fb_size - 1);
+		pa = iommu_iova_to_phys(d->iommu, iova);
+		n++;
+		if (pa != iova) {
+			if (!bad)
+				dev_err(d->dev, DPU_IOMMU_PFX "boot fb IOVA %pad -> %pa, not identity\n",
+					&iova, &pa);
+			bad++;
+		}
+	}
+	dev_info(d->dev, DPU_IOMMU_PFX "boot fb %pa+%#zx identity map: %u/%u probes 1:1\n",
+		 &d->fb_phys, d->fb_size, n - bad, n);
+	return bad ? -ENODEV : 0;
+}
+
+/*
+ * Take the runtime PM reference that keeps the DPU SysMMUs translating
+ * (exynos-iommu device links). The IOMMU core created the DMA domain with
+ * the boot framebuffer identity map (IOMMU_RESV_DIRECT) before attaching
+ * it, so whenever a SysMMU starts translating, SBoot's scanout of
+ * 0xcc000000 keeps reading the same physical memory.
+ *
+ * Normally the driver core already resumed the SysMMUs for the probe
+ * (supplier pre-activation), and the attach enabled them then; that is
+ * logged. If they are still in bypass here, they are enabled while DECON
+ * is idle, as 4.9 does for a running DECON (decon_reg_init()): mask the TE
+ * trigger, let the current frame drain, resume, unmask.
+ */
+static int dpu_iommu_enable(struct dpu_dev *d)
+{
+	unsigned int want = BIT(DPU_NR_SYSMMU) - 1, before, after;
+	bool masked = false;
+	u32 trig, fc0;
+	int ret;
+
+	if (dpu_sysmmu_present(d) != want) {
+		dev_err(d->dev, DPU_IOMMU_PFX "SysMMU views %#x of %#x: cannot verify translation, refusing\n",
+			dpu_sysmmu_present(d), want);
+		return -ENODEV;
+	}
+	before = dpu_sysmmu_enabled(d);
+	trig = decon_rd(d, HW_SW_TRIG_CONTROL);
+	if (before == want) {
+		dev_info(d->dev, DPU_IOMMU_PFX "SysMMUs %#x already translating at probe (enabled by the domain attach, after the identity map)\n",
+			 before);
+	} else if ((trig & (HW_TRIG_EN | HW_TRIG_MASK_DECON)) == HW_TRIG_EN) {
+		dpu_hw_trigger(d, false);
+		masked = true;
+		msleep(DPU_FRAME_DRAIN_MS);
+	}
+	fc0 = dpu_hw_frame_count(d);
+
+	pm_runtime_enable(d->dev);
+	ret = pm_runtime_resume_and_get(d->dev);
+	if (ret) {
+		dev_err(d->dev, DPU_IOMMU_PFX "runtime resume (SysMMUs): %d\n", ret);
+		pm_runtime_disable(d->dev);
+		goto out;
+	}
+	d->rpm_held = true;
+
+	after = dpu_sysmmu_enabled(d);
+	dpu_sysmmu_dump(d, "after runtime resume");
+	if (after != want) {
+		dev_err(d->dev, DPU_IOMMU_PFX "SysMMUs %#x of %#x translating: IOVAs would be fetched as physical addresses, refusing\n",
+			after, want);
+		pm_runtime_put_sync(d->dev);
+		pm_runtime_disable(d->dev);
+		d->rpm_held = false;
+		ret = -EIO;
+		goto out;
+	}
+	dev_info(d->dev, DPU_IOMMU_PFX "SysMMUs translating (%#x -> %#x)%s, FRAME_COUNT %u while enabling\n",
+		 before, after, masked ? " with the TE trigger masked" : "", fc0);
+out:
+	if (masked)
+		dpu_hw_trigger(d, true);
+	return ret;
+}
+
+/*
+ * Install or remove the SysMMU fault callback. iommu_set_fault_handler()
+ * stores the callback and its token separately and report_iommu_fault()
+ * reads them without a lock, so the three SysMMU fault IRQs (requested by
+ * exynos-iommu) are disabled meanwhile; disable_irq() also waits for a
+ * handler already running on another CPU.
+ */
+static void dpu_iommu_set_handler(struct dpu_dev *d, struct iommu_domain *dom,
+				  iommu_fault_handler_t fn, void *token)
+{
+	struct device_node *mmu;
+	int irq[DPU_NR_SYSMMU];
+	int i;
+
+	for (i = 0; i < DPU_NR_SYSMMU; i++) {
+		irq[i] = 0;
+		mmu = of_parse_phandle(d->dev->of_node, "iommus", i);
+		if (!mmu)
+			continue;
+		irq[i] = of_irq_get(mmu, 0);
+		of_node_put(mmu);
+		if (irq[i] > 0)
+			disable_irq(irq[i]);
+	}
+	iommu_set_fault_handler(dom, fn, token);
+	for (i = 0; i < DPU_NR_SYSMMU; i++)
+		if (irq[i] > 0)
+			enable_irq(irq[i]);
+}
+
+/*
+ * Probe failure after dpu_iommu_init() succeeded. Remove the fault handler
+ * and wait for running ones, so none can mask the trigger any more; drop
+ * DECON's runtime PM hold (the SysMMUs go to bypass once the driver core
+ * releases the probe's supplier references, right after the failed probe).
+ * Until then they translate the boot fb 1:1, so DECON can run meanwhile.
+ * Then clear the fault inhibit (no commit will) and hand back the trigger
+ * as it was before the fault handler, so the splash is not left frozen.
+ */
+static void dpu_iommu_release(struct dpu_dev *d)
+{
+	if (!d->iommu)
+		return;
+	dpu_iommu_set_handler(d, d->iommu, NULL, NULL);
+	if (d->rpm_held) {
+		pm_runtime_put_sync(d->dev);
+		pm_runtime_disable(d->dev);
+		d->rpm_held = false;
+	}
+	if (dpu_hw_powered(d)) {
+		dpu_hw_trigger_reset_fault(d, d->trig_boot);
+		dev_info(d->dev, DPU_IOMMU_PFX "probe failed: fault handler removed, TE trigger back to %#x (now %#x)\n",
+			 d->trig_boot, decon_rd(d, HW_SW_TRIG_CONTROL));
+	}
+	d->iommu = NULL;
+}
+
+/* sysmmu_dpu0..2 non-secure SFR bases (4.9 DT) */
+static const resource_size_t dpu_sysmmu_base[DPU_NR_SYSMMU] = {
+	0x160a0000, 0x160b0000, 0x160c0000,
+};
+
+/*
+ * The DPPs sit behind all three DPU SysMMUs (dpu0 VGRF/VGF, dpu1 G0/VG0,
+ * dpu2 G1/VG1/WB). With IOVAs a channel behind a SysMMU that is not ours
+ * would fetch them as physical addresses, so "iommus" must name exactly
+ * these three, each once, and DECON needs a view of each to verify them.
+ */
+static int dpu_iommu_check_controllers(struct dpu_dev *d)
+{
+	struct device_node *np = d->dev->of_node;
+	unsigned int seen = 0;
+	int n, i, j, ret;
+
+	n = of_count_phandle_with_args(np, "iommus", "#iommu-cells");
+	if (n != DPU_NR_SYSMMU) {
+		dev_err(d->dev, DPU_IOMMU_PFX "\"iommus\" lists %d SysMMUs, the DPU needs sysmmu_dpu0..2: refusing\n",
+			n);
+		return -ENODEV;
+	}
+	for (i = 0; i < n; i++) {
+		struct of_phandle_args args;
+		struct resource res;
+
+		ret = of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args);
+		if (ret)
+			return -ENODEV;
+		ret = of_address_to_resource(args.np, 0, &res);
+		of_node_put(args.np);
+		if (ret)
+			return -ENODEV;
+		for (j = 0; j < DPU_NR_SYSMMU; j++)
+			if (res.start == dpu_sysmmu_base[j])
+				break;
+		if (j == DPU_NR_SYSMMU || (seen & BIT(j)) || !d->sysmmu[i]) {
+			dev_err(d->dev, DPU_IOMMU_PFX "iommus[%d] at %pa: %s, refusing\n", i, &res.start,
+				j == DPU_NR_SYSMMU ? "not a DPU SysMMU" :
+				(seen & BIT(j)) ? "listed twice" : "no read-only view");
+			return -ENODEV;
+		}
+		seen |= BIT(j);
+	}
+	return 0;
+}
+
+/*
+ * "iommus" in DT gives decon_f a DMA domain whose page table already holds
+ * the boot framebuffer identity map. Anything else (no "iommus", or a
+ * domain that is not a DMA-API domain) leaves d->iommu NULL: the default
+ * contiguous + bounce path, unchanged.
+ */
+static int dpu_iommu_init(struct dpu_dev *d)
+{
+	struct iommu_domain *dom = iommu_get_domain_for_dev(d->dev);
+	int ret;
+
+	if (!dom)
+		return 0;
+	if (!(dom->type & __IOMMU_DOMAIN_DMA_API)) {
+		dev_warn(d->dev, DPU_IOMMU_PFX "domain type %#x is not a DMA domain: SysMMU path off\n",
+			 dom->type);
+		return 0;
+	}
+	/*
+	 * Refusing means failing the probe: decon_f's DMA ops are iommu-dma
+	 * now, so even the bounce path hands out IOVAs. The driver core then
+	 * drops the SysMMUs (bypass) and SBoot's scanout of 0xcc000000 goes
+	 * on; the DTB without "iommus" is the fallback.
+	 */
+	ret = dpu_iommu_check_controllers(d);
+	if (ret)
+		return ret;
+	d->iommu = dom;
+	/* one IOVA run per buffer: iommu-dma merges the whole sg_table */
+	dma_set_max_seg_size(d->dev, UINT_MAX);
+	ret = dpu_iommu_check_identity(d);
+	if (ret) {
+		d->iommu = NULL;
+		return ret;
+	}
+	/* handed back by dpu_iommu_release() if probe fails after this */
+	d->trig_boot = decon_rd(d, HW_SW_TRIG_CONTROL);
+	dpu_iommu_set_handler(d, dom, dpu_iommu_fault, d);
+	dev_info(d->dev, DPU_IOMMU_PFX "DMA domain attached: dma-bufs map to cached IOVAs, no bounce copies\n");
+	return 0;
+}
+
 static int dpu_adopt(struct dpu_dev *d)
 {
 	u32 gc, trig, dp0, dp1, ctrl;
@@ -2323,7 +2901,12 @@ static int dpu_adopt(struct dpu_dev *d)
 		ctrl = readl(d->sysmmu[i] + DPU_SYSMMU_CTRL);
 		dev_info(d->dev, "sysmmu_dpu%d CTRL=%#x VERSION=%#x\n", i, ctrl,
 			 readl(d->sysmmu[i] + DPU_SYSMMU_VERSION));
-		if (ctrl & 1) {
+		/*
+		 * With the IOMMU, exynos-iommu refused any SysMMU that SBoot
+		 * left translating, so an enabled one runs our domain (boot fb
+		 * identity-mapped). Without it, enabled = foreign IOVAs.
+		 */
+		if ((ctrl & 1) && !d->iommu) {
 			dev_err(d->dev, "DPU SysMMU enabled by SBoot: addresses are IOVAs, not adopting\n");
 			return -ENODEV;
 		}
@@ -2394,6 +2977,14 @@ static int dpu_adopt(struct dpu_dev *d)
 	dev_info(d->dev, "adopted: win%d dpp%d IDMA format %u at %pa; fb0 keeps it (DPP format %u)\n",
 		 d->boot_win, d->boot_dpp, d->boot_fmt, &d->fb_phys, d->fb_dpp_fmt);
 
+	/* SysMMUs held on (boot fb identity-mapped) before any trigger write */
+	if (d->iommu) {
+		int ret = dpu_iommu_enable(d);
+
+		if (ret)
+			return ret;
+	}
+
 	/* Stage 1 / 4.9 decon_reg_set_trigger(HW, ENABLE): continuous TE refresh */
 	if ((trig & (HW_TRIG_EN | HW_TRIG_MASK_DECON)) != HW_TRIG_EN) {
 		d->trig_orig = trig;
@@ -2433,7 +3024,8 @@ int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig)
 		ret = -EIO;
 		goto err;
 	}
-	if (dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
+	/* SysMMU: the same bounded recovery as a commit (ALPM exit, recovery) */
+	if (dpu_pending_resolve(d, "command window")) {
 		ret = -EBUSY;
 		goto err;
 	}
@@ -2456,7 +3048,7 @@ int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig)
 		i < DPU_CMD_IDLE_TRIES ? "stable" : "still advancing", gc,
 		!!(gc & GLOBAL_CONTROL_IDLE_STATUS), !!(gc & GLOBAL_CONTROL_RUN_STATUS));
 	if (i == DPU_CMD_IDLE_TRIES) {
-		decon_wr_mask(d, HW_SW_TRIG_CONTROL, *trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+		dpu_hw_trigger_restore(d, *trig);
 		WRITE_ONCE(d->te_gap_track, false);
 		ret = -EBUSY;
 		goto err;
@@ -2471,7 +3063,7 @@ err:
 void dpu_cmd_window_end(struct dpu_dev *d, u32 trig)
 {
 	d->cmd_window = false;
-	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	dpu_hw_trigger_restore(d, trig);
 	WRITE_ONCE(d->te_gap_track, false);
 	pb_dbg("command window closed: TRIG=%#x FRAME_COUNT=%u, longest TE irq interval %u us\n",
 	       decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d), d->te_gap_max_us);
@@ -2493,7 +3085,8 @@ void dpu_cmd_window_pause(struct dpu_dev *d, u32 trig)
 {
 	lockdep_assert_held(&d->hw_lock);
 	d->cmd_window = false;
-	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	/* trig_lock RMW; a SysMMU fault inhibit keeps the trigger masked */
+	dpu_hw_trigger_restore(d, trig);
 	pb_dbg("command window paused (hw_lock kept): TRIG=%#x FRAME_COUNT=%u\n",
 	       decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d));
 }
@@ -2624,6 +3217,10 @@ static int dpu_probe(struct platform_device *pdev)
 	mutex_init(&d->panel_lock);
 	spin_lock_init(&d->queue_lock);
 	spin_lock_init(&d->fence_lock);
+	spin_lock_init(&d->trig_lock);
+	mutex_init(&d->iova_lock);
+	INIT_LIST_HEAD(&d->iova_lru);
+	atomic_set(&d->iommu_faults, 0);
 	spin_lock_init(&d->ioc_lock);
 	spin_lock_init(&d->diag_lock);
 	INIT_LIST_HEAD(&d->diag_txt);
@@ -2667,15 +3264,33 @@ static int dpu_probe(struct platform_device *pdev)
 		return PTR_ERR(d->dma_com);
 	for (i = 0; i < DPU_NR_SYSMMU; i++) {
 		char name[8];
-		struct resource *r;
+		struct resource *r, res;
+		struct device_node *mmu;
 
 		snprintf(name, sizeof(name), "sysmmu%d", i);
 		r = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
-		if (!r)
+		if (r) {
+			d->sysmmu[i] = devm_ioremap_resource(dev, r);
+			if (IS_ERR(d->sysmmu[i]))
+				return PTR_ERR(d->sysmmu[i]);
 			continue;
-		d->sysmmu[i] = devm_ioremap_resource(dev, r);
-		if (IS_ERR(d->sysmmu[i]))
-			return PTR_ERR(d->sysmmu[i]);
+		}
+		/*
+		 * SysMMU opt-in DTB: no "sysmmuN" reg entries (exynos-iommu
+		 * requests the whole SFR windows and a nested decon_f resource
+		 * would block that). Read-only view of the first page of the
+		 * i-th "iommus" node, mapped without claiming it.
+		 */
+		mmu = of_parse_phandle(np, "iommus", i);
+		if (!mmu)
+			continue;
+		ret = of_address_to_resource(mmu, 0, &res);
+		of_node_put(mmu);
+		if (ret)
+			continue;
+		d->sysmmu[i] = devm_ioremap(dev, res.start, SZ_4K);
+		if (!d->sysmmu[i])
+			return -ENOMEM;
 	}
 
 	/*
@@ -2695,6 +3310,11 @@ static int dpu_probe(struct platform_device *pdev)
 		if (ret)
 			return dev_err_probe(dev, ret, "memory-region\n");
 	}
+
+	/* DPU SysMMUs, opt-in ("iommus"): before adopt reads the SysMMU state */
+	ret = dpu_iommu_init(d);
+	if (ret)
+		goto err_mem;
 
 	/* look the TE irq up before any side effect, so a deferral is clean */
 	ret = platform_get_irq_byname_optional(pdev, "te");
@@ -2828,6 +3448,7 @@ err_worker:
 	dpu_commit_free(d->active);
 	d->active = NULL;
 err_mem:
+	dpu_iommu_release(d);
 	of_reserved_mem_device_release(dev);
 	return ret;
 }

@@ -16,12 +16,17 @@
 #include <linux/interrupt.h>
 #include <linux/kmemleak.h>
 #include <linux/list.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
+#include <linux/ratelimit.h>
+#include <linux/regmap.h>
 #include <linux/slab.h>
 
+#include "dma-iommu.h"
 #include "iommu-pages.h"
 
 typedef u32 sysmmu_iova_t;
@@ -93,6 +98,15 @@ static const sysmmu_pte_t SYSMMU_V5_LV2_PROT[] = {
 	(3 << 2), /* IOMMU_READ | IOMMU_WRITE */
 };
 
+/*
+ * Exynos9810 (SysMMU v7.x, "legacy v7"): the Samsung 4.9 driver writes PTEs
+ * without any access-protection bits (mk_lv1ent_sect(pa) = pa >> 4 | 2,
+ * mk_lv2ent_spage(pa) = pa >> 4 | 2) and never sets CFG_EAP. Its lv2 bit 4
+ * is "shareable" and bit 5 a software flag, so the v5 encoding is not known
+ * to mean the same thing on this SoC. Use the 4.9 format.
+ */
+static const sysmmu_pte_t SYSMMU_NO_PROT[] = { 0, 0, 0, 0 };
+
 #define SYSMMU_SUPPORTED_PROT_BITS (IOMMU_READ | IOMMU_WRITE)
 
 #define sect_to_phys(ent) (((phys_addr_t) ent) << PG_ENT_SHIFT)
@@ -137,6 +151,11 @@ static u32 lv2ent_offset(sysmmu_iova_t iova)
 #define CFG_ACGEN	(1 << 24) /* System MMU 3.3 only */
 #define CFG_SYSSEL	(1 << 22) /* System MMU 3.2 only */
 #define CFG_FLPDCACHE	(1 << 20) /* System MMU 3.2+ only */
+
+/* Exynos9810 / 4.9 vendor driver (exynos-iommu.h, exynos-iommu-reg.h) */
+#define CFG_QOS_OVERRIDE	(1 << 11)
+#define CFG_MASK_LEGACY_V7	0x301F1F8C	/* bits 29-28, 20-16, 12-7, 3-2 */
+#define REG_V7_FAULT_INFO_WRITE	BIT(20)
 
 #define CTRL_VM_ENABLE			BIT(0)
 #define CTRL_VM_FAULT_MODE_STALL	BIT(3)
@@ -227,6 +246,24 @@ static const char * const sysmmu_v7_fault_names[] = {
 	"RESERVED"
 };
 
+/* 4.9 exynos-iommu-reg.h sysmmu_fault_name[], INT_STATUS bit order */
+static const char * const sysmmu_legacy_v7_fault_names[] = {
+	"PTW ACCESS",
+	"PAGE",
+	"L1TLB MULTI-HIT",
+	"ACCESS",
+	"SECURITY",
+};
+
+/* SoC integration data, selected by compatible */
+struct sysmmu_soc_data {
+	bool legacy_v7;		/* Exynos9810: 4.9 CFG, PTE and TLB maintenance */
+};
+
+static const struct sysmmu_soc_data exynos9810_sysmmu_data = {
+	.legacy_v7 = true,
+};
+
 /*
  * This structure is attached to dev->iommu->priv of the master device
  * on device add, contains a list of SYSMMU controllers defined by device tree,
@@ -305,6 +342,13 @@ struct sysmmu_drvdata {
 
 	/* v7 fields */
 	bool has_vcr;			/* virtual machine control register */
+
+	/* Exynos9810 ("legacy v7", 4.9 vendor programming model) */
+	bool legacy_v7;
+	u32 boot_cfg;			/* CFG as left by the bootloader */
+	int qos;			/* CFG QoS override, -1 = none */
+	unsigned int nr_enables;
+	atomic_t nr_faults;
 };
 
 #define SYSMMU_REG(data, reg) ((data)->sfrbase + (data)->variant->reg)
@@ -362,6 +406,24 @@ static int exynos_sysmmu_v7_get_fault_info(struct sysmmu_drvdata *data,
 	return 0;
 }
 
+/* 4.9 sysmmu_get_interrupt_info(): FAULT_ADDR 0x70, FAULT_TRANS_INFO 0x78 */
+static int exynos_sysmmu_legacy_v7_get_fault_info(struct sysmmu_drvdata *data,
+						  unsigned int itype,
+						  struct sysmmu_fault *fault)
+{
+	u32 info = readl(SYSMMU_REG(data, fault_info));
+
+	if (itype >= ARRAY_SIZE(sysmmu_legacy_v7_fault_names))
+		return -ENXIO;
+
+	fault->addr = readl(SYSMMU_REG(data, fault_va));
+	fault->name = sysmmu_legacy_v7_fault_names[itype];
+	fault->type = (info & REG_V7_FAULT_INFO_WRITE) ? IOMMU_FAULT_WRITE :
+							 IOMMU_FAULT_READ;
+
+	return 0;
+}
+
 /* SysMMU v1..v3 */
 static const struct sysmmu_variant sysmmu_v1_variant = {
 	.flush_all	= 0x0c,
@@ -401,6 +463,22 @@ static const struct sysmmu_variant sysmmu_v7_variant = {
 	.fault_info	= 0x78,
 
 	.get_fault_info	= exynos_sysmmu_v7_get_fault_info,
+};
+
+/* SysMMU v7 on Exynos9810: non-VM layout, 4.9 fault decoding */
+static const struct sysmmu_variant sysmmu_legacy_v7_variant = {
+	.pt_base	= 0x0c,
+	.flush_all	= 0x10,
+	.flush_entry	= 0x14,
+	.flush_range	= 0x18,
+	.flush_start	= 0x20,
+	.flush_end	= 0x24,
+	.int_status	= 0x60,
+	.int_clear	= 0x64,
+	.fault_va	= 0x70,
+	.fault_info	= 0x78,
+
+	.get_fault_info	= exynos_sysmmu_legacy_v7_get_fault_info,
 };
 
 /* SysMMU v7: VM capable register layout */
@@ -467,6 +545,19 @@ static void __sysmmu_tlb_invalidate_entry(struct sysmmu_drvdata *data,
 		       SYSMMU_REG(data, flush_end));
 		writel(0x1, SYSMMU_REG(data, flush_range));
 	}
+}
+
+/*
+ * 4.9 __sysmmu_tlb_invalidate() for v7: range flush by IOVA, issued while
+ * the SysMMU keeps translating (no CTRL block), exactly as the vendor driver
+ * does after every unmap.
+ */
+static void __sysmmu_tlb_invalidate_range_legacy(struct sysmmu_drvdata *data,
+						 sysmmu_iova_t iova, size_t size)
+{
+	writel(iova, SYSMMU_REG(data, flush_start));
+	writel(iova + size - 1, SYSMMU_REG(data, flush_end));
+	writel(0x1, SYSMMU_REG(data, flush_range));
 }
 
 static void __sysmmu_set_ptbase(struct sysmmu_drvdata *data, phys_addr_t pgd)
@@ -538,6 +629,8 @@ static void __sysmmu_get_version(struct sysmmu_drvdata *data)
 			__sysmmu_get_vcr(data);
 		if (data->has_vcr)
 			data->variant = &sysmmu_v7_vm_variant;
+		else if (data->legacy_v7)
+			data->variant = &sysmmu_legacy_v7_variant;
 		else
 			data->variant = &sysmmu_v7_variant;
 	}
@@ -554,41 +647,79 @@ static void show_fault_information(struct sysmmu_drvdata *data,
 		dev_name(data->master),
 		fault->type == IOMMU_FAULT_READ ? "READ" : "WRITE",
 		fault->name, fault->addr);
+	if (!data->pgtable)
+		return;
 	dev_dbg(data->sysmmu, "Page table base: %pa\n", &data->pgtable);
 	ent = section_entry(phys_to_virt(data->pgtable), fault->addr);
-	dev_dbg(data->sysmmu, "\tLv1 entry: %#x\n", *ent);
+	if (data->legacy_v7)
+		dev_err(data->sysmmu, "PT_BASE %#x (pgtable %pa), Lv1 entry: %#x, FAULT_INFO %#x\n",
+			readl(SYSMMU_REG(data, pt_base)), &data->pgtable, *ent,
+			readl(SYSMMU_REG(data, fault_info)));
+	else
+		dev_dbg(data->sysmmu, "\tLv1 entry: %#x\n", *ent);
 	if (lv1ent_page(ent)) {
 		ent = page_entry(ent, fault->addr);
-		dev_dbg(data->sysmmu, "\t Lv2 entry: %#x\n", *ent);
+		if (data->legacy_v7)
+			dev_err(data->sysmmu, "Lv2 entry: %#x\n", *ent);
+		else
+			dev_dbg(data->sysmmu, "\t Lv2 entry: %#x\n", *ent);
 	}
 }
+
+/*
+ * A fault never panics. The master's fault handler (if any) decides what to
+ * do: the Exynos9810 DECON driver stops its TE trigger so that a faulting
+ * buffer is fetched at most until the end of the current frame. Messages
+ * are limited to the first faults and then rate limited, because a
+ * scanout engine can raise thousands of faults per frame.
+ */
+static DEFINE_RATELIMIT_STATE(sysmmu_fault_rs, 5 * HZ, 10);
 
 static irqreturn_t exynos_sysmmu_irq(int irq, void *dev_id)
 {
 	struct sysmmu_drvdata *data = dev_id;
-	unsigned int itype;
+	unsigned int itype, n;
 	struct sysmmu_fault fault;
+	bool verbose;
+	u32 status;
 	int ret = -ENOSYS;
 
-	WARN_ON(!data->active);
+	WARN_ON_ONCE(!data->active);
 
 	spin_lock(&data->lock);
 	clk_enable(data->clk_master);
 
-	itype = __ffs(readl(SYSMMU_REG(data, int_status)));
+	status = readl(SYSMMU_REG(data, int_status));
+	if (!status) {
+		dev_err_ratelimited(data->sysmmu, "spurious interrupt (INT_STATUS 0)\n");
+		clk_disable(data->clk_master);
+		spin_unlock(&data->lock);
+		return IRQ_NONE;
+	}
+	itype = __ffs(status);
+	n = atomic_inc_return(&data->nr_faults);
+	verbose = n <= 8 || __ratelimit(&sysmmu_fault_rs);
+
 	ret = data->variant->get_fault_info(data, itype, &fault);
 	if (ret) {
-		dev_err(data->sysmmu, "Unhandled interrupt bit %u\n", itype);
+		if (verbose)
+			dev_err(data->sysmmu, "Unhandled interrupt bit %u (INT_STATUS %#x), fault #%u\n",
+				itype, status, n);
 		goto out;
 	}
-	show_fault_information(data, &fault);
+	if (verbose) {
+		if (data->legacy_v7)
+			dev_err(data->sysmmu, "fault #%u, INT_STATUS %#x\n", n, status);
+		show_fault_information(data, &fault);
+	}
 
 	if (data->domain) {
 		ret = report_iommu_fault(&data->domain->domain, data->master,
 					 fault.addr, fault.type);
 	}
-	if (ret)
-		panic("Unrecoverable System MMU Fault!");
+	if (ret && verbose)
+		dev_err(data->sysmmu, "fault #%u not handled by %s (%d): ignored, no panic\n",
+			n, data->master ? dev_name(data->master) : "no master", ret);
 
 out:
 	writel(1 << itype, SYSMMU_REG(data, int_clear));
@@ -613,12 +744,37 @@ static void __sysmmu_disable(struct sysmmu_drvdata *data)
 	data->active = false;
 	spin_unlock_irqrestore(&data->lock, flags);
 
+	if (data->legacy_v7)
+		dev_info(data->sysmmu, "disabled (bypass): WRITE CTRL 0x0, CFG 0x0\n");
+
 	__sysmmu_disable_clocks(data);
+}
+
+/* 4.9 __sysmmu_init_config() CFG value for an Exynos9810 SysMMU */
+static u32 sysmmu_legacy_cfg(struct sysmmu_drvdata *data)
+{
+	u32 cfg = data->boot_cfg & ~CFG_MASK_LEGACY_V7;
+
+	if (data->qos >= 0)
+		cfg |= CFG_QOS_OVERRIDE | CFG_QOS(data->qos);
+	return cfg;
 }
 
 static void __sysmmu_init_config(struct sysmmu_drvdata *data)
 {
 	unsigned int cfg;
+
+	/*
+	 * 4.9 __sysmmu_init_config(): keep the reset/bootloader bits outside
+	 * CFG_MASK, clear the rest (no CFG_EAP, no FLPD cache) and apply the
+	 * DT QoS with the override bit. The TLB way/port tuning of 4.9
+	 * ("sysmmu,tlb_property") is not applied: hardware defaults.
+	 */
+	if (data->legacy_v7) {
+		cfg = sysmmu_legacy_cfg(data);
+		writel(cfg, data->sfrbase + REG_MMU_CFG);
+		return;
+	}
 
 	if (data->version <= MAKE_MMU_VER(3, 1))
 		cfg = CFG_LRU | CFG_QOS(15);
@@ -646,18 +802,34 @@ static void __sysmmu_enable_vid(struct sysmmu_drvdata *data)
 
 static void __sysmmu_enable(struct sysmmu_drvdata *data)
 {
+	u32 ctrl0 = 0, ctrl, cfg, ptb, st;
 	unsigned long flags;
 
 	__sysmmu_enable_clocks(data);
 
 	spin_lock_irqsave(&data->lock, flags);
+	if (data->legacy_v7)
+		ctrl0 = readl(data->sfrbase + REG_MMU_CTRL);
+	/* 4.9 __sysmmu_enable_nocount(): same order of writes */
 	writel(CTRL_BLOCK, data->sfrbase + REG_MMU_CTRL);
 	__sysmmu_init_config(data);
 	__sysmmu_set_ptbase(data, data->pgtable);
 	__sysmmu_enable_vid(data);
 	writel(CTRL_ENABLE, data->sfrbase + REG_MMU_CTRL);
 	data->active = true;
+	data->nr_enables++;
 	spin_unlock_irqrestore(&data->lock, flags);
+
+	if (data->legacy_v7) {
+		ctrl = readl(data->sfrbase + REG_MMU_CTRL);
+		cfg = readl(data->sfrbase + REG_MMU_CFG);
+		ptb = readl(SYSMMU_REG(data, pt_base));
+		st = readl(data->sfrbase + REG_MMU_STATUS);
+		dev_info(data->sysmmu, "enable #%u for %s: CTRL %#x -> WRITE CTRL 0x7, CFG %#x, PT_BASE %#llx, FLUSH 0x1, CTRL 0x5; readback CTRL=%#x CFG=%#x PT_BASE=%#x STATUS=%#x\n",
+			 data->nr_enables,
+			 data->master ? dev_name(data->master) : "?", ctrl0, sysmmu_legacy_cfg(data),
+			 (u64)(data->pgtable >> SPAGE_ORDER), ctrl, cfg, ptb, st);
+	}
 
 	/*
 	 * SYSMMU driver keeps master's clock enabled only for the short
@@ -674,7 +846,11 @@ static void sysmmu_tlb_invalidate_flpdcache(struct sysmmu_drvdata *data,
 	unsigned long flags;
 
 	spin_lock_irqsave(&data->lock, flags);
-	if (data->active && data->version >= MAKE_MMU_VER(3, 3)) {
+	if (data->active && data->legacy_v7) {
+		/* FLPD cache is off (4.9 CFG); drop any cached 1 MiB entry */
+		__sysmmu_tlb_invalidate_range_legacy(data, iova & SECT_MASK,
+						     SECT_SIZE);
+	} else if (data->active && data->version >= MAKE_MMU_VER(3, 3)) {
 		clk_enable(data->clk_master);
 		if (sysmmu_block(data)) {
 			if (data->version >= MAKE_MMU_VER(5, 0))
@@ -694,7 +870,9 @@ static void sysmmu_tlb_invalidate_entry(struct sysmmu_drvdata *data,
 	unsigned long flags;
 
 	spin_lock_irqsave(&data->lock, flags);
-	if (data->active) {
+	if (data->active && data->legacy_v7) {
+		__sysmmu_tlb_invalidate_range_legacy(data, iova, size);
+	} else if (data->active) {
 		unsigned int num_inv = 1;
 
 		clk_enable(data->clk_master);
@@ -723,32 +901,98 @@ static void sysmmu_tlb_invalidate_entry(struct sysmmu_drvdata *data,
 
 static const struct iommu_ops exynos_iommu_ops;
 
+/* PTE format chosen by the first SysMMU; all instances share page tables */
+static int sysmmu_pte_legacy = -1;
+
+/*
+ * Exynos9810: the DPU SysMMUs sit in the DPU power domain, which the
+ * bootloader leaves on and nothing in this kernel turns off. A register
+ * read with the domain off would stall the bus, so check the PMU status
+ * first (DT "samsung,pmu-syscon" + "samsung,pd-status" = <offset mask value>).
+ * Then log the bootloader state and refuse an instance that is already
+ * translating: its page table is not ours.
+ */
+static int exynos_sysmmu_legacy_check(struct device *dev,
+				      struct sysmmu_drvdata *data)
+{
+	struct device_node *np = dev->of_node;
+	u32 pd[3], st = 0, ctrl, cfg, status, ptb, ver, capa0, capa1, ints;
+	struct regmap *pmu;
+	int ret;
+
+	if (!of_property_read_u32_array(np, "samsung,pd-status", pd, 3)) {
+		pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu-syscon");
+		if (IS_ERR(pmu))
+			return dev_err_probe(dev, PTR_ERR(pmu), "PMU syscon\n");
+		ret = regmap_read(pmu, pd[0], &st);
+		if (ret || (st & pd[1]) != pd[2]) {
+			dev_err(dev, "power domain off (PMU %#x = %#x, want %#x/%#x): not touching the SysMMU\n",
+				pd[0], st, pd[2], pd[1]);
+			return -ENODEV;
+		}
+	}
+
+	ctrl = readl(data->sfrbase + REG_MMU_CTRL);
+	cfg = readl(data->sfrbase + REG_MMU_CFG);
+	status = readl(data->sfrbase + REG_MMU_STATUS);
+	ptb = readl(data->sfrbase + 0x0c);
+	ver = readl(data->sfrbase + REG_MMU_VERSION);
+	capa0 = readl(data->sfrbase + REG_V7_CAPA0);
+	capa1 = readl(data->sfrbase + REG_V7_CAPA1);
+	ints = readl(data->sfrbase + 0x60);
+	dev_info(dev, "bootloader state: CTRL=%#x CFG=%#x STATUS=%#x PT_BASE=%#x VERSION=%#x (v%u.%u) CAPA0=%#x CAPA1=%#x INT_STATUS=%#x\n",
+		 ctrl, cfg, status, ptb, ver, MMU_MAJ_VER(MMU_RAW_VER(ver)),
+		 MMU_MIN_VER(MMU_RAW_VER(ver)), capa0, capa1, ints);
+
+	if (ctrl & 1) {
+		dev_err(dev, "translation already enabled by the bootloader: not taking over\n");
+		return -EBUSY;
+	}
+	if (MMU_MAJ_VER(MMU_RAW_VER(ver)) != 7) {
+		dev_err(dev, "not a SysMMU v7: the 9810 programming model does not apply\n");
+		return -ENODEV;
+	}
+	data->boot_cfg = cfg;
+
+	data->qos = -1;
+	if (!of_property_read_u32(np, "samsung,qos", &st)) {
+		if (st > 15)
+			dev_warn(dev, "invalid samsung,qos %u ignored\n", st);
+		else
+			data->qos = st;
+	}
+	return 0;
+}
+
 static int exynos_sysmmu_probe(struct platform_device *pdev)
 {
 	int irq, ret;
 	struct device *dev = &pdev->dev;
+	const struct sysmmu_soc_data *soc = device_get_match_data(dev);
 	struct sysmmu_drvdata *data;
 	struct resource *res;
 
 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
+	data->legacy_v7 = soc && soc->legacy_v7;
+	data->qos = -1;
+	atomic_set(&data->nr_faults, 0);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	data->sfrbase = devm_ioremap_resource(dev, res);
 	if (IS_ERR(data->sfrbase))
 		return PTR_ERR(data->sfrbase);
 
+	if (data->legacy_v7) {
+		ret = exynos_sysmmu_legacy_check(dev, data);
+		if (ret)
+			return ret;
+	}
+
 	irq = platform_get_irq(pdev, 0);
 	if (irq <= 0)
 		return irq;
-
-	ret = devm_request_irq(dev, irq, exynos_sysmmu_irq, 0,
-				dev_name(dev), data);
-	if (ret) {
-		dev_err(dev, "Unabled to register handler of irq %d\n", irq);
-		return ret;
-	}
 
 	data->clk = devm_clk_get_optional(dev, "sysmmu");
 	if (IS_ERR(data->clk))
@@ -762,7 +1006,12 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 	if (IS_ERR(data->pclk))
 		return PTR_ERR(data->pclk);
 
-	if (!data->clk && (!data->aclk || !data->pclk)) {
+	/*
+	 * Exynos9810: the SysMMU gates are HWACG Q-channel clocks whose
+	 * enable/disable are no-ops (4.9 and the legacy 6.12 clock driver),
+	 * so no clock is required.
+	 */
+	if (!data->legacy_v7 && !data->clk && (!data->aclk || !data->pclk)) {
 		dev_err(dev, "Failed to get device clock(s)!\n");
 		return -ENOSYS;
 	}
@@ -774,7 +1023,25 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 	data->sysmmu = dev;
 	spin_lock_init(&data->lock);
 
+	/* the variant must be known before the fault IRQ can fire */
 	__sysmmu_get_version(data);
+
+	if (data->legacy_v7 && data->variant != &sysmmu_legacy_v7_variant) {
+		dev_err(dev, "v%u.%u with VM layout (VCR): not the 9810 non-VM layout, refusing\n",
+			MMU_MAJ_VER(data->version), MMU_MIN_VER(data->version));
+		return -ENODEV;
+	}
+	if (sysmmu_pte_legacy >= 0 && sysmmu_pte_legacy != data->legacy_v7) {
+		dev_err(dev, "PTE format differs from the SysMMUs probed before\n");
+		return -EINVAL;
+	}
+
+	ret = devm_request_irq(dev, irq, exynos_sysmmu_irq, 0,
+				dev_name(dev), data);
+	if (ret) {
+		dev_err(dev, "Unabled to register handler of irq %d\n", irq);
+		return ret;
+	}
 
 	ret = iommu_device_sysfs_add(&data->iommu, &pdev->dev, NULL,
 				     dev_name(data->sysmmu));
@@ -788,11 +1055,16 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 			PG_ENT_SHIFT = SYSMMU_PG_ENT_SHIFT;
 			LV1_PROT = SYSMMU_LV1_PROT;
 			LV2_PROT = SYSMMU_LV2_PROT;
+		} else if (data->legacy_v7) {
+			PG_ENT_SHIFT = SYSMMU_V5_PG_ENT_SHIFT;
+			LV1_PROT = SYSMMU_NO_PROT;
+			LV2_PROT = SYSMMU_NO_PROT;
 		} else {
 			PG_ENT_SHIFT = SYSMMU_V5_PG_ENT_SHIFT;
 			LV1_PROT = SYSMMU_V5_LV1_PROT;
 			LV2_PROT = SYSMMU_V5_LV2_PROT;
 		}
+		sysmmu_pte_legacy = data->legacy_v7;
 	}
 
 	if (MMU_MAJ_VER(data->version) >= 5) {
@@ -815,6 +1087,12 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 	ret = iommu_device_register(&data->iommu, &exynos_iommu_ops, dev);
 	if (ret)
 		goto err_dma_set_mask;
+
+	if (data->legacy_v7)
+		dev_info(dev, "Exynos9810 SysMMU v%u.%u registered: 4.9 CFG %#x (QoS %d), PTEs without protection bits, range TLB flush, faults never panic\n",
+			 MMU_MAJ_VER(data->version), MMU_MIN_VER(data->version),
+			 sysmmu_legacy_cfg(data),
+			 data->qos);
 
 	return 0;
 
@@ -866,6 +1144,7 @@ static const struct dev_pm_ops sysmmu_pm_ops = {
 };
 
 static const struct of_device_id sysmmu_of_match[] = {
+	{ .compatible	= "samsung,exynos9810-sysmmu", .data = &exynos9810_sysmmu_data },
 	{ .compatible	= "samsung,exynos-sysmmu", },
 	{ },
 };
@@ -926,7 +1205,8 @@ static struct iommu_domain *exynos_iommu_domain_alloc_paging(struct device *dev)
 	INIT_LIST_HEAD(&domain->clients);
 
 	domain->domain.geometry.aperture_start = 0;
-	domain->domain.geometry.aperture_end   = ~0UL;
+	/* 4096 lv1 entries x 1 MiB: the IOVA space is 32 bits wide */
+	domain->domain.geometry.aperture_end   = U32_MAX;
 	domain->domain.geometry.force_aperture = true;
 
 	return &domain->domain;
@@ -1476,6 +1756,8 @@ static const struct iommu_ops exynos_iommu_ops = {
 	.release_device = exynos_iommu_release_device,
 	.pgsize_bitmap = SECT_SIZE | LPAGE_SIZE | SPAGE_SIZE,
 	.of_xlate = exynos_iommu_of_xlate,
+	/* DT reserved-memory "iommu-addresses": e.g. the boot framebuffer */
+	.get_resv_regions = iommu_dma_get_resv_regions,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev	= exynos_iommu_attach_device,
 		.map_pages	= exynos_iommu_map,
