@@ -86,7 +86,7 @@ static struct dma_fence *dpu_fence_create(struct dpu_dev *d)
 static void dpu_buf_release(struct dpu_buf *b)
 {
 	if (b->sgt)
-		dma_buf_unmap_attachment_unlocked(b->att, b->sgt, DMA_TO_DEVICE);
+		dma_buf_unmap_attachment_unlocked(b->att, b->sgt, DMA_BIDIRECTIONAL);
 	if (b->att)
 		dma_buf_detach(b->dmabuf, b->att);
 	if (b->dmabuf)
@@ -101,6 +101,13 @@ static void dpu_buf_release(struct dpu_buf *b)
  * with @may_bounce such a buffer is accepted and copied into a contiguous
  * decon-pool buffer before it is scanned (dpu_bounce()). Kernel buffers
  * (fb0, self-test) are always contiguous.
+ *
+ * The device has a 64-bit streaming DMA mask (dpu_probe()), so this mapping
+ * is plain dma-direct: dma address = physical address, no swiotlb. With the
+ * old 32-bit mask every system-heap page above 4 GiB was sent to swiotlb,
+ * whose 1 MiB segments overflow it ("swiotlb buffer is full", ROM-in-RAM v10)
+ * and the map failed. The 4 GiB limit of the IDMA base is checked here.
+ * The mapping of a bounced buffer is kept: dpu_bounce() reads its pages.
  */
 static int dpu_buf_import(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf *b,
 			  u64 need, bool may_bounce, const char **why)
@@ -123,7 +130,7 @@ static int dpu_buf_import(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf 
 		*why = "dma_buf_attach failed";
 		return ret;
 	}
-	b->sgt = dma_buf_map_attachment_unlocked(b->att, DMA_TO_DEVICE);
+	b->sgt = dma_buf_map_attachment_unlocked(b->att, DMA_BIDIRECTIONAL);
 	if (IS_ERR(b->sgt)) {
 		ret = PTR_ERR(b->sgt);
 		b->sgt = NULL;
@@ -131,7 +138,7 @@ static int dpu_buf_import(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf 
 			*why = "dma_buf_map_attachment failed";
 			return ret;
 		}
-		contig = false;		/* e.g. pages above 4 GiB for a 32-bit device */
+		contig = false;		/* dpu_bounce() falls back to dma_buf_vmap() */
 	} else {
 		addr = sg_dma_address(b->sgt->sgl);
 		for_each_sgtable_dma_sg(b->sgt, sg, i) {
@@ -152,15 +159,65 @@ static int dpu_buf_import(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf 
 		*why = "buffer not contiguous below 4 GiB (needs the DPU SysMMU)";
 		return -EINVAL;
 	}
-	/* no device mapping for a bounced buffer: only the CPU reads it */
-	if (b->sgt)
-		dma_buf_unmap_attachment_unlocked(b->att, b->sgt, DMA_TO_DEVICE);
-	dma_buf_detach(db, b->att);
-	b->sgt = NULL;
-	b->att = NULL;
 	b->bounce = true;
 	b->len = db->size;
 	return 0;
+}
+
+/*
+ * Copy a mapped buffer through the cacheable kernel linear map, segment by
+ * segment, after invalidating the CPU caches for it
+ * (dma_sync_sgtable_for_cpu(): DC IVAC on this non-coherent device). The
+ * system heap's own vmap of an uncached buffer is write-combined, and
+ * memcpy() reading from it ran at ~100 MB/s (ROM-in-RAM v10: 150-195 ms for
+ * the 17.3 MB AFBC client target). The CPU never writes these pages, so the
+ * invalidate cannot drop data; the GPU finished before the acquire fence.
+ * Returns -ENOENT if a segment has no struct page (caller uses the vmap).
+ */
+static int dpu_bounce_copy_sg(struct dpu_dev *d, struct dpu_buf *b, void *dst, u32 *inval_us)
+{
+	struct scatterlist *sg;
+	size_t off = 0;
+	ktime_t t0;
+	int i;
+
+	for_each_sgtable_sg(b->sgt, sg, i)
+		if (!sg_page(sg))
+			return -ENOENT;
+	t0 = ktime_get();
+	dma_sync_sgtable_for_cpu(d->dev, b->sgt, DMA_BIDIRECTIONAL);
+	*inval_us = ktime_us_delta(ktime_get(), t0);
+	for_each_sgtable_sg(b->sgt, sg, i) {
+		size_t n = min_t(size_t, sg->length, b->len - off);
+
+		if (!n)
+			break;
+		memcpy(dst + off, page_address(sg_page(sg)) + sg->offset, n);
+		off += n;
+	}
+	return off == b->len ? 0 : -EINVAL;
+}
+
+/* fallback: the exporter's CPU access path (slow for uncached heaps) */
+static int dpu_bounce_copy_vmap(struct dpu_buf *b, void *dst)
+{
+	struct iosys_map map;
+	int ret;
+
+	ret = dma_buf_begin_cpu_access(b->dmabuf, DMA_FROM_DEVICE);
+	if (ret)
+		return ret;
+	ret = dma_buf_vmap_unlocked(b->dmabuf, &map);
+	if (!ret && map.is_iomem) {
+		dma_buf_vunmap_unlocked(b->dmabuf, &map);
+		ret = -EINVAL;
+	}
+	if (!ret) {
+		memcpy(dst, map.vaddr, b->len);
+		dma_buf_vunmap_unlocked(b->dmabuf, &map);
+	}
+	dma_buf_end_cpu_access(b->dmabuf, DMA_FROM_DEVICE);
+	return ret;
 }
 
 /*
@@ -179,9 +236,9 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		struct dpu_buf *b = &c->buf[i];
 		struct dpu_bounce *t = &d->bounce[d->bounce_next];
-		struct iosys_map map;
 		ktime_t t0 = ktime_get();
-		u32 us;
+		u32 us, inval_us = 0;
+		const char *path = "linear map";
 
 		if (c->cfg[i].state != DECON_WIN_STATE_BUFFER || !b->bounce)
 			continue;
@@ -202,22 +259,14 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 			dev_info(d->dev, "bounce buffer %d: %zu bytes at %pad\n",
 				 d->bounce_next, t->size, &t->dma);
 		}
-		ret = dma_buf_begin_cpu_access(b->dmabuf, DMA_FROM_DEVICE);
-		if (ret)
-			return ret;
-		ret = dma_buf_vmap_unlocked(b->dmabuf, &map);
-		if (!ret && map.is_iomem) {
-			dma_buf_vunmap_unlocked(b->dmabuf, &map);
-			ret = -EINVAL;
+		ret = b->sgt ? dpu_bounce_copy_sg(d, b, t->vaddr, &inval_us) : -ENOENT;
+		if (ret == -ENOENT) {
+			path = "dma_buf_vmap";
+			ret = dpu_bounce_copy_vmap(b, t->vaddr);
 		}
-		if (!ret) {
-			memcpy(t->vaddr, map.vaddr, b->len);
-			dma_buf_vunmap_unlocked(b->dmabuf, &map);
-		}
-		dma_buf_end_cpu_access(b->dmabuf, DMA_FROM_DEVICE);
 		if (ret) {
-			dev_err_ratelimited(d->dev, "win%d: cannot map the dma-buf for the bounce copy: %d\n",
-					    i, ret);
+			dev_err_ratelimited(d->dev, "win%d: bounce copy (%s) failed: %d\n",
+					    i, path, ret);
 			return ret;
 		}
 		wmb();
@@ -226,9 +275,10 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 		us = ktime_us_delta(ktime_get(), t0);
 		d->bounce_max_us = max(d->bounce_max_us, us);
 		if (!d->nr_bounces++ || us > 40000)
-			dev_info_ratelimited(d->dev, "win%d: scattered buffer (%u segments, %zu bytes%s) copied to %pad in %u us (bounce #%u, max %u us)\n",
+			dev_info_ratelimited(d->dev, "win%d: scattered buffer (%u segments, %zu bytes%s) copied to %pad via %s in %u us (invalidate %u us; bounce #%u, max %u us)\n",
 					     i, b->nsegs, b->len, c->cfg[i].compression ? ", AFBC" : "",
-					     &b->addr, us, d->nr_bounces, d->bounce_max_us);
+					     &b->addr, path, us, inval_us, d->nr_bounces,
+					     d->bounce_max_us);
 	}
 	return 0;
 }
@@ -1636,7 +1686,16 @@ static int dpu_probe(struct platform_device *pdev)
 			return PTR_ERR(d->sysmmu[i]);
 	}
 
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	/*
+	 * Streaming mappings 64-bit: dma-buf imports are only inspected (and
+	 * bounced) or used when they lie below 4 GiB (dpu_buf_import()), so a
+	 * 32-bit streaming mask only pushed high pages into swiotlb. Coherent
+	 * allocations (bounce buffers, self-test) stay below 4 GiB for the
+	 * 32-bit IDMA base register.
+	 */
+	ret = dma_set_mask(dev, DMA_BIT_MASK(64));
+	if (!ret)
+		ret = dma_set_coherent_mask(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
 	if (of_property_present(np, "memory-region")) {
