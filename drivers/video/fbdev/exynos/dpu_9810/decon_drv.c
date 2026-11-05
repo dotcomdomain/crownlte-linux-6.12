@@ -2592,6 +2592,7 @@ static int dpu_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&d->st_work, dpu_st_work);
 	INIT_DELAYED_WORK(&d->pb_work, dpu_panel_bright_work);
 	INIT_DELAYED_WORK(&d->pb_status_work, dpu_panel_status_work);
+	INIT_DELAYED_WORK(&d->pb_alpm_work, dpu_panel_alpm_work);
 	INIT_DELAYED_WORK(&d->fb_snap_work, dpu_fb_snap_work);
 	d->fence_ctx = dma_fence_context_alloc(1);
 	platform_set_drvdata(pdev, d);
@@ -2735,6 +2736,14 @@ static int dpu_probe(struct platform_device *pdev)
 				   msecs_to_jiffies(d->pb_at_ms > now ? d->pb_at_ms - now : 0));
 		/* read-only panel status at 5.5 s and 25 s, whenever the brightness runs */
 		dpu_panel_status_schedule(d);
+		/* opt-in: one 4.9 fix_green() ALPM cycle, after the brightness */
+		if (d->pb_alpm_at_ms) {
+			pr_info(DPU_PB_PFX "alpm cycle (4.9 fix_green) scheduled at %u ms uptime\n",
+				d->pb_alpm_at_ms);
+			queue_delayed_work(system_long_wq, &d->pb_alpm_work,
+					   msecs_to_jiffies(d->pb_alpm_at_ms > now ?
+							    d->pb_alpm_at_ms - now : 0));
+		}
 	} else if (ret != -ENODEV) {
 		dev_warn(dev, "panel-bright disabled: %d\n", ret);
 	}
@@ -2771,6 +2780,7 @@ static void dpu_stop(struct dpu_dev *d)
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->pb_status_work);	/* re-queues itself; cancel waits */
+	cancel_delayed_work_sync(&d->pb_alpm_work);	/* sends the exit even when stopping */
 	cancel_delayed_work_sync(&d->st_work);
 	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {

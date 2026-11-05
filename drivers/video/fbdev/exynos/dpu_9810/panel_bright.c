@@ -112,6 +112,32 @@ static bool pb_write_allowed(u8 ofs, const u8 *b, size_t len)
 	}
 }
 
+/*
+ * The extra shapes of the 4.9 crown_a3_s0 alpm-enter / alpm-exit tables
+ * (pb_alpm_cycle()), allowed only while that cycle runs. B1 (LPM AOR),
+ * F0 and F7 are already in the brightness shapes above.
+ */
+static bool pb_alpm_write_allowed(u8 ofs, const u8 *b, size_t len)
+{
+	switch (b[0]) {
+	case 0xFC:			/* level 3 key on / off */
+		return !ofs && len == 3 && b[1] == b[2] && (b[1] == 0x5A || b[1] == 0xA5);
+	case 0xBB:			/* LPM nit (ALPM layer), LPM voltage, LPM off nit */
+		return (!ofs && len == 7 && b[1] == 0x07) ||
+		       (ofs == 0x25 && len == 3 && b[1] == 0x88 && b[2] == 0x80) ||
+		       (!ofs && len == 2 && b[1] == 0x03);
+	case 0xFD:			/* AVS on */
+		return ofs == 0x2B && len == 2 && b[1] == 0x03;
+	case 0x53:			/* LPM mode on (02/03) / exit (00) */
+		return !ofs && len == 2 && (b[1] == 0x00 || b[1] == 0x02 || b[1] == 0x03);
+	case 0xF4:			/* AVC2 off / on */
+		return !ofs && len == 6 && b[1] == 0xEB && b[2] == 0x23 && b[3] == 0x0B &&
+		       b[4] == 0x17 && (b[5] == 0x8A || b[5] == 0xCA);
+	default:
+		return false;
+	}
+}
+
 static bool pb_read_allowed(u8 reg)
 {
 	switch (reg) {
@@ -134,8 +160,9 @@ static int pb_write(struct dpu_dev *d, u8 ofs, const u8 *buf, size_t len)
 {
 	int ret;
 
-	if (!len || !pb_write_allowed(ofs, buf, len)) {
-		pr_err(DPU_PB_PFX "write %*ph (ofs %#x) not in the 4.9 brightness sequence, refused\n",
+	if (!len || !(pb_write_allowed(ofs, buf, len) ||
+		      (d->pb_alpm_active && pb_alpm_write_allowed(ofs, buf, len)))) {
+		pr_err(DPU_PB_PFX "write %*ph (ofs %#x) not in the 4.9 brightness / alpm sequences, refused\n",
 		       (int)min_t(size_t, len, 8), buf, ofs);
 		return -EPERM;
 	}
@@ -588,6 +615,9 @@ int dpu_panel_bright_init(struct dpu_dev *d)
 			 d->pb_has_id ? "gamma" : "panel id");
 	/* off by default: level 2 key around the EE/EA reads at 5.5 s / 25 s */
 	d->pb_status_key2 = of_property_read_bool(np, "samsung,panel-status-key2");
+	/* off by default: one 4.9 fix_green() ALPM cycle (dpu_panel_alpm_work) */
+	d->pb_alpm_at_ms = 0;
+	of_property_read_u32(np, "samsung,alpm-cycle-at-ms", &d->pb_alpm_at_ms);
 
 	r = platform_get_resource_byname(to_platform_device(d->dev), IORESOURCE_MEM, "dsim");
 	if (!r) {
@@ -648,4 +678,172 @@ void dpu_panel_bright_work(struct work_struct *work)
 		ret ? "FAIL" : "PASS", ret, ret ? 0 : d->pb_target, d->pb_readback,
 		d->dsim_ntx, d->dsim_nrx, d->dsim_nerr, d->dsim_nnote, us,
 		d->dsim_max_tx_us, d->dsim_max_rx_us, d->te_gap_max_us);
+}
+
+/*
+ * One 4.9 fix_green() cycle, opt-in via DT "samsung,alpm-cycle-at-ms".
+ *
+ * The owner's 4.9 kernel carries a "Green Screen Workaround" for this
+ * panel (panel_drv.c fix_green(), sysfs fix_green_screen, set to 1 on their
+ * Lineage by init.greenfix.rc / persist.vendor.panel.greenfix=1). At every
+ * display on (PANEL_IOC_EVT_FRAME_DONE with disp_on off) it runs:
+ *   panel_doze(PANEL_IOC_DOZE)  -> __panel_seq_set_alpm() -> PANEL_ALPM_ENTER_SEQ
+ *   usleep_range(126 ms)        ("ALPM spec")
+ *   panel_sleep_out()           -> __panel_seq_exit_alpm() -> PANEL_ALPM_EXIT_SEQ,
+ *                                  then backlight_update_status() -> PANEL_SET_BL_SEQ
+ * Packets: s6e3ha8_crown_a3_s0_panel.h crown_a3_s0_alpm_enter_cmdtbl and
+ * crown_a3_s0_alpm_exit_cmdtbl (CONFIG_ACTIVE_CLOCK off in the owner's
+ * build, so no active-clock packets). The LPM rows are those of
+ * getidx_lpm_table() as logged by the owner's Lineage 4.9 on screen on
+ * ("alpm_mode 0, brightness 44700, layer 0 row 3" = ALPM_60NIT at enter, row 0
+ * forced at exit): LPM nit BB 07 0C 0B 10 4F 04, LPM mode 53 02,
+ * LPM off nit BB 03.
+ * Left out (4.9 does them; all PMIC writes): the S2DOS05 ELVSS short-detect
+ * current for doze (CONFIG_DISP_PMIC_SSD) and the panel 1.6 V rail set to
+ * 1.5 V in ALPM and back (logged "regulator voltage : 1600000" / "1500000").
+ * Also __delay_normal_alpm()'s 124 ms guard after panel on (the panel has
+ * been on for seconds here).
+ * The question this answers: does the cycle clear the DDI's EE ELVDD error
+ * and light a panel that came up black?
+ */
+struct pb_step {
+	u8 ofs, len;
+	u8 data[8];
+	u32 delay_us;		/* after the packet */
+	const char *what;
+};
+
+static const struct pb_step pb_alpm_enter[] = {
+	{ 0, 3, { 0xF0, 0x5A, 0x5A }, 0, "level 2 key on" },
+	{ 0, 3, { 0xB1, 0x0B, 0x74 }, 0, "LPM AOR" },
+	{ 0, 2, { 0xF7, 0x03 }, 0, "gamma update" },
+	{ 0, 3, { 0xF0, 0xA5, 0xA5 }, 16700, "level 2 key off, 1 frame" },
+	{ 0, 3, { 0xF0, 0x5A, 0x5A }, 0, "level 2 key on" },
+	{ 0, 7, { 0xBB, 0x07, 0x0C, 0x0B, 0x10, 0x4F, 0x04 }, 0, "LPM nit (ALPM 60 nit)" },
+	{ 0x25, 3, { 0xBB, 0x88, 0x80 }, 0, "LPM voltage" },
+	{ 0, 3, { 0xFC, 0x5A, 0x5A }, 0, "level 3 key on" },
+	{ 0x2B, 2, { 0xFD, 0x03 }, 0, "AVS on" },
+	{ 0, 3, { 0xFC, 0xA5, 0xA5 }, 0, "level 3 key off" },
+	{ 0, 2, { 0x53, 0x02 }, 0, "LPM mode (ALPM 60 nit)" },
+	{ 0, 6, { 0xF4, 0xEB, 0x23, 0x0B, 0x17, 0x8A }, 0, "AVC2 off" },
+	{ 0, 2, { 0xF7, 0x03 }, 0, "gamma update" },
+	{ 0, 3, { 0xF0, 0xA5, 0xA5 }, 0, "level 2 key off" },
+};
+
+static const struct pb_step pb_alpm_exit[] = {
+	{ 0, 3, { 0xF0, 0x5A, 0x5A }, 0, "level 2 key on" },
+	{ 0, 2, { 0xBB, 0x03 }, 0, "LPM off nit" },
+	{ 0, 6, { 0xF4, 0xEB, 0x23, 0x0B, 0x17, 0xCA }, 0, "AVC2 on" },
+	{ 0, 2, { 0x53, 0x00 }, 0, "exit ALPM" },
+	{ 0, 3, { 0xF0, 0xA5, 0xA5 }, 0, "level 2 key off" },
+};
+
+/*
+ * Send a table; on any error stop and send both key-off packets (a failed
+ * key on may still have reached the panel). Returns the first error.
+ */
+static int pb_steps(struct dpu_dev *d, const struct pb_step *st, int n, int *sent)
+{
+	static const u8 key3_off[] = { 0xFC, 0xA5, 0xA5 };
+	int i, ret = 0;
+
+	for (i = 0; i < n; i++) {
+		pb_dbg("alpm step %d/%d: %s\n", i + 1, n, st[i].what);
+		ret = pb_write(d, st[i].ofs, st[i].data, st[i].len);
+		if (ret)
+			break;
+		if (st[i].delay_us)
+			usleep_range(st[i].delay_us, st[i].delay_us + 100);
+	}
+	*sent = i;
+	if (ret) {
+		if (pb_write(d, 0, key3_off, sizeof(key3_off)))
+			pr_err(DPU_PB_PFX "alpm: could not send level 3 key off\n");
+		if (pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
+			pr_err(DPU_PB_PFX "alpm: could not send level 2 key off\n");
+	}
+	return ret;
+}
+
+/* one window: optional status, a packet table, then RDDPM */
+static int pb_alpm_window(struct dpu_dev *d, const struct pb_step *st, int n,
+			  struct pb_status *s, u8 *pm, int *sent)
+{
+	u32 trig = 0;
+	int ret, ret_pm;
+
+	*sent = 0;
+	ret = dpu_cmd_window_begin(d, &trig);
+	if (ret)
+		return ret;
+	ret = dpu_dsim_check(d);
+	if (!ret) {
+		dpu_dsim_clear_status(d);
+		if (s)
+			pb_status_read(d, s);
+		d->pb_alpm_active = true;
+		ret = pb_steps(d, st, n, sent);
+		d->pb_alpm_active = false;
+		ret_pm = pb_read(d, MIPI_DCS_GET_POWER_MODE, 0, pm, 1);
+		if (ret_pm)
+			*pm = 0;
+	}
+	dpu_cmd_window_end(d, trig);
+	return ret;
+}
+
+void dpu_panel_alpm_work(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_alpm_work);
+	u64 ms = ktime_to_ms(ktime_get_boottime());
+	struct pb_status s0, sb, sa;
+	u8 pm_in = 0, pm_out = 0;
+	int ret, ret_exit, ret_bl = -ENODATA, n_in, n_out;
+	u32 trig = 0;
+
+	if (READ_ONCE(d->stopping))
+		return;
+	if (READ_ONCE(pb_reported) != d->pb_target) {
+		pr_info(DPU_PB_PFX "alpm cycle at %llu.%03llu s: skipped, brightness %u not applied\n",
+			ms / 1000, ms % 1000, d->pb_target);
+		return;
+	}
+	pb_status_init(&s0);
+	pb_status_init(&sb);
+	pb_status_init(&sa);
+	pr_info(DPU_PB_PFX "alpm cycle (4.9 fix_green) start at %llu.%03llu s\n",
+		ms / 1000, ms % 1000);
+
+	/* 1. ALPM enter */
+	ret = pb_alpm_window(d, pb_alpm_enter, ARRAY_SIZE(pb_alpm_enter), &s0, &pm_in, &n_in);
+	pb_status_log("before alpm", &s0);
+	pr_info(DPU_PB_PFX "alpm enter: %d, %d/%zu packets, RDDPM %#04x (idle %s)\n",
+		ret, n_in, ARRAY_SIZE(pb_alpm_enter), pm_in, pm_in & 0x40 ? "ON" : "off");
+	/* nothing reached the panel: nothing to undo */
+	if (ret && !n_in)
+		return;
+
+	/* 2. 4.9 fix_green(): 126 ms (ALPM spec), frames keep running */
+	usleep_range(126 * 1000, 126 * 1000 + 10);
+	if (READ_ONCE(d->stopping))
+		pr_info(DPU_PB_PFX "alpm: stopping, still sending the exit\n");
+
+	/* 3. ALPM exit, then 4.9's backlight_update_status(): the set-bl sequence */
+	ret_exit = pb_alpm_window(d, pb_alpm_exit, ARRAY_SIZE(pb_alpm_exit), NULL, &pm_out,
+				  &n_out);
+	pr_info(DPU_PB_PFX "alpm exit: %d, %d/%zu packets, RDDPM %#04x (idle %s)\n",
+		ret_exit, n_out, ARRAY_SIZE(pb_alpm_exit), pm_out, pm_out & 0x40 ? "ON" : "off");
+	if (!ret_exit && !READ_ONCE(d->stopping) && !dpu_cmd_window_begin(d, &trig)) {
+		ret_bl = dpu_dsim_check(d);
+		if (!ret_bl) {
+			dpu_dsim_clear_status(d);
+			ret_bl = pb_sequence(d, &sb, &sa);
+		}
+		dpu_cmd_window_end(d, trig);
+		pb_status_log("after alpm, before brightness", &sb);
+		pb_status_log("after alpm and brightness", &sa);
+	}
+	pr_info(DPU_PB_PFX "alpm cycle RESULT %s: enter %d, exit %d, brightness %d, read-back %s\n",
+		!ret && !ret_exit && !ret_bl ? "PASS" : "FAIL", ret, ret_exit, ret_bl,
+		ret_bl ? "-" : d->pb_readback);
 }

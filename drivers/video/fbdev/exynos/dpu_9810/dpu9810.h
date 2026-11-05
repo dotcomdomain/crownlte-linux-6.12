@@ -218,6 +218,10 @@ struct dpu_dev {
 	struct delayed_work pb_status_work;
 	u32 pb_nstatus;
 	bool pb_status_key2;			/* DT: level 2 key around EE/EA */
+	/* one 4.9 fix_green() ALPM enter/exit cycle (panel_bright.c), opt-in via DT */
+	struct delayed_work pb_alpm_work;
+	u32 pb_alpm_at_ms;			/* 0 = off */
+	bool pb_alpm_active;			/* alpm packet shapes allowed */
 };
 
 /* decon_hw.c: register layer (ported from 4.9 decon_reg.c / dpp_reg.c) */
@@ -270,6 +274,7 @@ int dpu_panel_bright_init(struct dpu_dev *d);
 void dpu_panel_bright_work(struct work_struct *work);
 void dpu_panel_status_work(struct work_struct *work);
 void dpu_panel_status_schedule(struct dpu_dev *d);
+void dpu_panel_alpm_work(struct work_struct *work);
 u32 dpu9810_panel_brightness(void);	/* also used by panel_ro.c */
 
 #endif /* __DPU9810_H__ */
