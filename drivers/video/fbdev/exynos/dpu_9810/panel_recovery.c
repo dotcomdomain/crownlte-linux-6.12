@@ -45,7 +45,10 @@
  * (normal display RDDPM, panel id 04 = DT samsung,panel-id, HBM gamma vs
  * DT, F4); with "samsung,panel-recovery-only-on-elvdd-error" the keyed EE
  * must show bit 3; at level 2 the reset GPIO must be gpa3-4 of
- * pinctrl@14050000, an output driven high.
+ * pinctrl@14050000, an output driven high, and the DSIM lanes must reach
+ * LP-11 with the HS clock request cleared and get the HS clock back
+ * (pr_lp11_trial()). The pulse itself happens only in LP-11 and only if
+ * the display off / exit tables went out without an error.
  *
  * Every key on is followed by its key off, also after errors: each table
  * tracks the levels it turned on and sends the outstanding key offs at its
@@ -306,6 +309,7 @@ struct pr_result {
 	u32 frames, frame_wait_ms;	/* between init and display on */
 	int ret_bl;			/* PANEL_SET_BL_SEQ */
 	int reset;			/* level 2 pulse: 0 ok, <0 error, 1 not run */
+	const char *reset_skip;		/* level 2 fell back to the level 1 path */
 };
 
 static void pr_note_err(struct pr_result *r, int ret)
@@ -556,6 +560,59 @@ static int pr_reset_pulse(struct dpu_dev *d, struct pr_gpio *g)
 	return ret ? ret : ret2;
 }
 
+/*
+ * Precondition for level 2 (Sol review R1 #1), before display off: the
+ * lanes must reach LP-11 when the HS clock request is cleared and the
+ * clock must come back when it is set again (dsim_cmd.c
+ * dpu_dsim_enter_lp11() / _leave_lp11(), 4.9 dsim_reg_set_hs_clock()).
+ */
+static int pr_lp11_trial(struct dpu_dev *d)
+{
+	bool hs = false;
+	int ret = dpu_dsim_enter_lp11(d, &hs);
+	int ret2 = dpu_dsim_leave_lp11(d, hs);
+
+	return ret ? ret : ret2;
+}
+
+/*
+ * Level 2 reset (Sol review R1 #1). 4.9 drives reset only with the DSIM
+ * stopped and its PHY off (_dsim_disable() -> dsim_reg_stop(), first step
+ * HS clock off) and re-initialises the link to LP-11 afterwards
+ * (_dsim_enable()). Here the link stays configured, so: no reset at all if
+ * the display off / exit tables had an error (the level 1 path continues);
+ * otherwise the HS clock request is cleared, every lane must be in LP-11
+ * and the reset pin still an output driven high, checked again right
+ * before reset goes low; afterwards the HS clock request is restored.
+ */
+static void pr_reset_phase(struct dpu_dev *d, struct pr_gpio *g, struct pr_result *r)
+{
+	bool hs = false;
+	int ret, ret2;
+
+	if (r->err) {
+		r->reset_skip = "display off / exit errors";
+		return;
+	}
+	ret = dpu_dsim_enter_lp11(d, &hs);
+	if (!ret)
+		ret = pr_gpio_verify(g, 1, "before");
+	if (!ret)
+		ret = dpu_dsim_lp11_check(d, "before reset");
+	if (ret) {
+		r->reset_skip = "lanes not in LP-11 or reset pin changed";
+	} else {
+		r->reset = pr_reset_pulse(d, g);
+		pr_note_err(r, r->reset);
+		dpu_dsim_lp11_check(d, "after reset");		/* logged only */
+	}
+	ret2 = dpu_dsim_leave_lp11(d, hs);
+	if (ret2) {
+		pr_err(DPU_PR_PFX "HS clock request not restored after the reset: %d\n", ret2);
+		pr_note_err(r, ret2);
+	}
+}
+
 /* ---- the work ----------------------------------------------------------- */
 
 static int pr_ee_elvdd(const struct pb_status *s)
@@ -599,6 +656,11 @@ static int pr_window_off_on(struct dpu_dev *d, struct pb_status *sb, struct pb_c
 			*why = "reset gpio";
 			return ret;
 		}
+		ret = pr_lp11_trial(d);
+		if (ret) {
+			*why = "DSIM lanes cannot be put in LP-11 for the reset";
+			return ret;
+		}
 	}
 
 	/* from here on writes go out: no refusal, every phase runs */
@@ -606,10 +668,8 @@ static int pr_window_off_on(struct dpu_dev *d, struct pb_status *sb, struct pb_c
 	d->pr_active = true;
 	pr_run(d, "display off", pr_tbl_display_off, ARRAY_SIZE(pr_tbl_display_off), r);
 	pr_run(d, "exit", pr_tbl_exit, ARRAY_SIZE(pr_tbl_exit), r);
-	if (d->pr_level >= 2) {
-		r->reset = pr_reset_pulse(d, g);
-		pr_note_err(r, r->reset);
-	}
+	if (d->pr_level >= 2)
+		pr_reset_phase(d, g, r);
 	pr_run(d, "init", pr_tbl_init, ARRAY_SIZE(pr_tbl_init), r);
 	r->ret_bl = pb_send_bl(d, c, true);	/* every packet tried (R1 #3) */
 	pr_note_err(r, r->ret_bl);
@@ -722,7 +782,9 @@ void dpu_panel_recovery_work(struct work_struct *work)
 	dpu_cmd_window_end(d, trig);
 
 	pb_status_log("before recovery", &sb);
-	if (r.reset <= 0)
+	if (r.reset_skip)
+		pr_err(DPU_PR_PFX "reset pulse skipped (%s): level 1 path\n", r.reset_skip);
+	else if (r.reset <= 0)
 		pr_info(DPU_PR_PFX "reset pulse: %d\n", r.reset);
 	if (!r.frames)
 		pr_err(DPU_PR_PFX "no frame within %u ms after the init table; display on sent anyway\n",
@@ -744,7 +806,7 @@ void dpu_panel_recovery_work(struct work_struct *work)
 		r.rd_ret[PR_RD_EXIT_DSIE], r.rd[PR_RD_INIT_DIAG], r.rd_ret[PR_RD_INIT_DIAG]);
 	pr_info(DPU_PR_PFX "RESULT %s: level %u, first error %d, %u packets (%u failed), set-bl %d, reset %s, %u frames in %u ms before display on, read-back %s, RDDPM after %#04x, EE (key2) before %s after %s, window 1 %u us, %u DSIM tx, %u DSIM errors\n",
 		!r.err && pm_ok && ee_ok ? "PASS" : "FAIL", d->pr_level, r.err, r.sent, r.failed,
-		r.ret_bl, r.reset > 0 ? "not run" : r.reset ? "FAILED" : "ok",
+		r.ret_bl, r.reset_skip ? "SKIPPED" : r.reset > 0 ? "not run" : r.reset ? "FAILED" : "ok",
 		r.frames, r.frame_wait_ms, d->pb_readback, sa.ret ? 0 : sa.pm[0], eeb, eea, us,
 		d->dsim_ntx - ntx0, d->dsim_nerr - nerr0);
 out:

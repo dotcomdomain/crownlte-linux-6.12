@@ -278,6 +278,9 @@ int dpu_dsim_check(struct dpu_dev *d);
 void dpu_dsim_clear_status(struct dpu_dev *d);
 int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len);
 int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len);
+int dpu_dsim_lp11_check(struct dpu_dev *d, const char *when);
+int dpu_dsim_enter_lp11(struct dpu_dev *d, bool *hs_was_on);
+int dpu_dsim_leave_lp11(struct dpu_dev *d, bool hs_was_on);
 
 /* panel_bright.c: the 4.9 brightness-44700 sequence */
 int dpu_panel_bright_init(struct dpu_dev *d);
