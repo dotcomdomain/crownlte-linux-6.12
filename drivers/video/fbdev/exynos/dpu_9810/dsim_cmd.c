@@ -19,11 +19,20 @@
  *    dpu_cmd_window_begin), i.e. DECON adopted, hw_lock held, TE trigger
  *    masked and no frame in flight;
  *  - DCS power, sleep, display on/off, reset, tearing, address and memory
- *    write commands and the DSC/PPS/peripheral packet types are refused.
+ *    write commands and the DSC/PPS/peripheral packet types are refused,
+ *    except while the panel recovery (panel_recovery.c) runs its 4.9
+ *    tables (d->pr_active): then sleep in/out (10/11), display off/on
+ *    (28/29), column/page address (2A/2B), tearing on (35), the DSC
+ *    compression mode packet (type 0x07) and a 128-byte PPS (type 0x0A)
+ *    may go out. Soft reset, partial/normal/idle mode, memory writes and
+ *    tearing off stay refused.
  *
  * Nothing here programs DSIM configuration, clocks, timing or the PHY.
- * The only registers written are PKTHDR/PAYLOAD (the packet FIFOs) and
- * INTSRC (write-1-to-clear of status bits nobody else in 6.12 uses).
+ * The only registers written are PKTHDR/PAYLOAD (the packet FIFOs),
+ * INTSRC (write-1-to-clear of status bits nobody else in 6.12 uses) and,
+ * around the panel recovery's level 2 reset pulse only,
+ * CLK_CTRL.TX_REQUEST_HSCLK (dpu_dsim_enter_lp11() / _leave_lp11(), the
+ * first step of 4.9 dsim_reg_stop() and the last of dsim_reg_start()).
  */
 #include <linux/delay.h>
 #include <linux/iopoll.h>
@@ -36,6 +45,7 @@
 #define DSIM_RD_TIMEOUT_US	100000	/* 4.9 MIPI_RD_TIMEOUT */
 #define DSIM_RX_FIFO_MAX_DEPTH	64	/* 4.9 dsim.h */
 #define DSIM_MAX_LONG		64
+#define DSIM_PPS_LEN		128	/* DSC 1.1 picture parameter set */
 #define DSIM_MAX_READ		40	/* 4.9 panel.c MAX_READ_BYTES */
 
 /*
@@ -71,9 +81,28 @@ static void dsim_wr(struct dpu_dev *d, u32 off, u32 val)
 	writel(val, d->dsim + off);
 }
 
-/* DCS commands this path never sends, whatever the caller asks */
-static bool dsim_dcs_forbidden(u8 cmd)
+/* the 4.9 screen off / on commands, only inside the panel recovery */
+static bool dsim_dcs_recovery_only(u8 cmd)
 {
+	switch (cmd) {
+	case MIPI_DCS_ENTER_SLEEP_MODE:		/* 10 */
+	case MIPI_DCS_EXIT_SLEEP_MODE:		/* 11 */
+	case MIPI_DCS_SET_DISPLAY_OFF:		/* 28 */
+	case MIPI_DCS_SET_DISPLAY_ON:		/* 29 */
+	case MIPI_DCS_SET_COLUMN_ADDRESS:	/* 2A */
+	case MIPI_DCS_SET_PAGE_ADDRESS:		/* 2B */
+	case MIPI_DCS_SET_TEAR_ON:		/* 35 */
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* DCS commands this path never sends, whatever the caller asks */
+static bool dsim_dcs_forbidden(struct dpu_dev *d, u8 cmd)
+{
+	if (d->pr_active && dsim_dcs_recovery_only(cmd))
+		return false;
 	switch (cmd) {
 	case MIPI_DCS_SOFT_RESET:
 	case MIPI_DCS_ENTER_SLEEP_MODE:
@@ -155,6 +184,112 @@ int dpu_dsim_check(struct dpu_dev *d)
 	return 0;
 }
 
+/* 4.9 dsim_reg_wait_hs_clk_disable() / _ready(): 1000 polls 10 us apart */
+#define DSIM_HS_CLK_TIMEOUT_US	10000
+
+static int dsim_wait_sfr_empty(struct dpu_dev *d, u32 timeout_us);
+
+/* enabled data lanes: CONFIG.LANES_EN bit 0 is the clock lane, 1..4 data 0..3 */
+static u32 dsim_data_lanes(struct dpu_dev *d)
+{
+	return (dsim_rd(d, DSIM_CONFIG) >> 1) & 0xf;
+}
+
+/*
+ * The link state the panel recovery needs around its reset pulse: HS clock
+ * not requested, the clock lane and every enabled data lane in stop state
+ * (LP-11), no ULPS / forced stop / forced BTA, PLL stable, SFR FIFOs empty
+ * (no packet in flight). Read only.
+ */
+int dpu_dsim_lp11_check(struct dpu_dev *d, const char *when)
+{
+	u32 clk, dphy, esc, fifo, l3, lanes;
+
+	if (!d->dsim)
+		return -ENODEV;
+	clk = dsim_rd(d, DSIM_CLK_CTRL);
+	dphy = dsim_rd(d, DSIM_DPHY_STATUS);
+	esc = dsim_rd(d, DSIM_ESCMODE);
+	fifo = dsim_rd(d, DSIM_FIFOCTRL);
+	l3 = dsim_rd(d, DSIM_LINK_STATUS3);
+	lanes = dsim_data_lanes(d);
+	pb_dbg("DSIM0 LP-11 %s: CLK_CTRL=%#x DPHY=%#x ESCMODE=%#x FIFOCTRL=%#x LINK3=%#x data lanes %#x\n",
+	       when, clk, dphy, esc, fifo, l3, lanes);
+	if (!lanes || (clk & DSIM_CLK_CTRL_TX_REQUEST_HSCLK) ||
+	    !(dphy & DSIM_DPHY_STATUS_STOP_STATE_CLK) ||
+	    (dphy & DSIM_DPHY_STATUS_STOP_STATE_DAT(lanes)) != DSIM_DPHY_STATUS_STOP_STATE_DAT(lanes) ||
+	    (dphy & DSIM_DPHY_STATUS_ULPS_CLK) || DSIM_DPHY_STATUS_ULPS_DATA_LANE_GET(dphy) ||
+	    (esc & (DSIM_ESCMODE_TX_ULPS_CLK | DSIM_ESCMODE_TX_ULPS_DATA |
+		    DSIM_ESCMODE_FORCE_STOP_STATE | DSIM_ESCMODE_FORCE_BTA)) ||
+	    !(l3 & DSIM_LINK_STATUS3_PLL_STABLE) ||
+	    !(fifo & DSIM_FIFOCTRL_EMPTY_PH_SFR) || !(fifo & DSIM_FIFOCTRL_EMPTY_PL_SFR)) {
+		pr_err(DPU_PB_PFX "DSIM0 not in LP-11 %s: CLK_CTRL=%#x DPHY_STATUS=%#x ESCMODE=%#x FIFOCTRL=%#x LINK3=%#x data lanes %#x\n",
+		       when, clk, dphy, esc, fifo, l3, lanes);
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * 4.9 _dsim_disable() -> dsim_reg_stop(), first step dsim_reg_set_hs_clock(0):
+ * clear CLK_CTRL.TX_REQUEST_HSCLK and wait (bounded) until the clock lane
+ * and every enabled data lane are in stop state. Inside a command window
+ * only (no frame, TE trigger masked). *hs_was_on tells
+ * dpu_dsim_leave_lp11() what to restore; call it whatever this returns.
+ */
+int dpu_dsim_enter_lp11(struct dpu_dev *d, bool *hs_was_on)
+{
+	u32 v, lanes;
+	int ret;
+
+	*hs_was_on = false;
+	if (!d->dsim || !d->cmd_window)
+		return -EPERM;
+	lockdep_assert_held(&d->hw_lock);
+	if (dsim_wait_sfr_empty(d, DSIM_WR_TIMEOUT_US)) {
+		pr_err(DPU_PB_PFX "DSIM0 SFR FIFOs busy, not stopping the HS clock\n");
+		return -EBUSY;
+	}
+	lanes = DSIM_DPHY_STATUS_STOP_STATE_DAT(dsim_data_lanes(d));
+	v = dsim_rd(d, DSIM_CLK_CTRL);
+	if (v & DSIM_CLK_CTRL_TX_REQUEST_HSCLK) {
+		*hs_was_on = true;
+		dsim_wr(d, DSIM_CLK_CTRL, v & ~DSIM_CLK_CTRL_TX_REQUEST_HSCLK);
+	}
+	ret = readl_poll_timeout(d->dsim + DSIM_DPHY_STATUS, v,
+				 (v & DSIM_DPHY_STATUS_STOP_STATE_CLK) && (v & lanes) == lanes,
+				 10, DSIM_HS_CLK_TIMEOUT_US);
+	if (ret)
+		pr_err(DPU_PB_PFX "DSIM0 lanes not in stop state %u us after the HS clock request was cleared (DPHY_STATUS=%#x)\n",
+		       DSIM_HS_CLK_TIMEOUT_US, v);
+	return ret ? ret : dpu_dsim_lp11_check(d, "entered");
+}
+
+/*
+ * 4.9 dsim_reg_start() -> dsim_reg_set_hs_clock(1): request the HS clock
+ * again if it was requested before, and for a continuous clock lane wait
+ * (bounded) for TX_READY_HS_CLK.
+ */
+int dpu_dsim_leave_lp11(struct dpu_dev *d, bool hs_was_on)
+{
+	u32 v;
+	int ret;
+
+	if (!hs_was_on || !d->dsim)
+		return 0;
+	lockdep_assert_held(&d->hw_lock);
+	v = dsim_rd(d, DSIM_CLK_CTRL);
+	dsim_wr(d, DSIM_CLK_CTRL, v | DSIM_CLK_CTRL_TX_REQUEST_HSCLK);
+	if (v & DSIM_CLK_CTRL_NONCONT_CLOCK_LANE)
+		return 0;
+	ret = readl_poll_timeout(d->dsim + DSIM_DPHY_STATUS, v,
+				 v & DSIM_DPHY_STATUS_TX_READY_HS_CLK, 10, DSIM_HS_CLK_TIMEOUT_US);
+	if (ret)
+		pr_err(DPU_PB_PFX "DSIM0 HS clock not ready %u us after the request (DPHY_STATUS=%#x)\n",
+		       DSIM_HS_CLK_TIMEOUT_US, v);
+	return ret;
+}
+
 /* Clear the INTSRC status bits this path polls (4.9 dsim_reg_clear_int) */
 void dpu_dsim_clear_status(struct dpu_dev *d)
 {
@@ -217,6 +352,10 @@ static int dsim_check_errors(struct dpu_dev *d, const char *what, u32 nr)
  * Send one packet: DCS/generic short or long write, or
  * SET_MAXIMUM_RETURN_PACKET_SIZE. @buf holds the command byte (DCS) or the
  * parameters (generic); short packets put buf[0]/buf[1] in DATA0/DATA1.
+ * Inside the panel recovery also the 4.9 DSC packets (dsim_write_data()):
+ * compression mode MIPI_DSI_DSC_PRA 0x07 as a short packet with DATA0 =
+ * buf[0], DATA1 = 0, and the PPS MIPI_DSI_DSC_PPS 0x0A as a long packet
+ * of exactly 128 bytes (common_mipi_lcd.c mipi_write()).
  */
 int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 {
@@ -263,10 +402,26 @@ int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 		d0 = len & 0xff;
 		d1 = (len >> 8) & 0xff;
 		break;
+	case MIPI_DSI_COMPRESSION_MODE:
+		if (!d->pr_active)
+			return -EPERM;
+		if (len != 1)
+			return -EINVAL;
+		d0 = buf[0];
+		break;
+	case MIPI_DSI_PICTURE_PARAMETER_SET:
+		if (!d->pr_active)
+			return -EPERM;
+		if (len != DSIM_PPS_LEN)
+			return -EINVAL;
+		is_long = true;
+		d0 = len & 0xff;
+		d1 = (len >> 8) & 0xff;
+		break;
 	default:
-		return -EINVAL;		/* DSC PRA/PPS, peripheral on/off, ... */
+		return -EINVAL;		/* peripheral on/off, color mode, ... */
 	}
-	if (dcs && dsim_dcs_forbidden(buf[0])) {
+	if (dcs && dsim_dcs_forbidden(d, buf[0])) {
 		pr_err(DPU_PB_PFX "refusing DCS command %#04x\n", buf[0]);
 		return -EPERM;
 	}

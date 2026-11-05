@@ -2478,6 +2478,48 @@ void dpu_cmd_window_end(struct dpu_dev *d, u32 trig)
 	mutex_unlock(&d->hw_lock);
 }
 
+/*
+ * The panel recovery (panel_recovery.c, Sol review R1 #2) owns the DECON
+ * across several command windows. dpu_cmd_window_pause() lets frames run
+ * again (the trigger bits of dpu_cmd_window_begin() restored) but keeps
+ * hw_lock, so no window update can start. dpu_cmd_window_resume() masks
+ * the trigger again and waits, bounded, for FRAME_COUNT to stop. It does
+ * not wait for a shadow update (none can be requested while hw_lock is
+ * held) and it reopens the window even when frames did not stop, returning
+ * -EBUSY, so the caller's cleanup (display on, key offs) can still go out.
+ * dpu_cmd_window_end() closes the window as usual.
+ */
+void dpu_cmd_window_pause(struct dpu_dev *d, u32 trig)
+{
+	lockdep_assert_held(&d->hw_lock);
+	d->cmd_window = false;
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	pb_dbg("command window paused (hw_lock kept): TRIG=%#x FRAME_COUNT=%u\n",
+	       decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d));
+}
+
+int dpu_cmd_window_resume(struct dpu_dev *d)
+{
+	u32 fc0, fc1;
+	int i;
+
+	lockdep_assert_held(&d->hw_lock);
+	dpu_hw_trigger(d, false);
+	fc0 = fc1 = dpu_hw_frame_count(d);
+	for (i = 0; i < DPU_CMD_IDLE_TRIES; i++) {
+		usleep_range(DPU_CMD_IDLE_US, DPU_CMD_IDLE_US + 1000);
+		fc1 = dpu_hw_frame_count(d);
+		if (fc1 == fc0)
+			break;
+		fc0 = fc1;
+	}
+	pb_dbg("command window resumed: TRIG=%#x, FRAME_COUNT %u %s\n",
+	       decon_rd(d, HW_SW_TRIG_CONTROL), fc1,
+	       i < DPU_CMD_IDLE_TRIES ? "stable" : "still advancing");
+	d->cmd_window = true;
+	return i < DPU_CMD_IDLE_TRIES ? 0 : -EBUSY;
+}
+
 /* ---- probe ----------------------------------------------------------- */
 
 static int dpu_parse_dt(struct dpu_dev *d)
@@ -2579,6 +2621,7 @@ static int dpu_probe(struct platform_device *pdev)
 	d->te_irq = -1;
 	mutex_init(&d->lock);
 	mutex_init(&d->hw_lock);
+	mutex_init(&d->panel_lock);
 	spin_lock_init(&d->queue_lock);
 	spin_lock_init(&d->fence_lock);
 	spin_lock_init(&d->ioc_lock);
@@ -2593,6 +2636,7 @@ static int dpu_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&d->pb_work, dpu_panel_bright_work);
 	INIT_DELAYED_WORK(&d->pb_status_work, dpu_panel_status_work);
 	INIT_DELAYED_WORK(&d->pb_alpm_work, dpu_panel_alpm_work);
+	INIT_DELAYED_WORK(&d->pr_work, dpu_panel_recovery_work);
 	INIT_DELAYED_WORK(&d->fb_snap_work, dpu_fb_snap_work);
 	d->fence_ctx = dma_fence_context_alloc(1);
 	platform_set_drvdata(pdev, d);
@@ -2744,6 +2788,19 @@ static int dpu_probe(struct platform_device *pdev)
 					   msecs_to_jiffies(d->pb_alpm_at_ms > now ?
 							    d->pb_alpm_at_ms - now : 0));
 		}
+		/* opt-in: one 4.9 screen off / on panel cycle (panel_recovery.c) */
+		ret = dpu_panel_recovery_init(d);
+		if (!ret) {
+			pr_info("panel-recovery: scheduled at %u ms uptime: level %u (%s)%s\n",
+				d->pr_at_ms, d->pr_level,
+				d->pr_level == 1 ? "DCS sleep cycle" : "reset pulse + DCS cycle",
+				d->pr_only_elvdd ? ", only on an ELVDD error" : "");
+			queue_delayed_work(system_long_wq, &d->pr_work,
+					   msecs_to_jiffies(d->pr_at_ms > now ?
+							    d->pr_at_ms - now : 0));
+		} else if (ret != -ENODEV) {
+			dev_warn(dev, "panel-recovery disabled: %d\n", ret);
+		}
 	} else if (ret != -ENODEV) {
 		dev_warn(dev, "panel-bright disabled: %d\n", ret);
 	}
@@ -2781,6 +2838,8 @@ static void dpu_stop(struct dpu_dev *d)
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->pb_status_work);	/* re-queues itself; cancel waits */
 	cancel_delayed_work_sync(&d->pb_alpm_work);	/* exit + brightness even when stopping */
+	/* not started: cancelled; started: runs to its display on, then returns */
+	cancel_delayed_work_sync(&d->pr_work);
 	cancel_delayed_work_sync(&d->st_work);
 	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {

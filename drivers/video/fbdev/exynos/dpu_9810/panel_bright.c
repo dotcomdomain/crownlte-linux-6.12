@@ -8,7 +8,9 @@
  * normal display state. This file sends the one panel command sequence 4.9
  * sends for that brightness, once, after the DECON driver adopted SBoot's
  * display. It never sends power, sleep, display on/off, reset, timing,
- * DSC/PPS, MTP/OTP-write or POC/flash commands.
+ * DSC/PPS, MTP/OTP-write or POC/flash commands. (The opt-in panel recovery,
+ * panel_recovery.c, sends the 4.9 sleep, display and DSC/PPS commands of a
+ * screen off / on cycle; it reuses the helpers in panel_bright.h.)
  *
  * 44700 = BRT(447) = crown_a3_s0_brt_tbl[86], the extended-HBM row
  * (720 nit). For that row 4.9 (s6e3ha8_crown_a3_s0_panel.h
@@ -57,10 +59,9 @@
 #include <linux/platform_device.h>
 #include <video/mipi_display.h>
 
-#include "dpu9810.h"
+#include "panel_bright.h"
 
 #define PB_BRT_EXT_HBM		44700	/* BRT(447), crown_a3_s0_brt_tbl[86] */
-#define PB_HBM_GAMMA_LEN	34	/* S6E3HA8_HBM_GAMMA_LEN */
 #define PB_HBM_GAMMA_OFS	2	/* S6E3HA8_HBM_GAMMA_OFS */
 #define PB_ELVSS_TEMP_0_OFS	22	/* S6E3HA8_ELVSS_TEMP_0_OFS */
 #define PB_ELVSS_TEMP_1_OFS	23	/* S6E3HA8_ELVSS_TEMP_1_OFS */
@@ -158,7 +159,7 @@ static bool pb_read_allowed(u8 reg)
 }
 
 /* 4.9 common_mipi_lcd.c mipi_write(), without the reset-and-retry loop */
-static int pb_write(struct dpu_dev *d, u8 ofs, const u8 *buf, size_t len)
+int pb_write(struct dpu_dev *d, u8 ofs, const u8 *buf, size_t len)
 {
 	int ret;
 
@@ -180,7 +181,7 @@ static int pb_write(struct dpu_dev *d, u8 ofs, const u8 *buf, size_t len)
 }
 
 /* 4.9 mipi_read(): optional "B0 <offset>", then dsim_read_data(DCS_READ) */
-static int pb_read(struct dpu_dev *d, u8 reg, u8 ofs, u8 *buf, size_t len)
+int pb_read(struct dpu_dev *d, u8 reg, u8 ofs, u8 *buf, size_t len)
 {
 	int ret;
 
@@ -196,8 +197,8 @@ static int pb_read(struct dpu_dev *d, u8 reg, u8 ofs, u8 *buf, size_t len)
 	return dpu_dsim_dcs_read(d, reg, buf, len);
 }
 
-static const u8 pb_key2_on[] = { 0xF0, 0x5A, 0x5A };
-static const u8 pb_key2_off[] = { 0xF0, 0xA5, 0xA5 };
+const u8 pb_key2_on[3] = { 0xF0, 0x5A, 0x5A };
+const u8 pb_key2_off[3] = { 0xF0, 0xA5, 0xA5 };
 
 /* crown_a3_s0_dimming_irc_table[73] scaled to 700 nit = rows 85 and 86 */
 static const u8 pb_irc_value[] = { 0xB8, 0x25, 0x69, 0xD6, 0x62, 0x06, 0x57, 0x53, 0x89,
@@ -267,10 +268,6 @@ static void pb_hbm_to_gamma(const u8 *hbm, u8 *gamma)
 	gamma[0] = hbm[0] & 0x07;
 }
 
-struct pb_state {
-	u8 ca[PB_HBM_GAMMA_LEN], b1[2], b5[3], f4[2], b8[17];
-};
-
 /* read-only snapshot of the registers the sequence writes */
 static int pb_snapshot(struct dpu_dev *d, struct pb_state *s)
 {
@@ -289,7 +286,7 @@ static int pb_snapshot(struct dpu_dev *d, struct pb_state *s)
 }
 
 /* make /sys/class/backlight/panel/brightness show what the panel now runs at */
-static void pb_publish(u32 v)
+void pb_publish(u32 v)
 {
 	struct backlight_device *bd;
 
@@ -317,21 +314,15 @@ static void pb_publish(u32 v)
  * reads; EE and EA are manufacturer registers, so they are read both
  * without a key and, where this file already holds the level 2 key, with
  * it. The counters in 05 and EA may reset when read, as with 4.9's reads.
+ * (struct pb_status is in panel_bright.h.)
  */
-struct pb_status {
-	int ret, ret_k;		/* -ENODATA: not read */
-	bool keyed;
-	u8 pm[3], sm[3], dsie, diag, ee, ea[5];
-	u8 ee_k, ea_k[5];
-};
-
-static void pb_status_init(struct pb_status *s)
+void pb_status_init(struct pb_status *s)
 {
 	memset(s, 0, sizeof(*s));
 	s->ret = -ENODATA;
 }
 
-static int pb_status_read(struct dpu_dev *d, struct pb_status *s)
+int pb_status_read(struct dpu_dev *d, struct pb_status *s)
 {
 	int ret;
 
@@ -351,7 +342,7 @@ static int pb_status_read(struct dpu_dev *d, struct pb_status *s)
 }
 
 /* EE and EA again; the caller holds the level 2 key */
-static int pb_status_read_keyed(struct dpu_dev *d, struct pb_status *s)
+int pb_status_read_keyed(struct dpu_dev *d, struct pb_status *s)
 {
 	int ret = pb_read(d, 0xEE, 0, &s->ee_k, 1);
 
@@ -372,7 +363,7 @@ static const char *pb_ee_str(u8 v, char *buf, size_t sz)
 }
 
 /* printed after the command window closed */
-static void pb_status_log(const char *when, const struct pb_status *s)
+void pb_status_log(const char *when, const struct pb_status *s)
 {
 	char ee[32], eek[32];
 	u8 pm = s->pm[0];
@@ -433,8 +424,10 @@ void dpu_panel_status_work(struct work_struct *work)
 		return;
 	pb_status_init(&s);
 	snprintf(when, sizeof(when), "at %llu.%03llu s", ms / 1000, ms % 1000);
+	mutex_lock(&d->panel_lock);	/* not between the recovery's windows */
 	ret = dpu_cmd_window_begin(d, &trig);
 	if (ret) {
+		mutex_unlock(&d->panel_lock);
 		pr_info(DPU_PB_PFX "status %s: no command window (%d), nothing sent\n", when, ret);
 		goto next;
 	}
@@ -460,6 +453,7 @@ void dpu_panel_status_work(struct work_struct *work)
 		}
 	}
 	dpu_cmd_window_end(d, trig);
+	mutex_unlock(&d->panel_lock);
 	pb_status_log(when, &s);
 	if (key_off)
 		pr_err(DPU_PB_PFX "status %s: could not send level 2 key off (%d)\n",
@@ -469,12 +463,17 @@ next:
 	dpu_panel_status_schedule(d);
 }
 
-static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status *sa)
+/*
+ * Steps 0-3 of the brightness sequence, reads only (plus the level 2 key
+ * around the calibration reads): status, normal display state, panel id,
+ * the per-panel calibration values and their cross-checks. Also the
+ * precondition check of the panel recovery (panel_recovery.c), which
+ * sends the set-bl sequence from @c later, inside its init table.
+ */
+int pb_prepare(struct dpu_dev *d, struct pb_status *sb, struct pb_calib *c)
 {
-	struct pb_pkt pkt[16];
-	struct pb_state before, after;
-	u8 rddpm, id[3], hbm[PB_HBM_GAMMA_LEN], gamma[PB_HBM_GAMMA_LEN], et1;
-	int i, n, ret, ret2;
+	u8 rddpm, id[3], hbm[PB_HBM_GAMMA_LEN];
+	int ret, ret2 = 0;
 	bool key2 = false;
 
 	/* 0. status before anything else (a failed status read stops nothing) */
@@ -501,17 +500,18 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 
 	/*
 	 * 3. calibration reads, under the level 2 key as 4.9's dim-flash
-	 * resource init re-reads the HBM gamma.
+	 * resource init re-reads the HBM gamma. A failed key on may still
+	 * have reached the panel, so key off follows every key-on attempt
+	 * (as dpu_panel_status_work()).
 	 */
-	ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
-	if (ret)
-		return ret;
 	key2 = true;
-	ret = pb_read(d, 0xB3, PB_HBM_GAMMA_OFS, hbm, sizeof(hbm));
+	ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
 	if (!ret)
-		ret = pb_read(d, 0xB5, PB_ELVSS_TEMP_1_OFS, &et1, 1);
+		ret = pb_read(d, 0xB3, PB_HBM_GAMMA_OFS, hbm, sizeof(hbm));
 	if (!ret)
-		ret = pb_snapshot(d, &before);
+		ret = pb_read(d, 0xB5, PB_ELVSS_TEMP_1_OFS, &c->et1, 1);
+	if (!ret)
+		ret = pb_snapshot(d, &c->before);
 	if (!ret)
 		pb_status_read_keyed(d, sb);	/* inside the existing key window */
 	ret2 = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
@@ -520,53 +520,94 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 	if (ret || ret2)
 		goto fail;
 
-	pb_hbm_to_gamma(hbm, gamma);
+	pb_hbm_to_gamma(hbm, c->gamma);
 	pb_dbg("HBM gamma (B3[2..35]) %*ph -> CA payload %*ph\n",
-		PB_HBM_GAMMA_LEN, hbm, PB_HBM_GAMMA_LEN, gamma);
-	pb_dbg("ELVSS temp 1 (B5[23]) %#04x\n", et1);
-	if (d->pb_has_gamma && memcmp(gamma, d->pb_gamma, sizeof(gamma))) {
+		PB_HBM_GAMMA_LEN, hbm, PB_HBM_GAMMA_LEN, c->gamma);
+	pb_dbg("ELVSS temp 1 (B5[23]) %#04x\n", c->et1);
+	if (d->pb_has_gamma && memcmp(c->gamma, d->pb_gamma, sizeof(c->gamma))) {
 		pr_err(DPU_PB_PFX "CA payload differs from the 4.9 gamma[720] in DT %*ph: not writing\n",
 		       PB_HBM_GAMMA_LEN, d->pb_gamma);
 		return -EINVAL;
 	}
-	if (before.f4[0] != 0xEB) {
+	if (c->before.f4[0] != 0xEB) {
 		pr_err(DPU_PB_PFX "F4 VGH byte %#04x, 4.9 always writes 0xEB: not writing\n",
-		       before.f4[0]);
+		       c->before.f4[0]);
 		return -EINVAL;
 	}
+	return 0;
 
-	/* 4. the 4.9 set-bl sequence */
-	n = pb_build(pkt, gamma, et1);
-	pb_dbg("sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets)\n",
-		d->pb_target, n);
+fail:
+	if (key2 && pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
+		pr_err(DPU_PB_PFX "could not send level 2 key off\n");
+	return ret ? ret : ret2;
+}
+
+/*
+ * Step 4: the 4.9 set-bl sequence for d->pb_target, with pb_prepare()'s
+ * values. One-shot brightness (@all false): stop at the first error. The
+ * panel recovery (@all true, Sol review R1 #3) has just re-initialised the
+ * panel, so it tries every remaining packet (voltages, ACL, IRC, gamma
+ * update) and the key off, and returns the first error.
+ */
+int pb_send_bl(struct dpu_dev *d, const struct pb_calib *c, bool all)
+{
+	struct pb_pkt pkt[16];
+	int i, n, r, ret = 0;
+	bool key_off_ok = false;
+
+	n = pb_build(pkt, c->gamma, c->et1);
+	pb_dbg("sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets%s)\n",
+		d->pb_target, n, all ? ", all tried" : "");
+	/* packet 0 is the key on: from its attempt on, key off is owed */
 	for (i = 0; i < n; i++) {
 		pb_dbg("step %d/%d: %s\n", i + 1, n, pkt[i].what);
-		ret = pb_write(d, pkt[i].ofs, pkt[i].data, pkt[i].len);
-		if (ret)
-			break;
-		key2 = (i < n - 1);
+		r = pb_write(d, pkt[i].ofs, pkt[i].data, pkt[i].len);
+		if (r) {
+			pr_err(DPU_PB_PFX "set-bl step %d/%d (%s): %d\n", i + 1, n, pkt[i].what, r);
+			if (!ret)
+				ret = r;
+			if (!all)
+				break;
+			continue;
+		}
+		if (i == n - 1)
+			key_off_ok = true;	/* the last packet is the key off */
 	}
-	if (ret)
-		goto fail;
+	/* after any error, unless the final key off itself went out: send it (again) */
+	if (ret && !key_off_ok && pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
+		pr_err(DPU_PB_PFX "could not send level 2 key off\n");
+	return ret;
+}
 
-	/* 5. read back (diagnostic only) */
+/*
+ * Step 5: read back (diagnostic only) into d->pb_readback, then the
+ * status after the sequence; key off after every key-on attempt.
+ */
+void pb_readback(struct dpu_dev *d, struct pb_status *sa, const struct pb_calib *c)
+{
+	const struct pb_state *before = &c->before;
+	struct pb_state after;
+	bool key2 = true;
+	int ret;
+
 	ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
 	if (!ret) {
-		key2 = true;
 		ret = pb_snapshot(d, &after);
 		if (!ret)
 			pb_status_read_keyed(d, sa);	/* inside the existing key window */
-		ret2 = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
-		if (!ret2)
-			key2 = false;
 	}
-	if (!key2)
+	if (!pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)) ||
+	    !pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
+		key2 = false;
+	if (key2)
+		pr_err(DPU_PB_PFX "could not send level 2 key off after the read-back\n");
+	else
 		pb_status_read(d, sa);		/* status after the sequence */
 	if (ret) {
 		d->pb_readback = "FAILED";
 		pb_dbg("read-back failed (%d); the sequence itself completed\n", ret);
 	} else {
-		bool ok = !memcmp(after.ca, gamma, sizeof(gamma)) &&
+		bool ok = !memcmp(after.ca, c->gamma, sizeof(c->gamma)) &&
 			  after.b1[0] == 0x00 && after.b1[1] == 0x0C &&
 			  after.b5[0] == 0x19 && after.b5[1] == 0xDC && after.b5[2] == 0x00 &&
 			  after.f4[0] == 0xEB && after.f4[1] == 0x26 &&
@@ -575,18 +616,25 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 		d->pb_readback = ok ? "MATCH" : "MISMATCH";
 		pb_dbg("read-back %s: CA %s, B1 %*ph -> %*ph, B5 %*ph -> %*ph, F4 %*ph -> %*ph, B8[18..] %*ph -> %*ph\n",
 			ok ? "MATCH" : "MISMATCH",
-			memcmp(after.ca, gamma, sizeof(gamma)) ? "differs" : "matches",
-			2, before.b1, 2, after.b1, 3, before.b5, 3, after.b5,
-			2, before.f4, 2, after.f4, 17, before.b8, 17, after.b8);
-		pb_dbg("CA before %*ph\n", PB_HBM_GAMMA_LEN, before.ca);
+			memcmp(after.ca, c->gamma, sizeof(c->gamma)) ? "differs" : "matches",
+			2, before->b1, 2, after.b1, 3, before->b5, 3, after.b5,
+			2, before->f4, 2, after.f4, 17, before->b8, 17, after.b8);
+		pb_dbg("CA before %*ph\n", PB_HBM_GAMMA_LEN, before->ca);
 		pb_dbg("CA after  %*ph\n", PB_HBM_GAMMA_LEN, after.ca);
 	}
-	return 0;
+}
 
-fail:
-	if (key2 && pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
-		pr_err(DPU_PB_PFX "could not send level 2 key off\n");
-	return ret ? ret : ret2;
+static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status *sa)
+{
+	struct pb_calib c;
+	int ret;
+
+	ret = pb_prepare(d, sb, &c);
+	if (!ret)
+		ret = pb_send_bl(d, &c, false);
+	if (!ret)
+		pb_readback(d, sa, &c);
+	return ret;
 }
 
 /* decon_drv.c probe: parse the opt-in DT properties of the panel node */
@@ -638,9 +686,8 @@ out:
 	return ret;
 }
 
-void dpu_panel_bright_work(struct work_struct *work)
+static void pb_bright_once(struct dpu_dev *d)
 {
-	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_work);
 	u64 ms = ktime_to_ms(ktime_get_boottime());
 	struct pb_status sb, sa;
 	u32 trig = 0, us;
@@ -680,6 +727,16 @@ void dpu_panel_bright_work(struct work_struct *work)
 		ret ? "FAIL" : "PASS", ret, ret ? 0 : d->pb_target, d->pb_readback,
 		d->dsim_ntx, d->dsim_nrx, d->dsim_nerr, d->dsim_nnote, us,
 		d->dsim_max_tx_us, d->dsim_max_rx_us, d->te_gap_max_us);
+}
+
+/* one panel sequence at a time (panel_recovery.c spans several windows) */
+void dpu_panel_bright_work(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_work);
+
+	mutex_lock(&d->panel_lock);
+	pb_bright_once(d);
+	mutex_unlock(&d->panel_lock);
 }
 
 /*
@@ -806,9 +863,8 @@ static int pb_alpm_window(struct dpu_dev *d, const struct pb_step *st, int n, bo
 	return ret;
 }
 
-void dpu_panel_alpm_work(struct work_struct *work)
+static void pb_alpm_cycle(struct dpu_dev *d)
 {
-	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_alpm_work);
 	u64 ms = ktime_to_ms(ktime_get_boottime());
 	struct pb_status s0, sb, sa;
 	u8 pm_in = 0, pm_out = 0;
@@ -885,4 +941,13 @@ void dpu_panel_alpm_work(struct work_struct *work)
 	pr_info(DPU_PB_PFX "alpm cycle RESULT %s: enter %d, exit %d, brightness %d, read-back %s\n",
 		!ret && !ret_exit && !ret_bl ? "PASS" : "FAIL", ret, ret_exit, ret_bl,
 		ret_bl ? "-" : d->pb_readback);
+}
+
+void dpu_panel_alpm_work(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_alpm_work);
+
+	mutex_lock(&d->panel_lock);
+	pb_alpm_cycle(d);
+	mutex_unlock(&d->panel_lock);
 }

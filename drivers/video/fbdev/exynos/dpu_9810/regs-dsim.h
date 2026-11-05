@@ -6,7 +6,9 @@
  * drivers/video/fbdev/exynos/dpu_9810/regs-dsim.h (offsets and bit
  * positions unchanged). Only the link-status, FIFO, packet and interrupt
  * status registers are listed: this driver never programs DSIM timing,
- * clocks, the PHY or the link configuration.
+ * clocks, the PHY or the link configuration. The one exception is
+ * CLK_CTRL.TX_REQUEST_HSCLK around the panel recovery's reset pulse
+ * (dsim_cmd.c dpu_dsim_enter_lp11(), as 4.9 dsim_reg_set_hs_clock()).
  */
 #ifndef _REGS_DSIM_9810_H
 #define _REGS_DSIM_9810_H
@@ -27,8 +29,11 @@
 #define DSIM_DPHY_STATUS_ULPS_CLK			(1 << 9)
 #define DSIM_DPHY_STATUS_STOP_STATE_CLK			(1 << 8)
 #define DSIM_DPHY_STATUS_ULPS_DATA_LANE_GET(x)		(((x) >> 4) & 0xf)
+#define DSIM_DPHY_STATUS_STOP_STATE_DAT(_x)		(((_x) & 0xf) << 0)
 
 #define DSIM_CLK_CTRL					(0x20)
+#define DSIM_CLK_CTRL_NONCONT_CLOCK_LANE		(1 << 25)
+#define DSIM_CLK_CTRL_TX_REQUEST_HSCLK			(1 << 20)
 
 #define DSIM_TIMEOUT					(0x28)
 

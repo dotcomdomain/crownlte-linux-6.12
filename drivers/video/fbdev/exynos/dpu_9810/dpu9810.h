@@ -222,6 +222,14 @@ struct dpu_dev {
 	struct delayed_work pb_alpm_work;
 	u32 pb_alpm_at_ms;			/* 0 = off */
 	bool pb_alpm_active;			/* alpm packet shapes allowed */
+	/* one 4.9 screen off / on panel cycle (panel_recovery.c), opt-in via DT */
+	struct delayed_work pr_work;
+	u32 pr_level, pr_at_ms;			/* level 0 = off */
+	bool pr_only_elvdd;			/* DT: only when keyed EE shows ELVDD */
+	bool pr_done;
+	bool pr_active;				/* sleep/display DCS, DSC/PPS allowed */
+	/* one panel command sequence at a time: bright, status, alpm, recovery */
+	struct mutex panel_lock;
 };
 
 /* decon_hw.c: register layer (ported from 4.9 decon_reg.c / dpp_reg.c) */
@@ -262,12 +270,17 @@ int dpu_fmt_bpp(u32 dpp_fmt);
 /* decon_drv.c: DECON-side guard around panel commands */
 int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig);
 void dpu_cmd_window_end(struct dpu_dev *d, u32 trig);
+void dpu_cmd_window_pause(struct dpu_dev *d, u32 trig);	/* frames run, hw_lock kept */
+int dpu_cmd_window_resume(struct dpu_dev *d);
 
 /* dsim_cmd.c: DSIM0 packets (4.9 dsim_write_data / dsim_read_data) */
 int dpu_dsim_check(struct dpu_dev *d);
 void dpu_dsim_clear_status(struct dpu_dev *d);
 int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len);
 int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len);
+int dpu_dsim_lp11_check(struct dpu_dev *d, const char *when);
+int dpu_dsim_enter_lp11(struct dpu_dev *d, bool *hs_was_on);
+int dpu_dsim_leave_lp11(struct dpu_dev *d, bool hs_was_on);
 
 /* panel_bright.c: the 4.9 brightness-44700 sequence */
 int dpu_panel_bright_init(struct dpu_dev *d);
@@ -276,5 +289,9 @@ void dpu_panel_status_work(struct work_struct *work);
 void dpu_panel_status_schedule(struct dpu_dev *d);
 void dpu_panel_alpm_work(struct work_struct *work);
 u32 dpu9810_panel_brightness(void);	/* also used by panel_ro.c */
+
+/* panel_recovery.c: one 4.9 screen off / on cycle (levels 1 and 2) */
+int dpu_panel_recovery_init(struct dpu_dev *d);
+void dpu_panel_recovery_work(struct work_struct *work);
 
 #endif /* __DPU9810_H__ */
