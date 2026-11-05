@@ -117,7 +117,7 @@ int dpu_dsim_check(struct dpu_dev *d)
 	cmdc = dsim_rd(d, DSIM_CMD_CONFIG);
 	isrc = dsim_rd(d, DSIM_INTSRC);
 	imsk = dsim_rd(d, DSIM_INTMSK);
-	pr_info(DPU_PB_PFX "DSIM0: SWRST=%#x CONFIG=%#x CLK_CTRL=%#x ESCMODE=%#x (cmd %s) TIMEOUT=%#x DPHY=%#x LINK1=%#x LINK3=%#x FIFOCTRL=%#x CMD_CONFIG=%#x INTSRC=%#x INTMSK=%#x\n",
+	pb_dbg("DSIM0: SWRST=%#x CONFIG=%#x CLK_CTRL=%#x ESCMODE=%#x (cmd %s) TIMEOUT=%#x DPHY=%#x LINK1=%#x LINK3=%#x FIFOCTRL=%#x CMD_CONFIG=%#x INTSRC=%#x INTMSK=%#x\n",
 		swrst, cfg, clk, esc, esc & DSIM_ESCMODE_CMD_LPDT ? "LP" : "HS",
 		dsim_rd(d, DSIM_TIMEOUT), dphy, dsim_rd(d, DSIM_LINK_STATUS1), l3, fifo, cmdc,
 		isrc, imsk);
@@ -201,7 +201,7 @@ static int dsim_check_errors(struct dpu_dev *d, const char *what, u32 nr)
 
 	if (isrc & DSIM_NOTE_BITS) {
 		d->dsim_nnote++;
-		pr_info(DPU_PB_PFX "%s#%u: note: INTSRC bits %#x (masked and ignored by 4.9; INTSRC=%#x CMD_STATUS=%#x)\n",
+		pb_dbg("%s#%u: note: INTSRC bits %#x (masked and ignored by 4.9; INTSRC=%#x CMD_STATUS=%#x)\n",
 			what, nr, isrc & DSIM_NOTE_BITS, isrc, dsim_rd(d, DSIM_CMD_STATUS));
 		dsim_wr(d, DSIM_INTSRC, isrc & DSIM_NOTE_BITS);
 	}
@@ -222,7 +222,8 @@ int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 {
 	bool is_long = false, dcs = false;
 	u8 d0 = 0, d1 = 0;
-	u32 nr;
+	u32 nr, us;
+	ktime_t t0;
 	int ret;
 
 	if (!d->dsim || !d->cmd_window)
@@ -277,7 +278,7 @@ int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 	}
 
 	nr = ++d->dsim_ntx;
-	pr_info(DPU_PB_PFX "tx#%u dt=%#04x len=%zu: %*ph\n", nr, type, len, (int)len, buf);
+	t0 = ktime_get();
 
 	dsim_wr(d, DSIM_INTSRC, DSIM_INTSRC_SFR_PH_FIFO_EMPTY | DSIM_INTSRC_SFR_PL_FIFO_EMPTY);
 	if (is_long)
@@ -285,15 +286,19 @@ int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 	dsim_tx_header(d, type, d0, d1, false);
 
 	ret = dsim_wait_sfr_empty(d, DSIM_WR_TIMEOUT_US);
+	us = ktime_us_delta(ktime_get(), t0);
+	d->dsim_max_tx_us = max(d->dsim_max_tx_us, us);
 	if (ret) {
 		d->dsim_nerr++;
-		pr_err(DPU_PB_PFX "tx#%u: FIFO did not drain in %u us (FIFOCTRL=%#x INTSRC=%#x)\n",
-		       nr, DSIM_WR_TIMEOUT_US, dsim_rd(d, DSIM_FIFOCTRL), dsim_rd(d, DSIM_INTSRC));
+		pr_err(DPU_PB_PFX "tx#%u dt=%#04x %*ph: FIFO did not drain in %u us (FIFOCTRL=%#x INTSRC=%#x)\n",
+		       nr, type, (int)min_t(size_t, len, 8), buf, us,
+		       dsim_rd(d, DSIM_FIFOCTRL), dsim_rd(d, DSIM_INTSRC));
 		return ret;
 	}
 	ret = dsim_check_errors(d, "tx", nr);
 	if (ret)
 		d->dsim_nerr++;
+	pb_dbg("tx#%u dt=%#04x len=%zu %u us: %*ph\n", nr, type, len, us, (int)len, buf);
 	return ret;
 }
 
@@ -330,6 +335,8 @@ int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len)
 	u32 rx, v, nr, depth = DSIM_RX_FIFO_MAX_DEPTH, drained = 0, hdr = 0;
 	size_t got = 0, i;
 	bool ready;
+	ktime_t t0 = ktime_get();
+	u32 us;
 	int ret;
 
 	if (!d->dsim || !d->cmd_window)
@@ -423,8 +430,8 @@ int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len)
 	}
 	ret = dsim_check_errors(d, "rx", nr);
 	if (!ret)
-		pr_info(DPU_PB_PFX "rx#%u dcs %#04x len=%zu (rx hdr %#x): %*ph\n", nr, cmd, len, hdr,
-			(int)len, buf);
+		pb_dbg("rx#%u dcs %#04x len=%zu %u us (rx hdr %#x): %*ph\n", nr, cmd, len,
+		       (u32)ktime_us_delta(ktime_get(), t0), hdr, (int)len, buf);
 	else if (got)
 		pr_err(DPU_PB_PFX "rx#%u dcs %#04x discarded answer (rx hdr %#x): %*ph\n", nr, cmd, hdr,
 		       (int)got, buf);
@@ -432,5 +439,7 @@ out:
 	if (ret)
 		d->dsim_nerr++;
 	dsim_wr(d, DSIM_INTSRC, DSIM_INTSRC_RX_DATA_DONE);
+	us = ktime_us_delta(ktime_get(), t0);
+	d->dsim_max_rx_us = max(d->dsim_max_rx_us, us);
 	return ret;
 }

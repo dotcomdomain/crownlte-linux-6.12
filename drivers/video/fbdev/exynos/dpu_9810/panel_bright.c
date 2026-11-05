@@ -314,9 +314,9 @@ static int pb_sequence(struct dpu_dev *d)
 		goto fail;
 
 	pb_hbm_to_gamma(hbm, gamma);
-	pr_info(DPU_PB_PFX "HBM gamma (B3[2..35]) %*ph -> CA payload %*ph\n",
+	pb_dbg("HBM gamma (B3[2..35]) %*ph -> CA payload %*ph\n",
 		PB_HBM_GAMMA_LEN, hbm, PB_HBM_GAMMA_LEN, gamma);
-	pr_info(DPU_PB_PFX "ELVSS temp 1 (B5[23]) %#04x\n", et1);
+	pb_dbg("ELVSS temp 1 (B5[23]) %#04x\n", et1);
 	if (d->pb_has_gamma && memcmp(gamma, d->pb_gamma, sizeof(gamma))) {
 		pr_err(DPU_PB_PFX "CA payload differs from the 4.9 gamma[720] in DT %*ph: not writing\n",
 		       PB_HBM_GAMMA_LEN, d->pb_gamma);
@@ -330,10 +330,10 @@ static int pb_sequence(struct dpu_dev *d)
 
 	/* 4. the 4.9 set-bl sequence */
 	n = pb_build(pkt, gamma, et1);
-	pr_info(DPU_PB_PFX "sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets)\n",
+	pb_dbg("sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets)\n",
 		d->pb_target, n);
 	for (i = 0; i < n; i++) {
-		pr_info(DPU_PB_PFX "step %d/%d: %s\n", i + 1, n, pkt[i].what);
+		pb_dbg("step %d/%d: %s\n", i + 1, n, pkt[i].what);
 		ret = pb_write(d, pkt[i].ofs, pkt[i].data, pkt[i].len);
 		if (ret)
 			break;
@@ -352,7 +352,8 @@ static int pb_sequence(struct dpu_dev *d)
 			key2 = false;
 	}
 	if (ret) {
-		pr_warn(DPU_PB_PFX "read-back failed (%d); the sequence itself completed\n", ret);
+		d->pb_readback = "FAILED";
+		pb_dbg("read-back failed (%d); the sequence itself completed\n", ret);
 	} else {
 		bool ok = !memcmp(after.ca, gamma, sizeof(gamma)) &&
 			  after.b1[0] == 0x00 && after.b1[1] == 0x0C &&
@@ -360,13 +361,14 @@ static int pb_sequence(struct dpu_dev *d)
 			  after.f4[0] == 0xEB && after.f4[1] == 0x26 &&
 			  !memcmp(after.b8, pb_irc_value + 1, sizeof(after.b8));
 
-		pr_info(DPU_PB_PFX "read-back %s: CA %s, B1 %*ph -> %*ph, B5 %*ph -> %*ph, F4 %*ph -> %*ph, B8[18..] %*ph -> %*ph\n",
+		d->pb_readback = ok ? "MATCH" : "MISMATCH";
+		pb_dbg("read-back %s: CA %s, B1 %*ph -> %*ph, B5 %*ph -> %*ph, F4 %*ph -> %*ph, B8[18..] %*ph -> %*ph\n",
 			ok ? "MATCH" : "MISMATCH",
 			memcmp(after.ca, gamma, sizeof(gamma)) ? "differs" : "matches",
 			2, before.b1, 2, after.b1, 3, before.b5, 3, after.b5,
 			2, before.f4, 2, after.f4, 17, before.b8, 17, after.b8);
-		pr_info(DPU_PB_PFX "CA before %*ph\n", PB_HBM_GAMMA_LEN, before.ca);
-		pr_info(DPU_PB_PFX "CA after  %*ph\n", PB_HBM_GAMMA_LEN, after.ca);
+		pb_dbg("CA before %*ph\n", PB_HBM_GAMMA_LEN, before.ca);
+		pb_dbg("CA after  %*ph\n", PB_HBM_GAMMA_LEN, after.ca);
 	}
 	return 0;
 
@@ -442,6 +444,7 @@ void dpu_panel_bright_work(struct work_struct *work)
 	}
 	t0 = ktime_get();
 	ret = dpu_dsim_check(d);
+	d->pb_readback = "not run";
 	if (!ret) {
 		dpu_dsim_clear_status(d);
 		ret = pb_sequence(d);
@@ -451,10 +454,9 @@ void dpu_panel_bright_work(struct work_struct *work)
 
 	if (!ret)
 		pb_publish(d->pb_target);
-	pr_info(DPU_PB_PFX "RESULT %s: %d, %u packets sent, %u reads, %u DSIM errors, %u ignored-status notes, window %u us, FRAME_COUNT=%u\n",
-		ret ? "FAIL" : "PASS", ret, d->dsim_ntx, d->dsim_nrx, d->dsim_nerr, d->dsim_nnote, us,
-		dpu_hw_frame_count(d));
-	if (!ret)
-		pr_info(DPU_PB_PFX "the panel should now be at 4.9 brightness %u (720 nit extended HBM); a person must confirm the screen became readable\n",
-			d->pb_target);
+	/* one console line: everything else is KERN_DEBUG (see pb_dbg) */
+	pr_info(DPU_PB_PFX "RESULT %s: %d, brightness %u, read-back %s, %u tx / %u rx, %u DSIM errors, %u notes, window %u us, max tx %u us, max rx %u us, longest TE irq interval %u us\n",
+		ret ? "FAIL" : "PASS", ret, ret ? 0 : d->pb_target, d->pb_readback,
+		d->dsim_ntx, d->dsim_nrx, d->dsim_nerr, d->dsim_nnote, us,
+		d->dsim_max_tx_us, d->dsim_max_rx_us, d->te_gap_max_us);
 }

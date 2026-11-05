@@ -501,8 +501,16 @@ out:
 static irqreturn_t dpu_te_irq(int irq, void *data)
 {
 	struct dpu_dev *d = data;
+	ktime_t now = ktime_get();
 
-	d->vsync_ts = ktime_get();
+	/* the panel keeps sending TE at 60 Hz: a longer gap = IRQs held off */
+	if (READ_ONCE(d->te_gap_track)) {
+		u32 us = ktime_us_delta(now, d->vsync_ts);
+
+		if (us > d->te_gap_max_us)
+			d->te_gap_max_us = us;
+	}
+	d->vsync_ts = now;
 	atomic_inc(&d->te_count);
 	wake_up_interruptible_all(&d->vsync_wait);
 	return IRQ_HANDLED;
@@ -1245,6 +1253,8 @@ int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig)
 		goto err;
 	}
 	*trig = decon_rd(d, HW_SW_TRIG_CONTROL);
+	d->te_gap_max_us = 0;
+	WRITE_ONCE(d->te_gap_track, true);
 	dpu_hw_trigger(d, false);
 
 	fc0 = dpu_hw_frame_count(d);
@@ -1256,12 +1266,13 @@ int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig)
 		fc0 = fc1;
 	}
 	gc = decon_rd(d, GLOBAL_CONTROL);
-	pr_info(DPU_PB_PFX "command window: TRIG %#x -> %#x, FRAME_COUNT %u %s, GLOBAL_CONTROL=%#x (idle %d, run %d)\n",
+	pb_dbg("command window: TRIG %#x -> %#x, FRAME_COUNT %u %s, GLOBAL_CONTROL=%#x (idle %d, run %d)\n",
 		*trig, decon_rd(d, HW_SW_TRIG_CONTROL), fc1,
 		i < DPU_CMD_IDLE_TRIES ? "stable" : "still advancing", gc,
 		!!(gc & GLOBAL_CONTROL_IDLE_STATUS), !!(gc & GLOBAL_CONTROL_RUN_STATUS));
 	if (i == DPU_CMD_IDLE_TRIES) {
 		decon_wr_mask(d, HW_SW_TRIG_CONTROL, *trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+		WRITE_ONCE(d->te_gap_track, false);
 		ret = -EBUSY;
 		goto err;
 	}
@@ -1276,8 +1287,9 @@ void dpu_cmd_window_end(struct dpu_dev *d, u32 trig)
 {
 	d->cmd_window = false;
 	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
-	pr_info(DPU_PB_PFX "command window closed: TRIG=%#x FRAME_COUNT=%u\n",
-		decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d));
+	WRITE_ONCE(d->te_gap_track, false);
+	pb_dbg("command window closed: TRIG=%#x FRAME_COUNT=%u, longest TE irq interval %u us\n",
+	       decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d), d->te_gap_max_us);
 	mutex_unlock(&d->hw_lock);
 }
 

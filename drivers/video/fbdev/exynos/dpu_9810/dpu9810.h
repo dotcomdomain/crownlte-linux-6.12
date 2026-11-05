@@ -29,6 +29,15 @@
 #define DPU_ST_PFX		"decon selftest: "
 #define DPU_PB_PFX		"panel-bright: "
 
+/*
+ * Per-packet panel command logs go to the ring buffer (and /dev/kmsg, so
+ * the serial capture still sees them) at KERN_DEBUG, below the default
+ * console loglevel: legacy consoles write with interrupts off
+ * (kernel/printk/printk.c console_emit_next_record()), and fbcon scrolling
+ * the 1440x2960 fb0 takes tens of ms per line at early boot (trial q46).
+ */
+#define pb_dbg(fmt, ...)	printk(KERN_DEBUG DPU_PB_PFX fmt, ##__VA_ARGS__)
+
 #define DPU_NR_DPP		6
 #define DPU_NR_SYSMMU		3
 
@@ -152,11 +161,16 @@ struct dpu_dev {
 	void __iomem *dsim;
 	bool cmd_window;			/* hw_lock held, trigger masked, no frame */
 	u32 dsim_ntx, dsim_nrx, dsim_nerr, dsim_nnote;
+	u32 dsim_max_tx_us, dsim_max_rx_us;
+	/* IRQ-latency sentinel: longest TE interrupt interval in a window */
+	bool te_gap_track;
+	u32 te_gap_max_us;
 
 	/* fault-display brightness (panel_bright.c), opt-in via DT */
 	struct delayed_work pb_work;
 	u32 pb_target, pb_at_ms;
 	bool pb_enabled, pb_done, pb_has_id, pb_has_gamma;
+	const char *pb_readback;
 	u8 pb_id[3];
 	u8 pb_gamma[34];
 };
