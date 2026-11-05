@@ -310,9 +310,12 @@
 };
 
 /*
- * cpuidle staging, stage B: the C2 driver registers with C2 disarmed on
- * every CPU. At ~90 s the self-test arms C2 on cpu1, then cpu4, then all
- * secondaries (never cpu0), 2.5 s each, and disarms everything afterwards.
+ * cpuidle: the C2 driver registers with C2 disarmed on every CPU. At ~90 s
+ * the self-test checks that LITTLE C2 is refused (no samsung,c2-little-enable:
+ * LITTLE cores were lost in EL3 in q22b/q40/q43), then arms C2 on the BIG
+ * cluster only: big-1/2/3 (1 s each), big-4 (2 s) and big-4-soak (10 s, DT
+ * samsung,cpuidle-selftest-soak-ms), and disarms everything afterwards
+ * (q44 PASS). CPU0 is never armed.
  */
 &cpuidle {
 	samsung,cpuidle-selftest;

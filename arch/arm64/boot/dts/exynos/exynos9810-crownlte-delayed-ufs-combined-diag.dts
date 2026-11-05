@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * COMBINED DIAGNOSTIC (trial q45): every hardware-verified feature of
+ * crownlte-integration-2 enabled at once, each with its self-test.
+ *
+ * Base: exynos9810-crownlte-delayed-ufs-display-s2-bright-diag (q42), which
+ * includes display stage 2 (q39) and the delayed-UFS diagnostic. The base
+ * diag already enables ACPM DVFS/cpufreq/devfreq/TMU, the CL0 watchdog
+ * (armed, pinged, no expiry self-test), the S2MPS18 PMIC/RTC self-test,
+ * Mali (q27b), the SoC ADC + MAX77705 read-only battery (q34) and the MCT
+ * broadcast + BIG-only C2 cpuidle self-test (q21b/q44). This file adds:
+ *  - RTC read latch (q24): one RTC UPDATE RUDR write per time read;
+ *  - G3D power domain in "runtime" mode (q30b/q31c): the PMIC transport
+ *    passes the exact 4.9 G3D rail request, the domain goes off 150 ms
+ *    after kbase powers the GPU off;
+ *  - a 3 s instead of 10 s cpuidle soak, and the brightness sequence moved
+ *    from 96 s to 99 s, so that C2 and the DSIM command path never overlap.
+ *
+ * Off on purpose: Trustonic TEE (q29 verified the start only; no combined
+ * trial may start the secure world), touchscreen (q32: LDO35/LDO43 are off,
+ * the IC does not answer), DPU SysMMU (crownlte-dpu-iommu not merged), the
+ * stage 1 handover helper (replaced by the stage 2 DECON driver), LITTLE C2.
+ *
+ * Self-test schedule (scheduled uptime; printk time runs ~1-1.5 s later):
+ *    86 s   MCT broadcast report
+ *    90 s   cpuidle: LITTLE refusal, big-1..4, 3 s soak (done ~98.5 s)
+ *    99 s   panel brightness 44700 via DSIM0 (~0.4 s, read-back check)
+ *   100 s   cpufreq (both clusters, ~1 s)
+ *   104 s   SoC ADC raw (12 channels); 104.5 s battery thermistors
+ *   105 s   devfreq MIF/INT + ACPM TMU
+ *   106 s   PMIC + RTC (latch on: advance ~1 s over a 1 s sleep)
+ *   107 s   MAX77705 battery
+ *   108 s   DECON A/B flips (20 flips, ~10 s, to ~118 s)
+ *   109 s   Mali (runtime G3D domain: power-up, cache clean, DVFS, ~0.7 s)
+ *   120 s   diag PID1 restart (watchdog restart guard: 30 s, unpetted)
+ * See Documentation/crownlte/integration-2.md.
+ */
+#include "exynos9810-crownlte-delayed-ufs-display-s2-bright-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic, integration-2 combined";
+};
+
+/* q24: RTC read latch; q30b/q31c: the exact 4.9 G3D rail request. */
+&s2mps18_pmic {
+	samsung,rtc-read-latch;
+	samsung,g3d-rail-update;
+};
+
+/* q31c: 4.9-style runtime G3D domain control. */
+&gpu {
+	samsung,g3d-power-control = "runtime";
+	samsung,g3d-off-delay-ms = <150>;
+};
+
+/* q44 phases with a shorter soak: finishes before the brightness work. */
+&cpuidle {
+	samsung,cpuidle-selftest-soak-ms = <3000>;
+};
+
+/* q42 sequence, 3 s later than the bright DTB (after the cpuidle test). */
+&{/panel_drv@001} {
+	samsung,fault-display-brightness-at-ms = <99000>;
+};
+
+/* Explicitly off, whatever the included files say. */
+&trustonic_tee { status = "disabled"; };
+&usi_touch { status = "disabled"; };
+&hsi2c_touch { status = "disabled"; };
+&touchscreen { status = "disabled"; };
+&sysmmu_dpu0 { status = "disabled"; };
+&sysmmu_dpu1 { status = "disabled"; };
+&sysmmu_dpu2 { status = "disabled"; };
+&decon_handover { status = "disabled"; };
