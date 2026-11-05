@@ -15,15 +15,22 @@
  *    in acme get_freq().
  *
  * Samsung's DVFS Manager is not ported. When a samsung,mif-devfreq supplier
- * is present, each CPU level raises MIF through a device PM QoS minimum
- * request before the CPU goes up, as the 4.9 DVFS Manager did. The mif-perf
- * floor is best effort: MIF goes as far as its maximum allows and the CPU
- * still scales. The ECT MINLOCK skew (chipset guidance) is never violated:
- * as 4.9 derived a CPU maximum from the MIF maximum, a policy maximum
- * follows the MIF maximum (exynos9810_mif_work()), and every transition
- * checks the requested level's skew against the MIF rate actually reached
- * and runs the highest level that rate satisfies instead
- * (exynos9810_target_index()). Without a supplier, MIF stays at its
+ * is present, each CPU level raises MIF before the CPU goes up, as the 4.9
+ * DVFS Manager did:
+ *  - the mif-perf floor (with the skew) is a device PM QoS minimum request,
+ *    best effort: MIF goes as far as its maximum allows and the CPU still
+ *    scales;
+ *  - the ECT MINLOCK skew (chipset guidance) of the level the CPU runs is a
+ *    hard floor inside the MIF devfreq driver
+ *    (exynos9810_mif_hard_floor()): MIF is never programmed below it, a MAX
+ *    QoS request cannot override it. It is raised, under the MIF devfreq
+ *    lock, before the CPU goes up and lowered only after the CPU went down;
+ *  - every transition checks the requested level's skew against the MIF
+ *    rate actually reached (CMU readback). If MIF could not get there (a
+ *    failed MIF/INT FREQ_REQ, MIF OPPs disabled) the highest level that
+ *    rate satisfies runs instead, and the request is retried with an
+ *    exponential backoff (100 ms .. 5 s).
+ * Without a supplier, MIF stays at its
  * current rate. In that case every level whose ECT MINLOCK MIF requirement
  * (acme "mif-skew", a chipset guidance constraint) the current MIF rate does
  * not meet is dropped from the table, including when the MIF rate cannot be
@@ -62,6 +69,7 @@
 #include <linux/workqueue.h>
 #include <soc/samsung/cal-if.h>
 #include <soc/samsung/ect_parser.h>
+#include <soc/samsung/exynos9810-devfreq.h>
 
 #define EXYNOS9810_DOMAINS 2
 #define EXYNOS9810_LEVELS 48
@@ -100,9 +108,10 @@ struct exynos9810_domain {
 	struct dev_pm_qos_request mif_request;
 	u32 mif_floor;		/* this domain's MIF request, not a reached rate */
 	/* ECT skew vs. MIF (supplier mode only) */
-	struct freq_qos_request skew_req;	/* policy max from the MIF max */
-	u32 skew_cap_khz;
+	u32 hard_khz;		/* this domain's hard MIF floor (skew) */
 	bool skew_short;	/* last transition ran below the request */
+	unsigned int retry_ms;	/* backoff of the re-request after a cap */
+	struct delayed_work retry_work;
 };
 
 struct exynos9810_cpufreq {
@@ -111,9 +120,6 @@ struct exynos9810_cpufreq {
 	u32 mif_cal_id;
 	unsigned long mif_static_khz;
 	struct exynos9810_domain domains[EXYNOS9810_DOMAINS];
-	struct notifier_block mif_max_nb;	/* MIF DEV_PM_QOS_MAX_FREQUENCY */
-	struct delayed_work mif_work;		/* exynos9810_mif_work() */
-	struct mutex skew_lock;			/* skew_req add/update */
 };
 
 static struct exynos9810_cpufreq *provider;
@@ -206,53 +212,30 @@ static struct exynos9810_domain *exynos9810_find_domain(unsigned int cpu)
 	return NULL;
 }
 
-/* MIF devfreq lock held: CMU readback, else devfreq's last set rate */
-static unsigned long exynos9810_mif_khz_locked(struct devfreq *mif)
-{
-	unsigned long hz = 0;
-
-	/* CAL reads 0 while the CMU is changing state (acme get_freq()) */
-	if (mif->profile->get_cur_freq(mif->dev.parent, &hz) || !hz)
-		hz = mif->previous_freq;
-	return hz / 1000;
-}
-
-static unsigned long exynos9810_mif_now(void)
-{
-	struct devfreq *mif = provider->mif;
-	unsigned long khz;
-
-	mutex_lock(&mif->lock);
-	khz = exynos9810_mif_khz_locked(mif);
-	mutex_unlock(&mif->lock);
-	return khz;
-}
-
 /*
- * Set this domain's MIF minimum request to @floor kHz, run a MIF update
- * (also when the request did not change, so a failed MIF/INT update is
- * retried) and report the MIF rate that results. The 4.9 DVFS Manager
- * ignored the MIF scaler's result; here the caller compares the reached
- * rate with what the CPU level needs. Only a rejected QoS request (a
- * driver bug) returns an error.
+ * Set this domain's MIF demands and report the MIF rate reached, in kHz.
+ * @floor is the device PM QoS minimum (mif-perf and skew, best effort);
+ * @hard is the hard floor inside the MIF devfreq driver (the skew of the
+ * level the CPU runs or is about to run), which a MAX QoS request cannot
+ * undercut. exynos9810_mif_hard_floor() applies it synchronously under the
+ * MIF devfreq lock and re-runs the MIF update even if nothing changed, so a
+ * failed MIF/INT FREQ_REQ is retried; the devfreq driver logs MIF failures,
+ * the caller judges the reached rate. Only a rejected request (a driver
+ * bug) returns an error.
  */
-static int exynos9810_set_mif_floor(struct exynos9810_domain *domain, u32 floor,
-				    unsigned long *mif_khz)
+static int exynos9810_set_mif(struct exynos9810_domain *domain, u32 floor, u32 hard,
+			      unsigned long *mif_khz)
 {
-	struct devfreq *mif = provider->mif;
 	int ret;
 
 	ret = dev_pm_qos_update_request(&domain->mif_request, floor);
 	if (ret < 0)
 		return ret;
 	domain->mif_floor = floor;
-	mutex_lock(&mif->lock);
-	ret = update_devfreq(mif);
-	*mif_khz = exynos9810_mif_khz_locked(mif);
-	mutex_unlock(&mif->lock);
+	ret = exynos9810_mif_hard_floor(provider->mif, domain->id, hard, mif_khz);
 	if (ret)
-		dev_warn_ratelimited(provider->dev, "domain%u: MIF update for a %u kHz floor failed: %d\n",
-				     domain->id, floor, ret);
+		return ret;
+	domain->hard_khz = hard;
 	return 0;
 }
 
@@ -271,20 +254,41 @@ static unsigned int exynos9810_skew_safe(const struct exynos9810_domain *domain,
 	return domain->levels - 1;
 }
 
-#define EXYNOS9810_SKEW_RETRY_MS	100
+#define EXYNOS9810_RETRY_MIN_MS	100
+#define EXYNOS9810_RETRY_MAX_MS	5000
 
 /*
  * A transition ran below the governor's request because MIF had not reached
  * the requested level's skew. schedutil does not repeat a request for the
- * frequency it already asked for, so exynos9810_mif_work() refreshes the
- * policy limits (CPUFREQ_NEED_UPDATE_LIMITS) and the request comes back.
+ * frequency it already asked for, so a delayed work refreshes the policy
+ * limits (CPUFREQ_NEED_UPDATE_LIMITS) and the request comes back. The delay
+ * doubles from 100 ms to 5 s while the shortfall lasts and resets once a
+ * transition runs the requested level.
  */
 static void exynos9810_skew_short(struct exynos9810_domain *domain, bool short_now)
 {
 	WRITE_ONCE(domain->skew_short, short_now);
-	if (short_now)
-		queue_delayed_work(system_wq, &provider->mif_work,
-				   msecs_to_jiffies(EXYNOS9810_SKEW_RETRY_MS));
+	if (!short_now) {
+		domain->retry_ms = 0;
+		return;
+	}
+	if (delayed_work_pending(&domain->retry_work))
+		return;
+	domain->retry_ms = domain->retry_ms ?
+			   min(domain->retry_ms * 2, EXYNOS9810_RETRY_MAX_MS) :
+			   EXYNOS9810_RETRY_MIN_MS;
+	queue_delayed_work(system_wq, &domain->retry_work,
+			   msecs_to_jiffies(domain->retry_ms));
+}
+
+static void exynos9810_retry_work(struct work_struct *work)
+{
+	struct exynos9810_domain *domain =
+		container_of(to_delayed_work(work), struct exynos9810_domain, retry_work);
+	unsigned int cpu = cpumask_first_and(&domain->cpus, cpu_online_mask);
+
+	if (READ_ONCE(domain->skew_short) && cpu < nr_cpu_ids)
+		cpufreq_update_limits(cpu);
 }
 
 static int exynos9810_target_index(struct cpufreq_policy *policy,
@@ -292,7 +296,7 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 {
 	struct exynos9810_domain *domain = policy->driver_data;
 	struct cpufreq_freqs freqs = { .old = policy->cur, .flags = 0 };
-	u32 old_floor = domain->mif_floor;
+	u32 old_floor = domain->mif_floor, old_hard = domain->hard_khz;
 	u32 new_floor = 0;
 	unsigned int pick = index;
 	unsigned long mif_khz;
@@ -302,26 +306,21 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 		return -EINVAL;
 	if (provider->mif) {
 		new_floor = domain->mif_khz[index];
-		/* Raise dependent MIF first, then ask firmware to raise the CPU. */
-		if (new_floor > old_floor) {
-			ret = exynos9810_set_mif_floor(domain, new_floor, &mif_khz);
-			if (ret)
-				return ret;
-		} else {
-			mif_khz = exynos9810_mif_now();
-			/* the request is in place; a MIF/INT update may have failed */
-			if (mif_khz < domain->skew_khz[index]) {
-				ret = exynos9810_set_mif_floor(domain, old_floor, &mif_khz);
-				if (ret)
-					return ret;
-			}
-		}
 		/*
-		 * Every target, whether its request raised MIF or not: the
-		 * ECT skew is checked against the MIF rate actually reached.
-		 * Short of it, run the highest level that rate satisfies (the
-		 * 4.9 DVFS Manager's CPU maximum from the MIF side) and keep
-		 * the request, so MIF can still get there.
+		 * Before the CPU moves, only raise: the QoS minimum to this
+		 * level's floor and the hard floor to its skew. The MIF update
+		 * runs on every target, raised or not, so the decision below
+		 * uses the rate MIF actually reached.
+		 */
+		ret = exynos9810_set_mif(domain, max(old_floor, new_floor),
+					 max_t(u32, old_hard, domain->skew_khz[index]),
+					 &mif_khz);
+		if (ret)
+			return ret;
+		/*
+		 * Short of the skew (a failed MIF/INT FREQ_REQ, MIF OPPs not
+		 * available): run the highest level the reached rate satisfies,
+		 * as the 4.9 DVFS Manager's CPU maximum from the MIF side did.
 		 */
 		pick = exynos9810_skew_safe(domain, index, mif_khz);
 		if (pick != index)
@@ -332,125 +331,56 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 		exynos9810_skew_short(domain, pick != index);
 	}
 	freqs.new = domain->table[pick].frequency;
-	if (freqs.new == policy->cur)
-		return 0;	/* capped to the level it already runs */
-
-	/* CPUFREQ_ASYNC_NOTIFICATION: notify the level actually programmed */
-	cpufreq_freq_transition_begin(policy, &freqs);
-	ret = cal_dfs_set_rate(domain->cal_id, freqs.new);
-	if (ret) {
-		/*
-		 * A failed firmware acknowledgement does not prove that the CPU
-		 * stayed at its previous rate. Keep any raised MIF floor.
-		 */
-		pr_err_ratelimited("exynos9810-cpufreq: domain%u FREQ_REQ %u kHz failed: %d\n",
-				   domain->id, freqs.new, ret);
-		ret = ret > 0 ? -EIO : ret;
-	} else {
-		WRITE_ONCE(domain->last_khz, freqs.new);
+	if (freqs.new != policy->cur) {
+		/* CPUFREQ_ASYNC_NOTIFICATION: notify the level actually programmed */
+		cpufreq_freq_transition_begin(policy, &freqs);
+		ret = cal_dfs_set_rate(domain->cal_id, freqs.new);
+		if (ret) {
+			/*
+			 * A failed firmware acknowledgement does not prove that
+			 * the CPU stayed at its previous rate. Keep the raised
+			 * MIF floors.
+			 */
+			pr_err_ratelimited("exynos9810-cpufreq: domain%u FREQ_REQ %u kHz failed: %d\n",
+					   domain->id, freqs.new, ret);
+			ret = ret > 0 ? -EIO : ret;
+		} else {
+			WRITE_ONCE(domain->last_khz, freqs.new);
+		}
+		cpufreq_freq_transition_end(policy, &freqs, ret);
+		if (ret)
+			return ret;
 	}
-	cpufreq_freq_transition_end(policy, &freqs, ret);
-	if (ret)
-		return ret;
 	/*
-	 * The CPU runs the requested level: a lower floor only releases MIF,
-	 * and that level's skew is part of the floor. While capped, the
-	 * higher request stays.
+	 * The CPU runs table[pick] now: the hard floor drops to its skew. The
+	 * QoS minimum drops to the requested level's floor once that level
+	 * runs; while capped the higher request stays, so MIF can still get
+	 * there.
 	 */
-	if (provider->mif && pick == index && new_floor < old_floor) {
-		ret = exynos9810_set_mif_floor(domain, new_floor, &mif_khz);
+	if (provider->mif) {
+		ret = exynos9810_set_mif(domain,
+					 pick == index ? new_floor : max(old_floor, new_floor),
+					 domain->skew_khz[pick], &mif_khz);
 		if (ret)
 			dev_warn_ratelimited(provider->dev, "MIF floor release failed: %d\n", ret);
 	}
 	return 0;
 }
 
-/* ---- ECT skew: CPU policy maximum from the MIF maximum (4.9 DM) ------- */
-
-/* the highest rate MIF may run: devfreq OPP range and MAX QoS requests */
-static unsigned long exynos9810_mif_max_khz(void)
-{
-	struct devfreq *mif = provider->mif;
-	unsigned long hz;
-	s32 qos;
-
-	mutex_lock(&mif->lock);
-	hz = mif->scaling_max_freq;
-	mutex_unlock(&mif->lock);
-	qos = dev_pm_qos_read_value(mif->dev.parent, DEV_PM_QOS_MAX_FREQUENCY);
-	if (qos >= 0 && qos != PM_QOS_MAX_FREQUENCY_DEFAULT_VALUE)
-		hz = min(hz, (unsigned long)qos * 1000);
-	return hz / 1000;
-}
-
 /*
- * 4.9 register_exynos_dm_constraint_table() turned every "guidance" (skew)
- * MIN constraint into a MAX constraint on the CPU domain: the highest CPU
- * rate whose skew the MIF maximum still allows. The same here as a
- * freq_qos maximum on the policy, so the governor never asks for a level
- * MIF cannot serve. skew_lock held.
+ * Drop this domain's MIF demands. For ->exit (the last CPU of the cluster
+ * went offline, or the policy is torn down after its ->init succeeded) and
+ * for a failed ->init.
  */
-static void exynos9810_skew_cap_update(struct exynos9810_domain *domain,
-				       unsigned long mif_max_khz)
+static void exynos9810_domain_release(struct exynos9810_domain *domain)
 {
-	u32 cap = domain->table[exynos9810_skew_safe(domain, 0, mif_max_khz)].frequency;
-	int ret;
+	unsigned long mif_khz;
 
-	if (!freq_qos_request_active(&domain->skew_req) || cap == domain->skew_cap_khz)
-		return;
-	ret = freq_qos_update_request(&domain->skew_req, cap);
-	if (ret < 0) {
-		dev_warn(provider->dev, "domain%u: skew cap %u kHz failed: %d\n",
-			 domain->id, cap, ret);
-		return;
-	}
-	dev_info(provider->dev, "domain%u: MIF max %lu kHz, CPU max %u kHz (ECT skew)\n",
-		 domain->id, mif_max_khz, cap);
-	domain->skew_cap_khz = cap;
-}
-
-static void exynos9810_mif_work(struct work_struct *work)
-{
-	unsigned long mif_max;
-	unsigned int i, cpu;
-
-	/* queued by the MIF max notifier before the driver registered */
-	if (!smp_load_acquire(&provider))
-		return;
-	mif_max = exynos9810_mif_max_khz();
-	for (i = 0; i < EXYNOS9810_DOMAINS; i++) {
-		struct exynos9810_domain *domain = &provider->domains[i];
-
-		if (!domain->levels)
-			continue;
-		mutex_lock(&provider->skew_lock);
-		exynos9810_skew_cap_update(domain, mif_max);
-		mutex_unlock(&provider->skew_lock);
-		/* re-issue the governor's request after a capped transition */
-		cpu = cpumask_first_and(&domain->cpus, cpu_online_mask);
-		if (READ_ONCE(domain->skew_short) && cpu < nr_cpu_ids)
-			cpufreq_update_limits(cpu);
-	}
-}
-
-/* MIF DEV_PM_QOS_MAX_FREQUENCY changed (devfreq max_freq, other caps) */
-static int exynos9810_mif_max_notify(struct notifier_block *nb,
-				     unsigned long value, void *data)
-{
-	struct exynos9810_cpufreq *state = container_of(nb, struct exynos9810_cpufreq,
-							mif_max_nb);
-
-	mod_delayed_work(system_wq, &state->mif_work, 0);
-	return NOTIFY_OK;
-}
-
-static void exynos9810_mif_max_unregister(void *data)
-{
-	struct exynos9810_cpufreq *state = data;
-
-	dev_pm_qos_remove_notifier(state->mif->dev.parent, &state->mif_max_nb,
-				   DEV_PM_QOS_MAX_FREQUENCY);
-	cancel_delayed_work_sync(&state->mif_work);
+	cancel_delayed_work(&domain->retry_work);
+	WRITE_ONCE(domain->skew_short, false);
+	domain->retry_ms = 0;
+	if (provider->mif && dev_pm_qos_request_active(&domain->mif_request))
+		exynos9810_set_mif(domain, 0, 0, &mif_khz);
 }
 
 static unsigned int exynos9810_domain_get(struct exynos9810_domain *domain)
@@ -471,17 +401,15 @@ static unsigned int exynos9810_get(unsigned int cpu)
 	return domain ? exynos9810_domain_get(domain) : 0;
 }
 
-static int exynos9810_policy_init(struct cpufreq_policy *policy)
+static int __exynos9810_policy_init(struct cpufreq_policy *policy,
+				    struct exynos9810_domain *domain)
 {
-	struct exynos9810_domain *domain = exynos9810_find_domain(policy->cpu);
 	unsigned int rate, target, ti, i;
 	bool listed = false;
 	unsigned long mif_khz;
-	u32 floor = 0;
+	u32 floor = 0, hard = 0;
 	int ret;
 
-	if (!domain || !domain->levels)
-		return -ENODEV;
 	rate = exynos9810_domain_get(domain);
 	if (!rate)
 		return -EIO;
@@ -497,15 +425,17 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 	}
 	target = domain->table[ti].frequency;
 	if (provider->mif) {
-		/* Floor for the current rate; the highest one if it is not listed. */
+		/* Floors of the current rate; the highest ones if it is not listed. */
 		for (i = 0; i < domain->levels; i++) {
 			if (domain->table[i].frequency == rate) {
 				floor = domain->mif_khz[i];
+				hard = domain->skew_khz[i];
 				break;
 			}
 			floor = max(floor, domain->mif_khz[i]);
+			hard = max(hard, domain->skew_khz[i]);
 		}
-		ret = exynos9810_set_mif_floor(domain, floor, &mif_khz);
+		ret = exynos9810_set_mif(domain, floor, hard, &mif_khz);
 		if (ret)
 			return ret;
 		if (mif_khz < floor)
@@ -540,6 +470,13 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 		WRITE_ONCE(domain->last_khz, target);
 		rate = target;
 	}
+	/* the CPU runs table[ti]: its own floors only */
+	if (provider->mif) {
+		ret = exynos9810_set_mif(domain, domain->mif_khz[ti],
+					 domain->skew_khz[ti], &mif_khz);
+		if (ret)
+			return ret;
+	}
 	cpumask_copy(policy->cpus, &domain->cpus);
 	policy->driver_data = domain;
 	policy->freq_table = domain->table;
@@ -548,6 +485,43 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 	policy->cpuinfo.transition_latency = EXYNOS9810_TRANSITION_NS;
 	policy->dvfs_possible_from_any_cpu = true;
 	return 0;
+}
+
+static int exynos9810_policy_init(struct cpufreq_policy *policy)
+{
+	struct exynos9810_domain *domain = exynos9810_find_domain(policy->cpu);
+	int ret;
+
+	if (!domain || !domain->levels)
+		return -ENODEV;
+	ret = __exynos9810_policy_init(policy, domain);
+	if (!ret)
+		return 0;
+	/*
+	 * cpufreq_online() frees the policy after a failed ->init, also an
+	 * inactive one coming back online (out_free_policy). Leave nothing
+	 * behind: drop the MIF demands, and unregister the cooling device
+	 * that a previous ->ready attached to this policy (it holds a freq_qos
+	 * request on the policy's constraints). A later successful online
+	 * registers a new one under the same name.
+	 */
+	exynos9810_domain_release(domain);
+	if (policy->cdev) {
+		dev_warn(provider->dev, "domain%u: re-init failed (%d): cooling device %s unregistered with the policy\n",
+			 domain->id, ret, policy->cdev->type);
+		cpufreq_cooling_unregister(policy->cdev);
+		policy->cdev = NULL;
+	}
+	return ret;
+}
+
+/* the last CPU of the cluster went offline (or a post-init step failed) */
+static void exynos9810_policy_exit(struct cpufreq_policy *policy)
+{
+	struct exynos9810_domain *domain = policy->driver_data;
+
+	if (domain)
+		exynos9810_domain_release(domain);
 }
 
 /* 4.9 cpu_cooling.c name for acme domain N: "thermal-cpufreq-N". */
@@ -561,8 +535,9 @@ static void exynos9810_cooling_register(struct cpufreq_policy *policy,
 	 * ->ready also runs when an inactive policy comes back online; the
 	 * device stays registered across CPU offline (as the core's own
 	 * CPUFREQ_IS_COOLING_DEV device does), so the cdev-by-name links made
-	 * once at boot stay valid. There is no ->exit: the driver is built in
-	 * and never unregistered, so a policy is never freed under it.
+	 * once at boot stay valid. The policy object survives offline; only a
+	 * failed ->init frees it, and exynos9810_policy_init() unregisters the
+	 * device first.
 	 */
 	if (policy->cdev)
 		return;
@@ -586,21 +561,6 @@ static void exynos9810_policy_ready(struct cpufreq_policy *policy)
 
 	exynos9810_cooling_register(policy, domain);
 
-	/* ECT skew cap; ->ready also runs when the policy comes back online */
-	if (provider->mif) {
-		mutex_lock(&provider->skew_lock);
-		if (!freq_qos_request_active(&domain->skew_req)) {
-			domain->skew_cap_khz = domain->table[0].frequency;
-			ret = freq_qos_add_request(&policy->constraints, &domain->skew_req,
-						   FREQ_QOS_MAX, domain->skew_cap_khz);
-			if (ret < 0)
-				dev_warn(provider->dev, "domain%u: skew cap request: %d\n",
-					 domain->id, ret);
-		}
-		mutex_unlock(&provider->skew_lock);
-		mod_delayed_work(system_wq, &provider->mif_work, 0);
-	}
-
 	/*
 	 * acme set_policy(): policy-max is the initial user policy maximum.
 	 * A later scaling_max_freq write can replace it, up to the table max.
@@ -623,7 +583,7 @@ static struct cpufreq_driver exynos9810_driver = {
 	 * ASYNC_NOTIFICATION: target_index() may program a lower level than
 	 * asked (ECT skew) and notifies the level it programmed.
 	 * NEED_UPDATE_LIMITS: after such a cap, a limits refresh brings the
-	 * governor's unchanged request back (exynos9810_mif_work()).
+	 * governor's unchanged request back (exynos9810_retry_work()).
 	 */
 	.flags = CPUFREQ_ASYNC_NOTIFICATION | CPUFREQ_NEED_UPDATE_LIMITS,
 	/* No CPUFREQ_IS_COOLING_DEV: see exynos9810_cooling_register(). */
@@ -631,6 +591,7 @@ static struct cpufreq_driver exynos9810_driver = {
 	.target_index = exynos9810_target_index,
 	.get = exynos9810_get,
 	.init = exynos9810_policy_init,
+	.exit = exynos9810_policy_exit,
 	.ready = exynos9810_policy_ready,
 	.suspend = cpufreq_generic_suspend,
 	.attr = exynos9810_attrs,
@@ -1134,24 +1095,20 @@ static int exynos9810_cpufreq_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	for (id = 0; id < EXYNOS9810_DOMAINS; id++)
+		INIT_DELAYED_WORK(&state->domains[id].retry_work, exynos9810_retry_work);
 	if (of_property_present(dev->of_node, "samsung,mif-devfreq")) {
 		ret = exynos9810_get_mif_supplier(state);
 		if (ret) {
 			exynos9810_note(ret, "MIF devfreq supplier");
 			return dev_err_probe(dev, ret, "MIF devfreq supplier unavailable\n");
 		}
-		INIT_DELAYED_WORK(&state->mif_work, exynos9810_mif_work);
-		mutex_init(&state->skew_lock);
-		state->mif_max_nb.notifier_call = exynos9810_mif_max_notify;
-		ret = dev_pm_qos_add_notifier(state->mif->dev.parent, &state->mif_max_nb,
-					      DEV_PM_QOS_MAX_FREQUENCY);
+		/* the skew is a hard floor in the Exynos9810 MIF devfreq driver */
+		ret = exynos9810_mif_hard_floor(state->mif, 0, 0, NULL);
 		if (ret) {
-			exynos9810_note(ret, "MIF max notifier");
-			return dev_err_probe(dev, ret, "MIF max notifier\n");
+			exynos9810_note(ret, "MIF hard floor");
+			return dev_err_probe(dev, ret, "samsung,mif-devfreq is not the Exynos9810 MIF devfreq\n");
 		}
-		ret = devm_add_action_or_reset(dev, exynos9810_mif_max_unregister, state);
-		if (ret)
-			return ret;
 	} else if (!of_property_read_u32(dev->of_node, "samsung,mif-cal-id",
 					 &state->mif_cal_id)) {
 		state->mif_static_khz = cal_dfs_get_rate(state->mif_cal_id);
