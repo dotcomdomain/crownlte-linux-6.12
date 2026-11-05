@@ -90,8 +90,21 @@ through that one IOVA space. Here all three are in decon_f's `iommus` and share 
   out their existing DMA address: identity IOVA for fb0, the IOVA `dma_alloc_wc()` returned for
   the others.
 - Fault handler (`dpu_iommu_fault`, hard IRQ): count, remember the IOVA, mask the TE trigger
-  under `trig_lock` (all trigger read-modify-writes, including the panel command window, now
-  take it), log. The next commit unmasks the trigger.
+  and latch `trig_fault_inhibit` under `trig_lock` (all trigger read-modify-writes, including
+  the panel command window, take it), log. While the inhibit is set, every restore of a saved
+  trigger value (command window end or idle timeout, adopt, SysMMU enable) keeps the trigger
+  masked; only a commit's own unmask in `dpu_apply()` clears it.
+- Recovery: if the fault masked the trigger while a shadow update waited for it, that update
+  could never latch and every later frame would stop at the pending-update wait. The commit
+  path (`dpu_process()`) then unmasks once, lets the pending update latch (up to 100 ms) and logs
+  `pending shadow update held by a SysMMU fault mask: one unmask, latched (recovery #n)`. The
+  pending frame is `d->active` and the frame before it stays on `d->stale` until the latch is
+  seen, so their IOVAs stay mapped throughout.
+- Probe requires `iommus` to name exactly sysmmu_dpu0..2 (0x160a0000/0x160b0000/0x160c0000,
+  each once) with a read-only view of each, and all three translating after the runtime resume
+  (CTRL readback 0x7). Anything else fails the probe: with `iommus` the device's DMA ops are
+  iommu-dma, so even the bounce path would hand out IOVAs. The DTB without `iommus` is the
+  fallback.
 
 ## Test DTB: exynos9810-crownlte-romram-iommu.dtb vs exynos9810-crownlte-romram-v18.dtb
 
@@ -131,10 +144,12 @@ wizard), with no copy latency.
 | Log | Meaning |
 |---|---|
 | `power domain off (PMU 0x4024 …)` | DPU domain off at SysMMU probe; no SFR touched |
-| `translation already enabled by the bootloader` | SBoot used a SysMMU: refused, decon_f then has no IOMMU |
+| `translation already enabled by the bootloader` | SBoot used a SysMMU: that SysMMU is refused, so DECON finds fewer than three translating and refuses to probe |
+| `decon iommu: "iommus" lists N SysMMUs` / `iommus[i] at …: not a DPU SysMMU / listed twice / no read-only view` | DT does not name sysmmu_dpu0..2 exactly once each: DECON refuses to probe, SysMMUs return to bypass, splash stays |
 | `decon iommu: boot fb IOVA … not identity` | `iommu-addresses` not applied: DECON refuses to probe, SysMMUs return to bypass, splash stays |
 | `decon iommu: SysMMUs 0x… of 0x7 translating` | runtime PM/device link did not enable all three: DECON refuses |
 | `decon iommu: SysMMU read fault #n at IOVA …` + `TE trigger masked` | a buffer was unmapped while scanned (lifetime bug); the panel freezes on its last frame until the next commit |
+| `decon iommu: pending shadow update held by a SysMMU fault mask: one unmask, …` | recovery of an update the fault mask had blocked; `still pending` means the frame was skipped and the next commit tries again |
 | `decon iommu: no IOVA for a …-byte dma-buf (…)` | mapping failed; that frame bounces as before |
 
 ## Not ported from crownlte-dpu-iommu
