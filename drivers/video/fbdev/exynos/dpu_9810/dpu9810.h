@@ -98,7 +98,7 @@ struct dpu_commit {
 	struct dma_fence *fence;	/* retire = release fence, may be NULL */
 	unsigned int nr_win;
 	bool internal;			/* kernel-owned buffers (fb, self-test) */
-	bool bounced;			/* a window scans d->bounce[d->bounce_next] */
+	unsigned long bounced;		/* window i scans d->bounce[i][d->bounce_next[i]] */
 	ktime_t queued;
 	u32 latch_us;			/* filled by the worker */
 	u32 fc_before, fc_after;
@@ -153,8 +153,8 @@ struct dpu_dev {
 	spinlock_t fence_lock;
 	u32 nr_commits, nr_latch_timeouts, nr_rejects;
 	u32 nr_base_mismatch;			/* active IDMA base != programmed */
-	struct dpu_bounce bounce[2];
-	int bounce_next;
+	struct dpu_bounce bounce[DECON_MAX_WIN][2];	/* per window, double buffered */
+	u8 bounce_next[DECON_MAX_WIN];
 	u32 nr_bounces, bounce_max_us, nr_afbc;
 	bool diag_latched;			/* first user commit logged */
 	u32 hwc_ver;

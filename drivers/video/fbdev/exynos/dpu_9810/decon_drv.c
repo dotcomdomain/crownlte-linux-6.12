@@ -227,9 +227,13 @@ static int dpu_bounce_copy_vmap(struct dpu_buf *b, void *dst)
  * (stopgap until the DPU SysMMU, branch crownlte-dpu-iommu, is merged). An
  * AFBC stream is position independent relative to its base, so a byte copy
  * scans out identically. Runs in the update worker after the acquire fences,
- * outside hw_lock. The buffer not used by the last latched commit is written,
- * so the one being scanned is never touched. At most one window per commit
- * is bounced (dpu_build_commit()).
+ * outside hw_lock. Every window has its own pair of slots, sized to its
+ * buffer (ROM-in-RAM v12: the status bar, a second scattered layer, was
+ * rejected and with it every frame after boot); the slot not used by the
+ * window in the last latched commit is written, so the one being scanned is
+ * never touched. Budget: decon-pool is 48 MiB, the full-screen AFBC client
+ * target takes 2 x 17.3 MB, bars a few hundred KiB each; a window whose slot
+ * cannot be allocated fails the frame with a log line.
  */
 static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 {
@@ -237,7 +241,7 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		struct dpu_buf *b = &c->buf[i];
-		struct dpu_bounce *t = &d->bounce[d->bounce_next];
+		struct dpu_bounce *t = &d->bounce[i][d->bounce_next[i]];
 		ktime_t t0 = ktime_get();
 		u32 us, inval_us = 0;
 		const char *path = "linear map";
@@ -250,16 +254,16 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 			t->size = PAGE_ALIGN(b->len);
 			t->vaddr = dma_alloc_wc(d->dev, t->size, &t->dma, GFP_KERNEL);
 			if (!t->vaddr || upper_32_bits(t->dma + t->size - 1)) {
-				dev_err_ratelimited(d->dev, "bounce buffer %d: cannot allocate %zu bytes below 4 GiB from decon-pool\n",
-						    d->bounce_next, t->size);
+				dev_err_ratelimited(d->dev, "win%d bounce buffer %d: cannot allocate %zu bytes below 4 GiB from decon-pool\n",
+						    i, d->bounce_next[i], t->size);
 				if (t->vaddr)
 					dma_free_wc(d->dev, t->size, t->vaddr, t->dma);
 				t->vaddr = NULL;
 				t->size = 0;
 				return -ENOMEM;
 			}
-			dev_info(d->dev, "bounce buffer %d: %zu bytes at %pad\n",
-				 d->bounce_next, t->size, &t->dma);
+			dev_info(d->dev, "win%d bounce buffer %d: %zu bytes at %pad\n",
+				 i, d->bounce_next[i], t->size, &t->dma);
 		}
 		ret = b->sgt ? dpu_bounce_copy_sg(d, b, t->vaddr, &inval_us) : -ENOENT;
 		if (ret == -ENOENT) {
@@ -273,7 +277,7 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 		}
 		wmb();
 		b->addr = t->dma;
-		c->bounced = true;	/* dpu_process() flips bounce_next once latched */
+		c->bounced |= BIT(i);	/* dpu_process() flips bounce_next[i] once latched */
 		us = ktime_us_delta(ktime_get(), t0);
 		d->bounce_max_us = max(d->bounce_max_us, us);
 		if (!d->nr_bounces++ || us > 40000)
@@ -349,7 +353,7 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 {
 	struct dpu_commit *c = kzalloc(sizeof(*c), GFP_KERNEL);
 	unsigned long used = 0;
-	int i, ret = 0, nbounce = 0;
+	int i, ret = 0;
 	const char *why = NULL;
 
 	if (!c) {
@@ -413,11 +417,6 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 			ret = dpu_buf_import(d, db, &c->buf[i], need, !kbufs, &why);
 			if (ret)
 				break;
-			if (c->buf[i].bounce && ++nbounce > 1) {
-				why = "more than one scattered buffer (only one bounce copy per frame)";
-				ret = -EINVAL;
-				break;
-			}
 			if (w->compression)
 				d->nr_afbc++;
 			if (!kbufs && w->acq_fence >= 0) {
@@ -539,7 +538,7 @@ static u32 decon_rd_shd(struct dpu_dev *d, u32 off)
 static void dpu_diag_content(struct dpu_dev *d, struct dpu_commit *c, int win)
 {
 	const struct decon_win_config *w = &c->cfg[win];
-	const u8 *p = d->bounce[d->bounce_next].vaddr;
+	const u8 *p = d->bounce[win][d->bounce_next[win]].vaddr;
 	size_t len = c->buf[win].len, n64 = min_t(size_t, len, SZ_64K), i;
 	u32 crc = crc32_le(~0U, p, n64);
 
@@ -670,8 +669,9 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	if (!c->result && !c->internal)
 		dpu_diag(d, c);		/* before bounce_next moves on */
 	/* the bounce buffer just written is now (or may be) scanned */
-	if (c->bounced && (c->result == 0 || c->result == -ETIMEDOUT))
-		d->bounce_next ^= 1;
+	if (c->result == 0 || c->result == -ETIMEDOUT)
+		for_each_set_bit(i, &c->bounced, DECON_MAX_WIN)
+			d->bounce_next[i] ^= 1;
 
 	if (c->fence) {
 		if (c->result)
