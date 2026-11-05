@@ -1746,6 +1746,13 @@ static int dpu_mx_thread(void *data)
 		w->src.h = w->src.f_h = w->dst.h = w->dst.f_h = d->lcd.yres;
 		ret = dpu_kcommit_win(d, wd, win, buf[n], &us);
 		dpu_mx_log(d, s->name, win, dpp, ret, us, want);
+		/*
+		 * Any failure, latch timeout included, may leave either buffer
+		 * scanned or referenced by a pending update: never draw again,
+		 * restore fb0 now.
+		 */
+		if (ret)
+			goto restore;
 		n ^= 1;
 	}
 	dpu_mx_wait(d, t0 + ARRAY_SIZE(dpu_mx_steps) * DPU_MX_STEP_MS);
