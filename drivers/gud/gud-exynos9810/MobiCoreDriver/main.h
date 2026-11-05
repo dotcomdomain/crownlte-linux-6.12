@@ -94,6 +94,9 @@ struct kasnprintf_buf {
 /* Wait for TEE to start and get status */
 int mc_wait_tee_start(void);
 
+/* crownlte: true only once mobicore_start() has fully succeeded */
+bool mc_tee_started(void);
+
 extern __printf(2, 3)
 int kasnprintf(struct kasnprintf_buf *buf, const char *fmt, ...);
 ssize_t debug_generic_read(struct file *file, char __user *user_buf,

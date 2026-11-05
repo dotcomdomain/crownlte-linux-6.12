@@ -37,4 +37,18 @@ void mc_fastcall_exit(void);
 
 int mc_fastcall_debug_smclog(struct kasnprintf_buf *buf);
 
+/* crownlte: per-command fastcall counters for the boot self-test */
+enum mc_fc_count_id {
+	MC_FC_COUNT_INIT,
+	MC_FC_COUNT_INFO,
+	MC_FC_COUNT_MEM_TRACE,
+	MC_FC_COUNT_NSIQ,
+	MC_FC_COUNT_YIELD,
+	MC_FC_COUNT_SWAP_CPU,
+	MC_FC_COUNT_OTHER,
+	MC_FC_COUNT_NR,
+};
+
+u32 mc_fastcall_count(enum mc_fc_count_id id);
+
 #endif /* _TBASE_FASTCALL_H_ */

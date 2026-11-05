@@ -142,6 +142,49 @@ static struct smc_log_entry smc_log[SMC_LOG_SIZE];
 static int smc_log_index;
 
 /*
+ * crownlte: per-command fastcall counters, read by the boot self-test to
+ * prove which SMCs the driver issued. Pure NWd bookkeeping.
+ */
+static atomic_t smc_count[MC_FC_COUNT_NR];
+
+static void smc_count_cmd(u32 cmd)
+{
+	enum mc_fc_count_id id;
+
+	switch (cmd) {
+	case MC_FC_INIT:
+		id = MC_FC_COUNT_INIT;
+		break;
+	case MC_FC_INFO:
+		id = MC_FC_COUNT_INFO;
+		break;
+	case MC_FC_MEM_TRACE:
+		id = MC_FC_COUNT_MEM_TRACE;
+		break;
+	case MC_SMC_N_SIQ:
+		id = MC_FC_COUNT_NSIQ;
+		break;
+	case MC_SMC_N_YIELD:
+		id = MC_FC_COUNT_YIELD;
+		break;
+	case MC_FC_SWAP_CPU:
+		id = MC_FC_COUNT_SWAP_CPU;
+		break;
+	default:
+		id = MC_FC_COUNT_OTHER;
+		break;
+	}
+	atomic_inc(&smc_count[id]);
+}
+
+u32 mc_fastcall_count(enum mc_fc_count_id id)
+{
+	if (id >= MC_FC_COUNT_NR)
+		return 0;
+	return atomic_read(&smc_count[id]);
+}
+
+/*
  * _smc() - fast call to MobiCore
  *
  * @data: pointer to fast call data
@@ -156,6 +199,7 @@ static inline int _smc(union mc_fc_generic *mc_fc_generic)
 	smc_log[smc_log_index].as_in = mc_fc_generic->as_in;
 	if (++smc_log_index >= SMC_LOG_SIZE)
 		smc_log_index = 0;
+	smc_count_cmd(mc_fc_generic->as_in.cmd);
 
 #ifdef MC_SMC_FASTCALL
 	return smc_fastcall(mc_fc_generic, sizeof(*mc_fc_generic));
@@ -249,6 +293,10 @@ static int mc_cpu_offline(int cpu)
 {
 	int i;
 	int ret = 0;
+
+	/* crownlte: no SWd core switch before the TEE has started */
+	if (!mc_tee_started())
+		return 0;
 
 	mutex_lock(&core_switch_lock);
 	core_status &= ~(0x1 << cpu);
@@ -795,6 +843,10 @@ int mc_switch_core(int cpu)
 int mc_switch_core(int cpu)
 {
        int ret;
+
+       /* crownlte: no SWd core switch before the TEE has started */
+       if (!mc_tee_started())
+               return -ENODEV;
        mutex_lock(&core_switch_lock);
        if (!(core_status & (0x1 << cpu))){
                mc_dev_devel("Core status... core #%d is off line\n", cpu);
@@ -809,6 +861,15 @@ int mc_switch_core(int cpu)
 int mc_switch_core_ctrl(uint32_t core_num, uint32_t ctrl_idx)
 {
 	int ret = 0;
+
+	/*
+	 * crownlte: sec_os_ctrl sysfs and the booster can call this when the
+	 * TEE never started (no DT node, or start failed). 4.9 would then block
+	 * forever in kthread_flush_work; on 6.12 the worker is not even
+	 * initialised. Refuse instead.
+	 */
+	if (!mc_tee_started())
+		return -ENODEV;
 
 	mc_dev_info("core_num : %x ctrl_idx : %x swap_ref : %x\n", core_num, ctrl_idx, swap_ref);
 

@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Trustonic TEE trial (q29): the delayed-UFS diagnostic plus the TEE node.
+ * Kept out of exynos9810-crownlte-delayed-ufs-diag.dts so that no other
+ * diagnostic DTB starts the secure world; see the TEE hard rules in
+ * Documentation/crownlte/trustonic-tee.md.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + Trustonic TEE start";
+};
+
+/*
+ * Trustonic TEE: driver init only, as 4.9 does at boot before userspace
+ * (Documentation/crownlte/trustonic-tee.md). The diagnostic PID1 never opens
+ * /dev/mobicore*, so no TA/driver is loaded and no secure storage is used.
+ * "tee selftest:" at ~110 s reports what init already did; it issues no SMC
+ * and no MCP command of its own.
+ */
+&trustonic_tee {
+	samsung,tee-selftest;
+	samsung,tee-selftest-ms = <110000>;
+	status = "okay";
+};
