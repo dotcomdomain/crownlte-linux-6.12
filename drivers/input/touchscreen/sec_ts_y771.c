@@ -647,23 +647,6 @@ static int sec_ts_rails_now(u8 *l35, u8 *l43)
 {
 	return sec_ts_rails_read(l35, l43);
 }
-#else
-static void sec_ts_power_off(struct sec_ts *ts, const char *why)
-{
-}
-
-static int sec_ts_power_on(struct sec_ts *ts)
-{
-	dev_err(&ts->client->dev,
-		"power: samsung,acpm-touch-power needs a built-in driver and CONFIG_EXYNOS_ACPM\n");
-	return -EOPNOTSUPP;
-}
-
-static int sec_ts_rails_now(u8 *l35, u8 *l43)
-{
-	return -EOPNOTSUPP;
-}
-#endif
 
 /*
  * 4.9 sec_ts_wait_for_ready(SEC_TS_ACK_BOOT_COMPLETE): while the IRQ line
@@ -719,6 +702,28 @@ static int sec_ts_power_up(struct sec_ts *ts)
 	sec_ts_wait_for_ready(ts);
 	return 0;
 }
+#else
+/*
+ * Module build or no ACPM: no power path at all (the exynos_acpm_*
+ * accessors are not exported), so the DT property only logs.
+ */
+static void sec_ts_power_off(struct sec_ts *ts, const char *why)
+{
+}
+
+static int sec_ts_rails_now(u8 *l35, u8 *l43)
+{
+	return -EOPNOTSUPP;
+}
+
+static int sec_ts_power_up(struct sec_ts *ts)
+{
+	dev_err(&ts->client->dev,
+		"power: samsung,acpm-touch-power needs a built-in driver and CONFIG_EXYNOS_ACPM, not powering\n");
+	ts->power_err = -EOPNOTSUPP;
+	return -EOPNOTSUPP;
+}
+#endif
 
 static int sec_ts_identify(struct sec_ts *ts)
 {
@@ -964,6 +969,13 @@ static int sec_ts_probe(struct i2c_client *client)
 	if (client->irq <= 0)
 		return dev_err_probe(dev, -EINVAL, "no interrupt\n");
 
+	/* before the rails go on: no early return may leave them on */
+	if (ts->selftest) {
+		ret = devm_add_action_or_reset(dev, sec_ts_cancel_selftest, ts);
+		if (ret)
+			return ret;
+	}
+
 	if (ts->power_ctl) {
 		ret = sec_ts_power_up(ts);
 		if (ret == -EPROBE_DEFER)
@@ -971,9 +983,6 @@ static int sec_ts_probe(struct i2c_client *client)
 	}
 
 	if (ts->selftest) {
-		ret = devm_add_action_or_reset(dev, sec_ts_cancel_selftest, ts);
-		if (ret)
-			return ret;
 		now = jiffies_to_msecs(jiffies - INITIAL_JIFFIES);
 		schedule_delayed_work(&ts->selftest_work,
 				      msecs_to_jiffies(now < SEC_TS_SELFTEST_MS ?
