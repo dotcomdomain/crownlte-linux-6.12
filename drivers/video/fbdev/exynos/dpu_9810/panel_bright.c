@@ -45,6 +45,11 @@
  * until its dim-flash work replaces row 73 with the panel flash copy
  * ("dim:table" in 4.9 logs); reading that flash needs POC commands, which
  * this driver does not send.
+ *
+ * Panel status (read only, pb_status_read()): the 4.9 panel-dump registers
+ * are read at the start and the end of that command window and again at
+ * 5.5 s and 25 s in short windows of their own, to tell a panel fault (EE
+ * ELVDD/VLOUT3/VLIN1 error) apart from a display path problem.
  */
 #include <linux/backlight.h>
 #include <linux/delay.h>
@@ -113,6 +118,11 @@ static bool pb_read_allowed(u8 reg)
 	case MIPI_DCS_GET_POWER_MODE:	/* 0x0A */
 	case 0x04:			/* ID */
 	case 0xB1: case 0xB3: case 0xB4: case 0xB5: case 0xB8: case 0xCA: case 0xF4:
+	/* status, as 4.9's panel dump (see pb_status_read()) */
+	case MIPI_DCS_GET_SIGNAL_MODE:		/* 0x0E */
+	case MIPI_DCS_GET_ERROR_COUNT_ON_DSI:	/* 0x05 */
+	case MIPI_DCS_GET_DIAGNOSTIC_RESULT:	/* 0x0F */
+	case 0xEE: case 0xEA:
 		return true;
 	default:
 		return false;
@@ -267,13 +277,168 @@ static void pb_publish(u32 v)
 	put_device(&bd->dev);
 }
 
-static int pb_sequence(struct dpu_dev *d)
+/*
+ * Panel status, read only: the registers 4.9's panel dump reads for its
+ * ESD/error checks (s6e3ha8.h "for panel dump", crown_a3_s0_dump_cmdtbl;
+ * decoding as s6e3ha8.c show_rddpm() .. show_self_diag()):
+ *   0A RDDPM 3 bytes, 0E RDDSM 3, 05 DSI error count 1, 0F self-diagnostic
+ *   1, EE ERR_FG 1 (bit 2 VLOUT3, bit 3 ELVDD, bit 6 VLIN1 error), EA DSI
+ *   error flags + CRC/ECC counts 5.
+ * 4.9 reads them with its level 1-3 keys on. 0A/0E/05/0F are standard DCS
+ * reads; EE and EA are manufacturer registers, so they are read both
+ * without a key and, where this file already holds the level 2 key, with
+ * it. The counters in 05 and EA may reset when read, as with 4.9's reads.
+ */
+struct pb_status {
+	int ret, ret_k;		/* -ENODATA: not read */
+	bool keyed;
+	u8 pm[3], sm[3], dsie, diag, ee, ea[5];
+	u8 ee_k, ea_k[5];
+};
+
+static void pb_status_init(struct pb_status *s)
+{
+	memset(s, 0, sizeof(*s));
+	s->ret = -ENODATA;
+}
+
+static int pb_status_read(struct dpu_dev *d, struct pb_status *s)
+{
+	int ret;
+
+	ret = pb_read(d, MIPI_DCS_GET_POWER_MODE, 0, s->pm, sizeof(s->pm));
+	if (!ret)
+		ret = pb_read(d, MIPI_DCS_GET_SIGNAL_MODE, 0, s->sm, sizeof(s->sm));
+	if (!ret)
+		ret = pb_read(d, MIPI_DCS_GET_ERROR_COUNT_ON_DSI, 0, &s->dsie, 1);
+	if (!ret)
+		ret = pb_read(d, MIPI_DCS_GET_DIAGNOSTIC_RESULT, 0, &s->diag, 1);
+	if (!ret)
+		ret = pb_read(d, 0xEE, 0, &s->ee, 1);
+	if (!ret)
+		ret = pb_read(d, 0xEA, 0, s->ea, sizeof(s->ea));
+	s->ret = ret;
+	return ret;
+}
+
+/* EE and EA again; the caller holds the level 2 key */
+static int pb_status_read_keyed(struct dpu_dev *d, struct pb_status *s)
+{
+	int ret = pb_read(d, 0xEE, 0, &s->ee_k, 1);
+
+	if (!ret)
+		ret = pb_read(d, 0xEA, 0, s->ea_k, sizeof(s->ea_k));
+	s->keyed = true;
+	s->ret_k = ret;
+	return ret;
+}
+
+static const char *pb_ee_str(u8 v, char *buf, size_t sz)
+{
+	if (!(v & 0x4c))
+		return "GOOD";
+	scnprintf(buf, sz, "NG:%s%s%s", v & 0x08 ? " ELVDD" : "",
+		  v & 0x04 ? " VLOUT3" : "", v & 0x40 ? " VLIN1" : "");
+	return buf;
+}
+
+/* printed after the command window closed */
+static void pb_status_log(const char *when, const struct pb_status *s)
+{
+	char ee[32], eek[32];
+	u8 pm = s->pm[0];
+
+	if (s->ret) {
+		pr_info(DPU_PB_PFX "status %s: %s (%d)\n", when,
+			s->ret == -ENODATA ? "not read" : "read failed", s->ret);
+		return;
+	}
+	pr_info(DPU_PB_PFX "status %s: 0A %*ph (%s: booster %s, idle %s, partial %s, sleep %s, normal %s, display %s) 0E %*ph (TE %s) 05 %#04x (DSI errors) 0F %#04x (OTP load %s) EE %#04x (%s) EA %*ph (flags %#06x CRC %u ECC1 %u ECC2 %u)\n",
+		when, 3, s->pm, pm == 0x9c ? "GOOD" : "not 9c", pm & 0x80 ? "on" : "OFF",
+		pm & 0x40 ? "ON" : "off", pm & 0x20 ? "on" : "off", pm & 0x10 ? "out" : "IN",
+		pm & 0x08 ? "on" : "OFF", pm & 0x04 ? "on" : "OFF", 3, s->sm,
+		s->sm[0] & 0x80 ? "on" : "OFF", s->dsie, s->diag,
+		s->diag & 0x80 ? "ok" : "ERROR", s->ee, pb_ee_str(s->ee, ee, sizeof(ee)),
+		5, s->ea, (s->ea[0] << 8) | s->ea[1], s->ea[2], s->ea[3], s->ea[4]);
+	if (!s->keyed)
+		return;
+	if (s->ret_k)
+		pr_info(DPU_PB_PFX "status %s, level 2 key: read failed (%d)\n", when, s->ret_k);
+	else
+		pr_info(DPU_PB_PFX "status %s, level 2 key: EE %#04x (%s) EA %*ph (flags %#06x CRC %u ECC1 %u ECC2 %u)\n",
+			when, s->ee_k, pb_ee_str(s->ee_k, eek, sizeof(eek)), 5, s->ea_k,
+			(s->ea_k[0] << 8) | s->ea_k[1], s->ea_k[2], s->ea_k[3], s->ea_k[4]);
+}
+
+/* later status samples, each in its own short command window */
+static const u32 pb_status_at_ms[] = { 5500, 25000 };
+
+static void pb_status_schedule(struct dpu_dev *d)
+{
+	u64 ms = ktime_to_ms(ktime_get_boottime());
+	u32 at;
+
+	if (READ_ONCE(d->stopping) || d->pb_nstatus >= ARRAY_SIZE(pb_status_at_ms))
+		return;
+	at = pb_status_at_ms[d->pb_nstatus];
+	queue_delayed_work(system_long_wq, &d->pb_status_work,
+			   msecs_to_jiffies(at > ms ? at - ms : 0));
+}
+
+/*
+ * Without "samsung,panel-status-key2" in DT only the reads are sent. With
+ * it, EE and EA are read again between F0 5A 5A and F0 A5 A5, the level 2
+ * key packets the brightness sequence itself sends.
+ */
+void dpu_panel_status_work(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_status_work);
+	u64 ms = ktime_to_ms(ktime_get_boottime());
+	struct pb_status s;
+	bool key_left_on = false;
+	char when[24];
+	u32 trig = 0;
+	int ret;
+
+	if (READ_ONCE(d->stopping))
+		return;
+	pb_status_init(&s);
+	snprintf(when, sizeof(when), "at %llu.%03llu s", ms / 1000, ms % 1000);
+	ret = dpu_cmd_window_begin(d, &trig);
+	if (ret) {
+		pr_info(DPU_PB_PFX "status %s: no command window (%d), nothing sent\n", when, ret);
+		goto next;
+	}
+	ret = dpu_dsim_check(d);
+	if (ret) {
+		s.ret = ret;
+	} else {
+		dpu_dsim_clear_status(d);
+		pb_status_read(d, &s);
+		if (d->pb_status_key2 && !pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on))) {
+			pb_status_read_keyed(d, &s);
+			key_left_on = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
+		}
+	}
+	dpu_cmd_window_end(d, trig);
+	pb_status_log(when, &s);
+	if (key_left_on)
+		pr_err(DPU_PB_PFX "status %s: could not send level 2 key off\n", when);
+next:
+	d->pb_nstatus++;
+	pb_status_schedule(d);
+}
+
+static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status *sa)
 {
 	struct pb_pkt pkt[16];
 	struct pb_state before, after;
 	u8 rddpm, id[3], hbm[PB_HBM_GAMMA_LEN], gamma[PB_HBM_GAMMA_LEN], et1;
 	int i, n, ret, ret2;
 	bool key2 = false;
+
+	/* 0. status before anything else (a failed status read stops nothing) */
+	pb_status_read(d, sb);
 
 	/* 1. normal display state: sleep out, normal mode, display on, not idle (AOD) */
 	ret = pb_read(d, MIPI_DCS_GET_POWER_MODE, 0, &rddpm, 1);
@@ -307,6 +472,8 @@ static int pb_sequence(struct dpu_dev *d)
 		ret = pb_read(d, 0xB5, PB_ELVSS_TEMP_1_OFS, &et1, 1);
 	if (!ret)
 		ret = pb_snapshot(d, &before);
+	if (!ret)
+		pb_status_read_keyed(d, sb);	/* inside the existing key window */
 	ret2 = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
 	if (!ret2)
 		key2 = false;
@@ -347,10 +514,14 @@ static int pb_sequence(struct dpu_dev *d)
 	if (!ret) {
 		key2 = true;
 		ret = pb_snapshot(d, &after);
+		if (!ret)
+			pb_status_read_keyed(d, sa);	/* inside the existing key window */
 		ret2 = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
 		if (!ret2)
 			key2 = false;
 	}
+	if (!key2)
+		pb_status_read(d, sa);		/* status after the sequence */
 	if (ret) {
 		d->pb_readback = "FAILED";
 		pb_dbg("read-back failed (%d); the sequence itself completed\n", ret);
@@ -404,6 +575,8 @@ int dpu_panel_bright_init(struct dpu_dev *d)
 	if (!d->pb_has_id || !d->pb_has_gamma)
 		dev_warn(d->dev, "panel-bright: no %s cross-check in DT\n",
 			 d->pb_has_id ? "gamma" : "panel id");
+	/* off by default: level 2 key around the EE/EA reads at 5.5 s / 25 s */
+	d->pb_status_key2 = of_property_read_bool(np, "samsung,panel-status-key2");
 
 	r = platform_get_resource_byname(to_platform_device(d->dev), IORESOURCE_MEM, "dsim");
 	if (!r) {
@@ -426,6 +599,7 @@ void dpu_panel_bright_work(struct work_struct *work)
 {
 	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_work);
 	u64 ms = ktime_to_ms(ktime_get_boottime());
+	struct pb_status sb, sa;
 	u32 trig = 0, us;
 	ktime_t t0;
 	int ret;
@@ -433,6 +607,8 @@ void dpu_panel_bright_work(struct work_struct *work)
 	if (d->pb_done || READ_ONCE(d->stopping))
 		return;
 	d->pb_done = true;		/* once, whatever the outcome */
+	pb_status_init(&sb);
+	pb_status_init(&sa);
 	pr_info(DPU_PB_PFX "start at %llu.%03llu s: target %u, DECON FRAME_COUNT=%u TE=%d\n",
 		ms / 1000, ms % 1000, d->pb_target, dpu_hw_frame_count(d),
 		atomic_read(&d->te_count));
@@ -440,6 +616,7 @@ void dpu_panel_bright_work(struct work_struct *work)
 	ret = dpu_cmd_window_begin(d, &trig);
 	if (ret) {
 		pr_err(DPU_PB_PFX "RESULT FAIL: no command window (%d), nothing sent\n", ret);
+		pb_status_schedule(d);
 		return;
 	}
 	t0 = ktime_get();
@@ -447,10 +624,13 @@ void dpu_panel_bright_work(struct work_struct *work)
 	d->pb_readback = "not run";
 	if (!ret) {
 		dpu_dsim_clear_status(d);
-		ret = pb_sequence(d);
+		ret = pb_sequence(d, &sb, &sa);
 	}
 	us = ktime_us_delta(ktime_get(), t0);
 	dpu_cmd_window_end(d, trig);
+	pb_status_log("at 1 s before brightness", &sb);
+	pb_status_log("at 1 s after brightness", &sa);
+	pb_status_schedule(d);		/* read-only samples at 5.5 s and 25 s */
 
 	if (!ret)
 		pb_publish(d->pb_target);

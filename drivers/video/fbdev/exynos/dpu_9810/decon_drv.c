@@ -2591,6 +2591,7 @@ static int dpu_probe(struct platform_device *pdev)
 	init_waitqueue_head(&d->vsync_wait);
 	INIT_DELAYED_WORK(&d->st_work, dpu_st_work);
 	INIT_DELAYED_WORK(&d->pb_work, dpu_panel_bright_work);
+	INIT_DELAYED_WORK(&d->pb_status_work, dpu_panel_status_work);
 	INIT_DELAYED_WORK(&d->fb_snap_work, dpu_fb_snap_work);
 	d->fence_ctx = dma_fence_context_alloc(1);
 	platform_set_drvdata(pdev, d);
@@ -2767,6 +2768,7 @@ static void dpu_stop(struct dpu_dev *d)
 {
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
+	cancel_delayed_work_sync(&d->pb_status_work);	/* after pb_work, which queues it */
 	cancel_delayed_work_sync(&d->st_work);
 	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {

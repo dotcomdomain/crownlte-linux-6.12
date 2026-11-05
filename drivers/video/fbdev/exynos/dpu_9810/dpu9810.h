@@ -214,6 +214,10 @@ struct dpu_dev {
 	const char *pb_readback;
 	u8 pb_id[3];
 	u8 pb_gamma[34];
+	/* read-only panel status samples after the brightness (panel_bright.c) */
+	struct delayed_work pb_status_work;
+	u32 pb_nstatus;
+	bool pb_status_key2;			/* DT: level 2 key around EE/EA */
 };
 
 /* decon_hw.c: register layer (ported from 4.9 decon_reg.c / dpp_reg.c) */
@@ -264,6 +268,7 @@ int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len);
 /* panel_bright.c: the 4.9 brightness-44700 sequence */
 int dpu_panel_bright_init(struct dpu_dev *d);
 void dpu_panel_bright_work(struct work_struct *work);
+void dpu_panel_status_work(struct work_struct *work);
 u32 dpu9810_panel_brightness(void);	/* also used by panel_ro.c */
 
 #endif /* __DPU9810_H__ */
