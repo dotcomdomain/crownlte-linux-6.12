@@ -150,9 +150,9 @@ static const char * const e9810_stage_name[] = {
 };
 
 /* Self-test timing. The diag PID1 restarts the phone at about 120 s. */
-/* After the MCT report (86-89 s); six phases end at about 100 s. */
+/* After the MCT report (86-90 s); eleven phases end at about 100 s. */
 #define E9810_SELFTEST_MS		90000
-#define E9810_PHASE_MS			1500
+#define E9810_PHASE_MS			800
 #define E9810_POLL_MS			20
 #define E9810_PING_TIMEOUT_MS		100
 #define E9810_SLEEP_MS			10
@@ -182,6 +182,7 @@ struct e9810_stats {
 	u64 unarmed;		/* C2 requested while not armed: WFI */
 	u64 wfi_fallback;	/* any C2 request that ran WFI instead */
 	u64 stale_grp2;		/* own GRP2 event latched before arming */
+	u64 guarded;		/* C2 refused by the cluster-0 limit: WFI */
 	int last_err;
 	unsigned int fail_streak;
 };
@@ -193,6 +194,7 @@ static DEFINE_PER_CPU(u32, e9810_stage);
 static DEFINE_PER_CPU(u32, e9810_hooks_reset);
 static DEFINE_PER_CPU(int, e9810_hooks_ret);
 static unsigned int e9810_phycpu[NR_CPUS];
+static unsigned int e9810_cpu_of_phy[E9810_NR_PHYCPUS];
 static unsigned int e9810_cluster_of[NR_CPUS];
 static u64 e9810_live_mpidr[NR_CPUS];
 static bool e9810_topology_ok;
@@ -217,6 +219,22 @@ static unsigned int e9810_lost_reminders;
 
 /* PSCI CPU_ON function ID from the DT psci node (v0.1 IDs), 0 if unknown. */
 static u32 e9810_psci_cpu_on_fn;
+
+/*
+ * Cluster-0 (LITTLE, boot cluster) C2 concurrency limit. q40: two LITTLE
+ * cores in C2 together passed (430 cycles), the first time a third one went
+ * down it never woke (cpu3, wake never latched in GRP1_PEND, then stuck in
+ * EL3). q22b lost cpu1 and cpu3 the same way. Until the firmware side is
+ * understood, at most this many cluster-0 cores are inside the C2 path
+ * (cal_cpu_disable() .. cal_cpu_enable()) at once; the others idle in WFI.
+ * 0 = no limit. DT: samsung,c2-little-limit. The self-test changes it per
+ * phase.
+ */
+#define E9810_LITTLE_LIMIT_DEFAULT	2
+static int e9810_little_limit = E9810_LITTLE_LIMIT_DEFAULT;
+/* The configured value (default or DT), restored after each test phase. */
+static int e9810_little_limit_cfg = E9810_LITTLE_LIMIT_DEFAULT;
+static atomic_t e9810_little_in_c2 = ATOMIC_INIT(0);
 
 /* Called with interrupts off from the idle path: no plain printk here. */
 static void e9810_disable_deep(const char *why)
@@ -265,7 +283,8 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	struct e9810_stats *st = this_cpu_ptr(&e9810_stats);
 	unsigned int phy = e9810_phycpu[dev->cpu];
 	u32 bit = INTR_GEN_BIT(phy);
-	int ret;
+	bool little = e9810_cluster_of[dev->cpu] == 0;
+	int ret, lim;
 
 	if (!cpumask_test_cpu(dev->cpu, &e9810_armed)) {
 		st->unarmed++;
@@ -274,9 +293,22 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	if (atomic_read(&e9810_deep_off))
 		goto wfi;
 
+	/* The slot is held until cal_cpu_enable() has run (see "out"). */
+	if (little) {
+		lim = READ_ONCE(e9810_little_limit);
+		if (atomic_inc_return(&e9810_little_in_c2) > lim && lim) {
+			atomic_dec(&e9810_little_in_c2);
+			st->guarded++;
+			goto wfi;
+		}
+	}
+
 	/* A vetoing notifier has already been rolled back by cpu_pm. */
-	if (cpu_pm_enter())
+	if (cpu_pm_enter()) {
+		if (little)
+			atomic_dec(&e9810_little_in_c2);
 		goto wfi;
+	}
 
 	/*
 	 * cal_cpu_disable() enables this core's GRP2 interrupt first. A GRP2
@@ -295,6 +327,8 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	if (ret) {
 		e9810_set_stage(E9810_ST_CAL_ON);
 		cal_cpu_enable(phy);
+		if (little)
+			atomic_dec(&e9810_little_in_c2);
 		e9810_set_stage(E9810_ST_PM_EXIT);
 		cpu_pm_exit();
 		e9810_set_stage(E9810_ST_KERNEL);
@@ -308,6 +342,8 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	e9810_set_stage(E9810_ST_CAL_ON);
 
 	cal_cpu_enable(phy);
+	if (little)
+		atomic_dec(&e9810_little_in_c2);
 	e9810_set_stage(E9810_ST_PM_EXIT);
 	cpu_pm_exit();
 	e9810_set_stage(E9810_ST_KERNEL);
@@ -374,6 +410,7 @@ static const char *e9810_init_topology(void)
 			return "unexpected cpu reg/MPIDR layout";
 		seen |= BIT(phy);
 		e9810_phycpu[cpu] = phy;
+		e9810_cpu_of_phy[phy] = cpu;
 		e9810_cluster_of[cpu] = aff1;
 		cpumask_set_cpu(cpu, &e9810_clusters[aff1].cpus);
 	}
@@ -783,7 +820,191 @@ struct e9810_snap {
 struct e9810_phase {
 	const char *name;
 	struct cpumask cpus;
+	int little_limit;	/* cluster-0 C2 limit for this phase, 0 = none */
+	bool busy0;		/* CPU0 busy-polls: never in WFI during the phase */
+	bool bisect;		/* expected to fail on q40 firmware; runs last */
 };
+
+/*
+ * Timeline of the LITTLE cores (phy 1-3) and the INTR_GEN group bits,
+ * sampled by a kthread on a CPU outside the phase (cpu7), one entry per
+ * change. Printed when a phase fails.
+ */
+#define E9810_TL_ENTRIES		256
+#define E9810_TL_MARKS			64
+#define E9810_TL_CPU			7
+
+struct e9810_tl_state {
+	u32 status[3];
+	u8 config[3], inform[3], stage[3];
+	u8 grp1_en, grp1_pend, grp2_en, grp2_pend;
+};
+
+struct e9810_tl_entry {
+	u64 t;
+	struct e9810_tl_state s;
+};
+
+struct e9810_tl_mark {
+	u64 t;
+	const char *what;
+	int arg;
+};
+
+#define E9810_TL_FIRST			128
+
+struct e9810_tl {
+	/* The first changes after arming are kept apart from the ring. */
+	struct e9810_tl_entry first[E9810_TL_FIRST];
+	struct e9810_tl_entry e[E9810_TL_ENTRIES];
+	struct e9810_tl_mark m[E9810_TL_MARKS];
+	unsigned int n, nm;
+	u64 samples, t0;
+	struct task_struct *task;
+	bool stop, exited;
+};
+
+static struct e9810_tl *e9810_tl;
+
+static void e9810_tl_mark(const char *what, int arg)
+{
+	struct e9810_tl *tl = e9810_tl;
+
+	if (!tl || !tl->task || tl->nm >= E9810_TL_MARKS)
+		return;
+	tl->m[tl->nm].t = ktime_get_ns();
+	tl->m[tl->nm].what = what;
+	tl->m[tl->nm].arg = arg;
+	tl->nm++;
+}
+
+static void e9810_tl_sample(struct e9810_tl_state *s)
+{
+	unsigned int phy, v;
+
+	memset(s, 0, sizeof(*s));
+	for (phy = 1; phy <= 3; phy++) {
+		regmap_read(e9810_pmu, pmu_cpu_status[phy], &s->status[phy - 1]);
+		regmap_read(e9810_pmu, PMU_CPU_CONFIG(phy), &v);
+		s->config[phy - 1] = v;
+		regmap_read(e9810_pmu, PMU_CPU_INFORM(phy), &v);
+		s->inform[phy - 1] = v | ((v >> 16) ? 0x80 : 0);
+		/* stage of the logical CPU on this core */
+		s->stage[phy - 1] = READ_ONCE(per_cpu(e9810_stage,
+						       e9810_cpu_of_phy[phy]));
+	}
+	s->grp1_en = readl(e9810_intr_gen + INTR_GEN_GRP1_ENABLE);
+	s->grp1_pend = readl(e9810_intr_gen + INTR_GEN_GRP1_PEND);
+	s->grp2_en = readl(e9810_intr_gen + INTR_GEN_GRP2_ENABLE);
+	s->grp2_pend = readl(e9810_intr_gen + INTR_GEN_GRP2_PEND);
+}
+
+static int e9810_tl_fn(void *data)
+{
+	struct e9810_tl *tl = data;
+	struct e9810_tl_state cur, prev;
+	bool first = true;
+
+	while (!READ_ONCE(tl->stop) && !kthread_should_stop()) {
+		u64 t = ktime_get_ns();
+
+		e9810_tl_sample(&cur);
+		tl->samples++;
+		if (first || memcmp(&cur, &prev, sizeof(cur))) {
+			struct e9810_tl_entry *e = &tl->e[tl->n % E9810_TL_ENTRIES];
+
+			e->t = t;
+			e->s = cur;
+			if (tl->n < E9810_TL_FIRST)
+				tl->first[tl->n] = *e;
+			prev = cur;
+			first = false;
+			smp_store_release(&tl->n, tl->n + 1);
+		}
+		cond_resched();
+	}
+	smp_store_release(&tl->exited, true);
+	return 0;
+}
+
+static void e9810_tl_start(void)
+{
+	struct e9810_tl *tl = e9810_tl;
+
+	if (!tl || !cpu_online(E9810_TL_CPU))
+		return;
+	tl->n = 0;
+	tl->nm = 0;
+	tl->samples = 0;
+	tl->stop = false;
+	tl->exited = false;
+	tl->t0 = ktime_get_ns();
+	tl->task = kthread_create(e9810_tl_fn, tl, "c2tl/%u", E9810_TL_CPU);
+	if (IS_ERR(tl->task)) {
+		tl->task = NULL;
+		return;
+	}
+	kthread_bind(tl->task, E9810_TL_CPU);
+	get_task_struct(tl->task);
+	wake_up_process(tl->task);
+}
+
+static void e9810_tl_stop(void)
+{
+	struct e9810_tl *tl = e9810_tl;
+	u64 deadline = ktime_get_ns() + 200 * NSEC_PER_MSEC;
+
+	if (!tl || !tl->task)
+		return;
+	WRITE_ONCE(tl->stop, true);
+	while (!smp_load_acquire(&tl->exited) && ktime_get_ns() < deadline)
+		msleep(2);
+	if (smp_load_acquire(&tl->exited))
+		kthread_stop(tl->task);
+	else
+		pr_err("cpuidle selftest: timeline thread did not stop; leaked\n");
+	put_task_struct(tl->task);
+	tl->task = NULL;
+}
+
+static void e9810_tl_print(const char *tag, unsigned int idx,
+			   const struct e9810_tl_entry *e, u64 t0)
+{
+	const struct e9810_tl_state *s = &e->s;
+
+	pr_info("cpuidle selftest: %s#%u +%lluus c1=%x/%x/%x/%u c2=%x/%x/%x/%u c3=%x/%x/%x/%u g1e=%02x g1p=%02x g2e=%02x g2p=%02x\n",
+		tag, idx, div_u64(e->t - t0, NSEC_PER_USEC),
+		s->status[0], s->config[0], s->inform[0], s->stage[0],
+		s->status[1], s->config[1], s->inform[1], s->stage[1],
+		s->status[2], s->config[2], s->inform[2], s->stage[2],
+		s->grp1_en, s->grp1_pend, s->grp2_en, s->grp2_pend);
+}
+
+/*
+ * Times are microseconds after arming. "tl-first" = the first changes after
+ * arming, "tl" = the last changes before the sampler stopped (after the
+ * recovery attempts). Entry numbers are global, so overlaps are visible.
+ */
+static void e9810_tl_dump(const char *phase)
+{
+	struct e9810_tl *tl = e9810_tl;
+	unsigned int n, i, first;
+
+	if (!tl)
+		return;
+	n = smp_load_acquire(&tl->n);
+	first = n > E9810_TL_ENTRIES ? n - E9810_TL_ENTRIES : 0;
+	pr_info("cpuidle selftest: timeline %s: samples=%llu changes=%u marks=%u (cN=status/config/inform[0x80=bit16]/stage 0 kernel 1 cal_off 2 firmware 3 cal_on 4 pm_exit; INTR_GEN bytes, LITTLE cpuN = bit 4+N)\n",
+		phase, tl->samples, n, tl->nm);
+	for (i = 0; i < tl->nm; i++)
+		pr_info("cpuidle selftest: tl-mark +%lluus %s %d\n",
+			div_u64(tl->m[i].t - tl->t0, NSEC_PER_USEC),
+			tl->m[i].what, tl->m[i].arg);
+	for (i = 0; i < min_t(unsigned int, n, E9810_TL_FIRST); i++)
+		e9810_tl_print("tl-first", i, &tl->first[i], tl->t0);
+	for (i = max(first, (unsigned int)E9810_TL_FIRST); i < n; i++)
+		e9810_tl_print("tl", i, &tl->e[i % E9810_TL_ENTRIES], tl->t0);
+}
 
 static void e9810_read_regs(unsigned int cpu, struct e9810_regs *r)
 {
@@ -832,24 +1053,85 @@ static bool e9810_wait_answer(struct e9810_ping *p, unsigned int ms)
 	return true;
 }
 
-struct e9810_cpu_on_req {
+#define PSCI_FN_VERSION			0x84000000
+#define PSCI_FN64_AFFINITY_INFO		0xc4000004
+
+struct e9810_smc_req {
 	call_single_data_t csd;
 	u32 fn;
-	u64 mpidr;
-	unsigned long entry;
+	unsigned long a1, a2;
 	long ret;
 	bool done;
 };
 
 /* Runs on a healthy helper CPU, so CPU0 survives if EL3 blocks the call. */
-static void e9810_cpu_on_fn(void *info)
+static void e9810_smc_fn(void *info)
 {
-	struct e9810_cpu_on_req *r = info;
+	struct e9810_smc_req *r = info;
 	struct arm_smccc_res res;
 
-	arm_smccc_smc(r->fn, r->mpidr, r->entry, 0, 0, 0, 0, 0, &res);
+	arm_smccc_smc(r->fn, r->a1, r->a2, 0, 0, 0, 0, 0, &res);
 	r->ret = (long)(s32)res.a0;
 	smp_store_release(&r->done, true);
+}
+
+/* First online CPU other than CPU0 that is not in @avoid, or nr_cpu_ids. */
+static unsigned int e9810_pick_helper(const struct cpumask *avoid)
+{
+	unsigned int cpu;
+
+	for_each_online_cpu(cpu)
+		if (cpu && !(avoid && cpumask_test_cpu(cpu, avoid)))
+			return cpu;
+	return nr_cpu_ids;
+}
+
+/*
+ * Raw SMC on @helper with a bounded wait. 0 and *ret on completion,
+ * -ETIMEDOUT if the helper is still inside EL3 (the request is then leaked
+ * on purpose), -EBUSY/-ENOMEM otherwise.
+ */
+static int e9810_smc_on(unsigned int helper, u32 fn, unsigned long a1,
+			unsigned long a2, long *ret)
+{
+	struct e9810_smc_req *req;
+	u64 t0;
+
+	if (helper >= nr_cpu_ids)
+		return -ENODEV;
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+	req->fn = fn;
+	req->a1 = a1;
+	req->a2 = a2;
+	INIT_CSD(&req->csd, e9810_smc_fn, req);
+	if (smp_call_function_single_async(helper, &req->csd)) {
+		kfree(req);
+		return -EBUSY;
+	}
+	t0 = ktime_get_ns();
+	while (!smp_load_acquire(&req->done) &&
+	       ktime_get_ns() - t0 < E9810_RECOVER_WAIT_MS * NSEC_PER_MSEC)
+		usleep_range(200, 500);
+	if (!smp_load_acquire(&req->done))
+		return -ETIMEDOUT;
+	*ret = req->ret;
+	kfree(req);
+	return 0;
+}
+
+/* PSCI AFFINITY_INFO (0 ON, 1 OFF, 2 ON_PENDING; <0 error), logged. */
+static void e9810_log_affinity(const char *tag, unsigned int cpu,
+			       unsigned int helper)
+{
+	long ret = 0;
+	int err = e9810_smc_on(helper, PSCI_FN64_AFFINITY_INFO,
+			       cpu_logical_map(cpu), 0, &ret);
+
+	pr_info("cpuidle selftest: %s cpu%u PSCI AFFINITY_INFO=%ld%s\n", tag,
+		cpu, err ? 0 : ret, err == -ETIMEDOUT ? " (helper timeout)" :
+		err ? " (not issued)" : "");
 }
 
 /*
@@ -866,16 +1148,19 @@ static void e9810_cpu_on_fn(void *info)
  *     ON_PENDING) and nothing happens. If EL3 has it as off, the core
  *     starts in cpu_resume, which restores the context this core saved in
  *     __cpu_suspend_enter() before CPU_SUSPEND and returns from that call.
- * Steps 2 and 3 cannot help a core that is stuck in kernel code (marker
+ *  4. "pmu-cycle": only if CPU_ON was accepted (0) and the core is powered:
+ *     power it down and up through CONFIGURATION, see below.
+ * Steps 2-4 cannot help a core that is stuck in kernel code (marker
  * cal_cpu_disable / cal_cpu_enable / cpu_pm_exit); that is reported.
  */
 static const char *e9810_recover(unsigned int cpu, struct e9810_ping *p,
 				 const struct cpumask *unhealthy)
 {
 	unsigned int phy = e9810_phycpu[cpu], helper;
-	struct e9810_cpu_on_req *req;
 	struct e9810_regs r;
-	u32 st;
+	long ret = 0;
+	u32 st = 0;
+	int err;
 	u64 t0;
 
 	pr_warn("cpuidle selftest: recover cpu%u: step ipi\n", cpu);
@@ -918,47 +1203,85 @@ static const char *e9810_recover(unsigned int cpu, struct e9810_ping *p,
 		       cpu);
 		return NULL;
 	}
-	helper = nr_cpu_ids;
-	for_each_online_cpu(helper)
-		if (helper && !cpumask_test_cpu(helper, unhealthy))
-			break;
+	helper = e9810_pick_helper(unhealthy);
 	if (helper >= nr_cpu_ids) {
 		pr_err("cpuidle selftest: recover cpu%u: no healthy helper CPU for PSCI CPU_ON\n",
 		       cpu);
 		return NULL;
 	}
-	/* Never freed if the helper does not finish: it may still write. */
-	req = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!req)
-		return NULL;
-	req->fn = e9810_psci_cpu_on_fn;
-	req->mpidr = cpu_logical_map(cpu);
-	req->entry = __pa_symbol(cpu_resume);
-	INIT_CSD(&req->csd, e9810_cpu_on_fn, req);
+	/* What EL3 thinks of the lost core and of a running one. */
+	e9810_log_affinity("recover", cpu, helper);
+	e9810_log_affinity("reference", helper, helper);
+
 	pr_warn("cpuidle selftest: recover cpu%u: step psci-cpu-on fn=%#x mpidr=%#llx entry=cpu_resume@%#lx via cpu%u\n",
-		cpu, req->fn, req->mpidr, req->entry, helper);
-	if (smp_call_function_single_async(helper, &req->csd)) {
-		pr_err("cpuidle selftest: recover cpu%u: helper IPI busy\n", cpu);
-		return NULL;
-	}
-	t0 = ktime_get_ns();
-	while (!smp_load_acquire(&req->done) &&
-	       ktime_get_ns() - t0 < E9810_RECOVER_WAIT_MS * NSEC_PER_MSEC)
-		usleep_range(500, 1000);
-	if (!smp_load_acquire(&req->done)) {
-		pr_err("cpuidle selftest: recover cpu%u: helper cpu%u still inside PSCI CPU_ON after %d ms\n",
-		       cpu, helper, E9810_RECOVER_WAIT_MS);
+		cpu, e9810_psci_cpu_on_fn, cpu_logical_map(cpu),
+		(unsigned long)__pa_symbol(cpu_resume), helper);
+	err = e9810_smc_on(helper, e9810_psci_cpu_on_fn, cpu_logical_map(cpu),
+			   __pa_symbol(cpu_resume), &ret);
+	if (err) {
+		pr_err("cpuidle selftest: recover cpu%u: PSCI CPU_ON not completed via cpu%u (%d)\n",
+		       cpu, helper, err);
 		return NULL;
 	}
 	/* PSCI: 0 ok, -4 ALREADY_ON, -5 ON_PENDING, -2 INVALID_PARAMS */
 	pr_warn("cpuidle selftest: recover cpu%u: PSCI CPU_ON returned %ld\n",
-		cpu, req->ret);
-	kfree(req);
+		cpu, ret);
 	wake_up_if_idle(cpu);
 	if (e9810_wait_answer(p, E9810_RECOVER_WAIT_MS))
 		return "psci-cpu-on";
 	e9810_read_regs(cpu, &r);
 	e9810_log_regs("recover-psci", cpu, &r);
+	e9810_log_affinity("after-cpu-on", cpu, helper);
+
+	/*
+	 * 4. "pmu-cycle": q40 had the core powered on, CPU_ON accepted (0, so
+	 * EL3 holds it as OFF) and still nothing. That fits a core parked in
+	 * EL3 (WFI/WFE) waiting for a power-on reset that never comes because
+	 * it is already powered. Only after CPU_ON was accepted: disarm its
+	 * GRP2 event (cal_cpu_enable(phy) from CPU0, which also rewrites
+	 * CPU0's own INFORM slot to 0, its normal value), request power-down
+	 * (CONFIGURATION[3:0] = 0, completes only if the core sits in WFI),
+	 * then power-up. The reset goes through EL3 warm boot with the CPU_ON
+	 * entry point recorded.
+	 */
+	if (ret || (r.status & PMU_CPU_STATUS_ON) != PMU_CPU_STATUS_ON)
+		return NULL;
+	pr_warn("cpuidle selftest: recover cpu%u: step pmu-cycle\n", cpu);
+	{
+		unsigned long flags;
+
+		local_irq_save(flags);
+		cal_cpu_enable(phy);
+		local_irq_restore(flags);
+	}
+	regmap_update_bits(e9810_pmu, PMU_CPU_CONFIG(phy),
+			   PMU_CPU_LOCAL_PWR_CFG, 0);
+	t0 = ktime_get_ns();
+	do {
+		regmap_read(e9810_pmu, pmu_cpu_status[phy], &st);
+		if (!(st & PMU_CPU_STATUS_ON))
+			break;
+		usleep_range(50, 100);
+	} while (ktime_get_ns() - t0 < 5 * NSEC_PER_MSEC);
+	pr_warn("cpuidle selftest: recover cpu%u: pmu-cycle off: status=%#x after %llu us%s\n",
+		cpu, st, div_u64(ktime_get_ns() - t0, NSEC_PER_USEC),
+		(st & PMU_CPU_STATUS_ON) ? " (did not power down: core not in WFI)" : "");
+	regmap_update_bits(e9810_pmu, PMU_CPU_CONFIG(phy),
+			   PMU_CPU_LOCAL_PWR_CFG, PMU_CPU_LOCAL_PWR_CFG);
+	t0 = ktime_get_ns();
+	do {
+		regmap_read(e9810_pmu, pmu_cpu_status[phy], &st);
+		if ((st & PMU_CPU_STATUS_ON) == PMU_CPU_STATUS_ON)
+			break;
+		usleep_range(100, 200);
+	} while (ktime_get_ns() - t0 < 20 * NSEC_PER_MSEC);
+	pr_warn("cpuidle selftest: recover cpu%u: pmu-cycle on: status=%#x after %llu us\n",
+		cpu, st, div_u64(ktime_get_ns() - t0, NSEC_PER_USEC));
+	wake_up_if_idle(cpu);
+	if (e9810_wait_answer(p, E9810_RECOVER_WAIT_MS))
+		return "pmu-cycle";
+	e9810_read_regs(cpu, &r);
+	e9810_log_regs("recover-pmu-cycle", cpu, &r);
 	return NULL;
 }
 
@@ -1109,20 +1432,40 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 	e9810_snapshot(a);
 	exynos9810_mct_bc_get_stats(&bc0);
 
+	WRITE_ONCE(e9810_little_limit, ph->little_limit);
+	if (!cpumask_test_cpu(E9810_TL_CPU, &ph->cpus))
+		e9810_tl_start();
+	e9810_tl_mark("arm", ph->little_limit);
 	why = e9810_arm(&ph->cpus);
 	if (why) {
 		pr_err("cpuidle selftest: phase %s: cannot arm %*pbl: %s\n",
 		       ph->name, cpumask_pr_args(&ph->cpus), why);
+		e9810_tl_stop();
+		WRITE_ONCE(e9810_little_limit, e9810_little_limit_cfg);
 		goto stop_sleepers;
 	}
-	pr_info("cpuidle selftest: phase %s: armed %*pbl for %d ms\n",
-		ph->name, cpumask_pr_args(&ph->cpus), E9810_PHASE_MS);
+	pr_info("cpuidle selftest: phase %s: armed %*pbl for %d ms little_limit=%d cpu0=%s timeline=%s%s\n",
+		ph->name, cpumask_pr_args(&ph->cpus), E9810_PHASE_MS,
+		ph->little_limit, ph->busy0 ? "busy" : "idle",
+		e9810_tl && e9810_tl->task ? "cpu7" : "off",
+		ph->bisect ? " (bisect phase)" : "");
 
 	t_end = ktime_get_ns() + (u64)E9810_PHASE_MS * NSEC_PER_MSEC;
 	while (!why && ktime_get_ns() < t_end) {
 		u64 deadline;
 
-		msleep(E9810_POLL_MS);
+		if (ph->busy0) {
+			/* CPU0 must not reach WFI: no sleeping at all. */
+			deadline = ktime_get_ns() +
+				   (u64)E9810_POLL_MS * NSEC_PER_MSEC;
+			/* cond_resched() runs other work, never idle. */
+			while (ktime_get_ns() < deadline) {
+				cond_resched();
+				cpu_relax();
+			}
+		} else {
+			msleep(E9810_POLL_MS);
+		}
 
 		/* Power state as the PMU sees it, sampled before the ping. */
 		samples++;
@@ -1150,6 +1493,7 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		}
 		if (why)
 			break;
+		e9810_tl_mark("ping", samples);
 
 		deadline = ktime_get_ns() +
 			   (u64)E9810_PING_TIMEOUT_MS * NSEC_PER_MSEC;
@@ -1161,7 +1505,10 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 					pending = true;
 			if (!pending || ktime_get_ns() > deadline)
 				break;
-			usleep_range(50, 100);
+			if (ph->busy0)
+				udelay(50);
+			else
+				usleep_range(50, 100);
 		}
 
 		/* Every CPU is checked, so all unanswered CPUs are named. */
@@ -1210,11 +1557,14 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 			e9810_read_regs(cpu, &r);
 			e9810_log_regs("FAIL-state", cpu, &r);
 		}
-		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; unanswered=%*pbl pmucal_cpu_lock=%s\n",
+		e9810_tl_mark("fail", *failed_cpu);
+		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; unanswered=%*pbl pmucal_cpu_lock=%s little_in_c2=%d\n",
 		       ph->name, *failed_cpu, why, cpumask_pr_args(&unanswered),
-		       cal_cpu_lock_is_held() ? "HELD" : "free");
+		       cal_cpu_lock_is_held() ? "HELD" : "free",
+		       atomic_read(&e9810_little_in_c2));
 		e9810_disable_deep("selftest phase failed");
 		e9810_disarm_all();
+		e9810_tl_mark("disarmed", 0);
 		msleep(E9810_RECHECK_MS);
 
 		cpumask_clear(&lost);
@@ -1228,8 +1578,10 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 				cpumask_set_cpu(cpu, &lost);
 		}
 		for_each_cpu(cpu, &lost) {
-			const char *how = e9810_recover(cpu, &pings[cpu],
-							&unanswered);
+			const char *how;
+
+			e9810_tl_mark("recover", cpu);
+			how = e9810_recover(cpu, &pings[cpu], &unanswered);
 
 			if (how) {
 				pr_warn("cpuidle selftest: RECOVERED cpu%u via %s (stage now %s)\n",
@@ -1255,9 +1607,13 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; unanswered=%*pbl lost=%*pbl\n",
 		       ph->name, *failed_cpu, why,
 		       cpumask_pr_args(&unanswered), cpumask_pr_args(&lost));
+		e9810_tl_stop();
+		e9810_tl_dump(ph->name);
 	} else if (!e9810_keep_armed) {
 		e9810_disarm_all();
 	}
+	e9810_tl_stop();
+	WRITE_ONCE(e9810_little_limit, e9810_little_limit_cfg);
 
 	e9810_snapshot(b);
 	exynos9810_mct_bc_get_stats(&bc1);
@@ -1270,7 +1626,7 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		if (sb->c2_resumed == sa->c2_resumed)
 			*entered_all = false;
 		/* last_err is cumulative: only shown if it changed this phase. */
-		pr_info("cpuidle selftest: phase %s cpu%u c2_enter=+%llu resumed=+%llu early=+%llu psci_fail=+%llu last_err=%d stale_grp2=+%llu stage=%s unarmed=+%llu wfi_fallback=+%llu | usage=+%llu time_ms=+%llu rejected=+%llu above=+%llu below=+%llu\n",
+		pr_info("cpuidle selftest: phase %s cpu%u c2_enter=+%llu resumed=+%llu early=+%llu psci_fail=+%llu last_err=%d stale_grp2=+%llu stage=%s guarded=+%llu unarmed=+%llu wfi_fallback=+%llu | usage=+%llu time_ms=+%llu rejected=+%llu above=+%llu below=+%llu\n",
 			ph->name, cpu, sb->c2_enter - sa->c2_enter,
 			sb->c2_resumed - sa->c2_resumed, sb->early - sa->early,
 			sb->psci_fail - sa->psci_fail,
@@ -1278,6 +1634,7 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 			 sb->early != sa->early) ? sb->last_err : 0,
 			sb->stale_grp2 - sa->stale_grp2,
 			e9810_stage_str(READ_ONCE(per_cpu(e9810_stage, cpu))),
+			sb->guarded - sa->guarded,
 			sb->unarmed - sa->unarmed,
 			sb->wfi_fallback - sa->wfi_fallback,
 			b[cpu].usage - a[cpu].usage,
@@ -1325,14 +1682,27 @@ stop_sleepers:
 	return why;
 }
 
+static void e9810_add_phase(struct e9810_phase *ph, const char *name,
+			    u32 cpus, int little_limit, bool busy0,
+			    bool bisect)
+{
+	ph->name = name;
+	cpumask_clear(&ph->cpus);
+	bitmap_from_arr32(cpumask_bits(&ph->cpus), &cpus, 32);
+	ph->little_limit = little_limit;
+	ph->busy0 = busy0;
+	ph->bisect = bisect;
+}
+
 static void e9810_selftest(struct work_struct *work)
 {
-	struct e9810_phase phases[6];
+	struct e9810_phase phases[11];
 	struct e9810_snap *a, *b;
 	struct e9810_ping *pings;
 	struct e9810_sleeper *sl;
-	const char *result = "PASS", *why = NULL;
+	const char *result = "PASS", *why = NULL, *bisect_fail = NULL;
 	unsigned int cpu, i, nphases = 0, passed = 0, failed_cpu = UINT_MAX;
+	int lim = e9810_little_limit_cfg ? : E9810_LITTLE_LIMIT_DEFAULT;
 	u64 t0 = ktime_get_ns();
 
 	a = kcalloc(nr_cpu_ids, sizeof(*a), GFP_KERNEL);
@@ -1379,36 +1749,39 @@ static void e9810_selftest(struct work_struct *work)
 		pr_warn("cpuidle selftest: running on cpu%d, expected cpu0\n",
 			raw_smp_processor_id());
 
+	if (!e9810_tl)
+		e9810_tl = kzalloc(sizeof(*e9810_tl), GFP_KERNEL);
+	{
+		long ver = 0;
+		int err = e9810_smc_on(e9810_pick_helper(NULL), PSCI_FN_VERSION,
+				       0, 0, &ver);
+
+		pr_info("cpuidle selftest: PSCI_VERSION=%#lx%s little_limit(default)=%d\n",
+			err ? 0 : ver, err ? " (not issued/timeout)" : "",
+			e9810_little_limit_cfg);
+	}
+
 	/*
-	 * One LITTLE secondary, one BIG CPU, then growing groups: two and three
-	 * LITTLE cores, all BIG cores, every secondary. q22b failed on the
-	 * first concurrent phase, so the steps in between locate the
-	 * concurrency limit. CPU0 owns every SPI (GIC default affinity) and the
-	 * MCT broadcast interrupt; it is never armed here.
+	 * q40: little-1, big-1, little-2 passed; little-3 lost cpu3 on its
+	 * first C2 entry. Order: the phases expected to pass with the
+	 * cluster-0 limit (the q43 fix) first, then bisect phases that may
+	 * lose a CPU, the q40 reproducer last. CPU0 owns every SPI and the MCT
+	 * broadcast interrupt; it is never armed here.
 	 */
-	phases[nphases].name = "little-1";
-	cpumask_clear(&phases[nphases].cpus);
-	cpumask_set_cpu(1, &phases[nphases++].cpus);
-	phases[nphases].name = "big-1";
-	cpumask_clear(&phases[nphases].cpus);
-	cpumask_set_cpu(4, &phases[nphases++].cpus);
-	phases[nphases].name = "little-2";
-	cpumask_clear(&phases[nphases].cpus);
-	cpumask_set_cpu(1, &phases[nphases].cpus);
-	cpumask_set_cpu(2, &phases[nphases++].cpus);
-	phases[nphases].name = "little-3";
-	cpumask_clear(&phases[nphases].cpus);
-	for (i = 1; i <= 3; i++)
-		cpumask_set_cpu(i, &phases[nphases].cpus);
-	nphases++;
-	phases[nphases].name = "big-4";
-	cpumask_clear(&phases[nphases].cpus);
-	for (i = 4; i <= 7; i++)
-		cpumask_set_cpu(i, &phases[nphases].cpus);
-	nphases++;
-	phases[nphases].name = "secondaries";
-	cpumask_copy(&phases[nphases].cpus, cpu_online_mask);
-	cpumask_clear_cpu(0, &phases[nphases++].cpus);
+	nphases = 0;
+	e9810_add_phase(&phases[nphases++], "little-1", 0x02, lim, false, false);
+	e9810_add_phase(&phases[nphases++], "big-1", 0x10, lim, false, false);
+	e9810_add_phase(&phases[nphases++], "little-2", 0x06, lim, false, false);
+	e9810_add_phase(&phases[nphases++], "little-3-lim", 0x0e, lim, false, false);
+	e9810_add_phase(&phases[nphases++], "big-4", 0xf0, lim, false, false);
+	e9810_add_phase(&phases[nphases++], "secondaries-lim", 0xfe, lim, false, false);
+	/* Bisect: is it cpu3, any pair with cpu3, or three at once? */
+	e9810_add_phase(&phases[nphases++], "cpu3-solo", 0x08, 0, false, true);
+	e9810_add_phase(&phases[nphases++], "little-13", 0x0a, 0, false, true);
+	e9810_add_phase(&phases[nphases++], "little-23", 0x0c, 0, false, true);
+	/* Three at once with CPU0 kept out of WFI, then the q40 reproducer. */
+	e9810_add_phase(&phases[nphases++], "little-3-busy0", 0x0e, 0, true, true);
+	e9810_add_phase(&phases[nphases++], "little-3-raw", 0x0e, 0, false, true);
 
 	for (i = 0; i < nphases; i++) {
 		bool entered_all;
@@ -1434,10 +1807,21 @@ static void e9810_selftest(struct work_struct *work)
 		why = e9810_run_phase(&phases[i], pings, sl, a, b,
 				      &failed_cpu, &entered_all);
 		if (why) {
-			result = failed_cpu == UINT_MAX ? "SKIPPED" : "FAIL";
+			if (failed_cpu == UINT_MAX)
+				result = "SKIPPED";
+			else
+				result = phases[i].bisect ?
+					 "FAIL-IN-BISECT (limited phases passed)" :
+					 "FAIL";
+			bisect_fail = phases[i].name;
 			break;
 		}
-		if (!entered_all) {
+		if (!entered_all && phases[i].little_limit &&
+		    cpumask_weight(&phases[i].cpus) > phases[i].little_limit) {
+			/* The limit may starve one core for a whole phase. */
+			pr_warn("cpuidle selftest: phase %s: a CPU never got a C2 slot (limit %d); continuing\n",
+				phases[i].name, phases[i].little_limit);
+		} else if (!entered_all) {
 			/* No evidence yet: do not widen the exposure. */
 			why = "a CPU never resumed from C2 in this phase";
 			result = "INCONCLUSIVE";
@@ -1450,10 +1834,12 @@ static void e9810_selftest(struct work_struct *work)
 		pr_info("cpuidle selftest: phase %s: PASS\n", phases[i].name);
 	}
 
-	pr_info("cpuidle selftest: done result=%s phases_passed=%u/%u%s%s deep_off=%d armed=%*pbl lost=%*pbl elapsed_ms=%llu\n",
+	pr_info("cpuidle selftest: done result=%s phases_passed=%u/%u%s%s%s%s deep_off=%d armed=%*pbl lost=%*pbl little_limit=%d elapsed_ms=%llu\n",
 		result, passed, nphases, why ? " why=" : "", why ? why : "",
+		bisect_fail ? " failed_phase=" : "",
+		bisect_fail ? bisect_fail : "",
 		atomic_read(&e9810_deep_off), cpumask_pr_args(&e9810_armed),
-		cpumask_pr_args(&e9810_lost),
+		cpumask_pr_args(&e9810_lost), READ_ONCE(e9810_little_limit),
 		div_u64(ktime_get_ns() - t0, NSEC_PER_MSEC));
 
 	kfree(a);
@@ -1486,8 +1872,17 @@ static void e9810_arm_boot_cpus(struct device_node *np)
 static int e9810_cpuidle_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
+	u32 lim;
 
 	INIT_DELAYED_WORK(&e9810_lost_work, e9810_lost_remind);
+	/* Before anything can be armed. */
+	if (!of_property_read_u32(np, "samsung,c2-little-limit", &lim) &&
+	    lim <= 4) {
+		e9810_little_limit_cfg = lim;
+		WRITE_ONCE(e9810_little_limit, lim);
+	}
+	pr_info("cluster-0 C2 limit %d%s\n", e9810_little_limit_cfg,
+		e9810_little_limit_cfg ? "" : " (none)");
 	e9810_setup_why = e9810_setup(pdev);
 	if (e9810_setup_why)
 		pr_warn("deep idle not available, WFI only: %s\n",
