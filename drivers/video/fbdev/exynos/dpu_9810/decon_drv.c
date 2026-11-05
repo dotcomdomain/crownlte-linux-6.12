@@ -1589,6 +1589,7 @@ out:
  */
 #define DPU_MX_STEP_MS		4000
 #define DPU_MX_TIMEBOX_MS	40000
+#define DPU_MX_RESTORE_MS	3000	/* keep retrying the fb0 restore this long */
 
 enum { MX_NONE, MX_BANDS_WR, MX_GREEN_CROSS, MX_MAGENTA };
 
@@ -1763,14 +1764,30 @@ restore:
 	if (IS_ERR(fb)) {
 		pr_err(DPU_MX_PFX "7 restore: cannot wrap fb0: %ld\n", PTR_ERR(fb));
 	} else {
-		for (i = 0; i < 2; i++) {
+		/*
+		 * Keep asking until the restore latches: after a latch timeout
+		 * the update still pending makes dpu_process() drop each attempt
+		 * with -EBUSY until it clears. Capped at DPU_MX_RESTORE_MS; a
+		 * stop request does not end it, the restore is what a stop must
+		 * leave behind.
+		 */
+		ktime_t t_end = ktime_add_ms(ktime_get(), DPU_MX_RESTORE_MS);
+
+		for (i = 1; ; i++) {
 			dpu_fb_window(d, wd, d->fb_dpp_fmt);
 			ret = dpu_kcommit(d, wd, fb, &us);
 			if (!ret)
 				break;
+			pr_warn(DPU_MX_PFX "7 restore attempt %d: %d, retrying\n", i, ret);
+			if (ktime_after(ktime_get(), t_end))
+				break;
+			msleep(100);
 		}
 		dpu_mx_log(d, "7 restore fb0 as SBoot left it", d->boot_win, d->boot_dpp, ret, us,
 			   d->fb_phys);
+		if (ret)
+			pr_err(DPU_MX_PFX "fb0 was NOT restored after %d attempts in %u ms: the last matrix buffer may stay on screen\n",
+			       i, DPU_MX_RESTORE_MS);
 		dma_buf_put(fb);
 	}
 	for (i = 0; i < 2; i++)
