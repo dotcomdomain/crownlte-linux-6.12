@@ -9,3 +9,16 @@ config ASHMEM
 
 	  It is, in theory, a good memory allocator for low-memory devices,
 	  because it can discard shared memory units when under memory pressure.
+
+config ASHMEM_C
+	bool "Anonymous Shared Memory Subsystem (C driver, no Rust)"
+	depends on SHMEM && !ASHMEM
+	help
+	  The C ashmem driver (mainline staging up to v5.18, Android Common
+	  Kernels up to android15-6.6), ported to this kernel for builds
+	  without a Rust toolchain. It provides /dev/ashmem with the ashmem
+	  ioctl ABI, including ASHMEM_GET_FILE_ID. The ashmem ioctls on memfd
+	  files are not provided, so the Android libcutils keeps using
+	  /dev/ashmem.
+
+	  Say Y for Android userspace on a kernel without CONFIG_RUST.
