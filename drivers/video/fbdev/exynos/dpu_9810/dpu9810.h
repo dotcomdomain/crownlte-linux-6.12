@@ -165,6 +165,13 @@ struct dpu_dev {
 	atomic_t iommu_faults;
 	unsigned long last_fault_iova;
 	u32 fault_trigger_stops, fault_inhibit_holds, fault_recoveries;
+	/* a shadow update held by a fault mask (dpu_pending_resolve()), hw_lock */
+	u32 update_seq;				/* shadow updates requested */
+	u32 fault_try_seq;			/* update the tries count for */
+	u8 fault_tries;
+	bool fault_quiesced;			/* tries used up, trigger stays masked */
+	u32 fault_quiesces, fault_fresh;
+	u32 trig_boot;				/* trigger before the fault handler */
 	struct mutex iova_lock;			/* the IOVA cache */
 	struct list_head iova_lru;
 	u32 iova_nr, iova_maps, iova_hits, iova_unmaps;
@@ -296,6 +303,8 @@ void dpu_hw_trigger(struct dpu_dev *d, bool enable);
 void dpu_hw_trigger_restore(struct dpu_dev *d, u32 trig);
 void dpu_hw_trigger_commit(struct dpu_dev *d);
 bool dpu_hw_trigger_fault_unmask(struct dpu_dev *d);
+bool dpu_hw_fault_inhibited(struct dpu_dev *d);
+void dpu_hw_trigger_reset_fault(struct dpu_dev *d, u32 trig);
 bool dpu_hw_trigger_stop_atomic(struct dpu_dev *d);
 int dpu_hw_wait_shadow(struct dpu_dev *d, unsigned int timeout_us);
 void dpu_hw_update_req(struct dpu_dev *d);

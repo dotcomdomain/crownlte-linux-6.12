@@ -149,6 +149,31 @@ bool dpu_hw_trigger_fault_unmask(struct dpu_dev *d)
 	return done;
 }
 
+bool dpu_hw_fault_inhibited(struct dpu_dev *d)
+{
+	unsigned long flags;
+	bool v;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	v = d->trig_fault_inhibit;
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+	return v;
+}
+
+/*
+ * Probe failure after the fault handler was removed and synchronised: no
+ * commit will ever clear the inhibit, so drop it and write @trig back.
+ */
+void dpu_hw_trigger_reset_fault(struct dpu_dev *d, u32 trig)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	d->trig_fault_inhibit = false;
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+}
+
 /*
  * From the DPU SysMMU fault IRQ: stop TE-triggered frames so that no new
  * frame fetches a faulting buffer; the frame in progress completes. Returns

@@ -52,6 +52,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_irq.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -690,7 +691,87 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 
 /* ---- update worker -------------------------------------------------- */
 
-static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
+#define DPU_FAULT_TRIES		3	/* controlled unmasks per held update */
+
+/*
+ * hw_lock held. 0 once no shadow update is pending, else -EBUSY.
+ *
+ * SysMMU only: a fault masked the TE trigger while an update waited for it,
+ * so that update cannot latch and every later commit or panel command
+ * window would stop here. Such an update gets at most DPU_FAULT_TRIES
+ * controlled unmasks (commits and command windows together), each followed
+ * by a wait of up to DPU_LATCH_US. A fault after the latch masks the
+ * trigger again; the next commit replaces the frame. If the update still
+ * does not latch, DECON is quiesced: the trigger stays masked (logged once)
+ * until a commit with a different buffer set replaces the held update
+ * (dpu_commit_fresh()). Nothing is freed here: the held frame is
+ * d->active and the frame before it stays on d->stale until a latch.
+ */
+static int dpu_pending_resolve(struct dpu_dev *d, const char *who)
+{
+	int ret = dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US);
+
+	if (!ret) {
+		if (d->fault_quiesced)
+			dev_info(d->dev, DPU_IOMMU_PFX "%s: no update pending any more, quiesce over\n",
+				 who);
+		d->fault_quiesced = false;
+		return 0;
+	}
+	if (d->fault_quiesced || !dpu_hw_fault_inhibited(d))
+		return -EBUSY;
+	if (d->fault_try_seq != d->update_seq) {
+		d->fault_try_seq = d->update_seq;
+		d->fault_tries = 0;
+	}
+	if (d->fault_tries >= DPU_FAULT_TRIES) {
+		d->fault_quiesced = true;
+		d->fault_quiesces++;
+		dev_err(d->dev, DPU_IOMMU_PFX "%s: update #%u still held after %u unmasks: quiesced, TE trigger masked until a commit with other buffers\n",
+			who, d->update_seq, DPU_FAULT_TRIES);
+		return -EBUSY;
+	}
+	if (!dpu_hw_trigger_fault_unmask(d))
+		return -EBUSY;
+	d->fault_tries++;
+	ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
+	dev_warn(d->dev, DPU_IOMMU_PFX "%s: update #%u held by a SysMMU fault mask: unmask %u/%u, %s\n",
+		 who, d->update_seq, d->fault_tries, DPU_FAULT_TRIES,
+		 ret ? "still pending" : "latched");
+	return ret ? -EBUSY : 0;
+}
+
+/*
+ * Quiesced (hw_lock held): @c may replace the held update if it scans a
+ * different buffer set and needs no bounce copy (both slots of a bounced
+ * window may still be referenced while an update is held).
+ */
+static bool dpu_commit_fresh(struct dpu_dev *d, const struct dpu_commit *c)
+{
+	const struct dpu_commit *h = d->active;
+	bool same = !!h;
+	int i;
+
+	for (i = 0; i < DECON_MAX_WIN; i++) {
+		bool on = c->cfg[i].state == DECON_WIN_STATE_BUFFER;
+
+		if (on && c->buf[i].bounce)
+			return false;
+		if (!h)
+			continue;
+		if (on != (h->cfg[i].state == DECON_WIN_STATE_BUFFER) ||
+		    (on && c->buf[i].addr != h->buf[i].addr))
+			same = false;
+	}
+	return !same;
+}
+
+/*
+ * @fresh: quiesced, @c replaces a held update (dpu_commit_fresh()): the
+ * trigger is masked, so no frame starts and the shadow registers can be
+ * rewritten although the old request is still pending.
+ */
+static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c, bool fresh)
 {
 	ktime_t t0;
 	int i, ret;
@@ -701,7 +782,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 		goto out;
 	}
 	/* 4.9: the previous shadow update must have latched */
-	if (dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
+	if (!fresh && dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
 		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped\n");
 		ret = -EBUSY;		/* nothing programmed */
 		goto out;
@@ -726,6 +807,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 				  c->cfg[i].state != DECON_WIN_STATE_DISABLED);
 
 	dpu_hw_update_req(d);
+	d->update_seq++;
 	dpu_hw_trigger_commit(d);	/* also ends a SysMMU fault inhibit */
 	t0 = ktime_get();
 	ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
@@ -736,6 +818,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 		dev_warn_ratelimited(d->dev, "shadow update did not latch in %u us (FRAME_COUNT %u -> %u)\n",
 				     DPU_LATCH_US, c->fc_before, c->fc_after);
 	} else {
+		d->fault_quiesced = false;
 		/* "latched" must mean the IDMA now scans the new buffer */
 		for (i = 0; i < DECON_MAX_WIN; i++) {
 			u32 act;
@@ -1360,6 +1443,7 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
 	LIST_HEAD(txt);
+	bool fresh;
 	int i, ret;
 
 	/*
@@ -1390,20 +1474,14 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	 * copied, nothing programmed).
 	 */
 	mutex_lock(&d->hw_lock);
-	ret = dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US);
-	/*
-	 * SysMMU only: a fault masked the trigger while an update waited for
-	 * it, so it can never latch and every later frame would stop here
-	 * (dpu_apply() and its unmask are never reached). Let that update
-	 * latch with one controlled unmask. Its buffers stay mapped: it is
-	 * d->active (requested, timed out), and the frame before it stays on
-	 * d->stale until the latch is seen below. A new fault after the
-	 * latch masks the trigger again; the commit then replaces the frame.
-	 */
-	if (ret && dpu_hw_trigger_fault_unmask(d)) {
-		ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
-		dev_warn(d->dev, DPU_IOMMU_PFX "pending shadow update held by a SysMMU fault mask: one unmask, %s (recovery #%u)\n",
-			 ret ? "still pending" : "latched", d->fault_recoveries);
+	/* SysMMU: also the bounded recovery of an update a fault mask holds */
+	ret = dpu_pending_resolve(d, "commit");
+	fresh = ret && d->fault_quiesced && dpu_commit_fresh(d, c);
+	if (fresh) {
+		d->fault_fresh++;
+		dev_warn(d->dev, DPU_IOMMU_PFX "quiesced: a commit with other buffers replaces held update #%u\n",
+			 d->update_seq);
+		ret = 0;
 	}
 	mutex_unlock(&d->hw_lock);
 	if (ret) {
@@ -1420,13 +1498,16 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		 * reclaim (Sol review S4: otherwise two 17.3 MB slots could stay
 		 * pinned until another commit succeeded).
 		 */
-		list_for_each_entry_safe(p, n, &d->stale, node) {
-			list_del(&p->node);
-			dpu_commit_free(p);
+		/* (not when replacing a held update: nothing has latched yet) */
+		if (!fresh) {
+			list_for_each_entry_safe(p, n, &d->stale, node) {
+				list_del(&p->node);
+				dpu_commit_free(p);
+			}
 		}
 		c->result = dpu_bounce(d, c);
 		if (!c->result)
-			c->result = dpu_apply(d, c);
+			c->result = dpu_apply(d, c, fresh);
 	}
 	d->nr_commits++;
 	if (!c->result && !c->internal && !READ_ONCE(d->stopping))
@@ -2676,16 +2757,49 @@ out:
 	return ret;
 }
 
+/* wait for SysMMU fault handlers already running on another CPU */
+static void dpu_sysmmu_sync_irqs(struct dpu_dev *d)
+{
+	struct device_node *mmu;
+	int i, irq;
+
+	for (i = 0; i < DPU_NR_SYSMMU; i++) {
+		mmu = of_parse_phandle(d->dev->of_node, "iommus", i);
+		if (!mmu)
+			continue;
+		irq = of_irq_get(mmu, 0);
+		of_node_put(mmu);
+		if (irq > 0)
+			synchronize_irq(irq);
+	}
+}
+
+/*
+ * Probe failure after dpu_iommu_init() succeeded. Remove the fault handler
+ * and wait for running ones, so none can mask the trigger any more; drop
+ * DECON's runtime PM hold (the SysMMUs go to bypass once the driver core
+ * releases the probe's supplier references, right after the failed probe).
+ * Until then they translate the boot fb 1:1, so DECON can run meanwhile.
+ * Then clear the fault inhibit (no commit will) and hand back the trigger
+ * as it was before the fault handler, so the splash is not left frozen.
+ */
 static void dpu_iommu_release(struct dpu_dev *d)
 {
-	if (d->iommu)
-		iommu_set_fault_handler(d->iommu, NULL, NULL);
-	/* the window still scans the identity-mapped boot fb: bypass is safe */
+	if (!d->iommu)
+		return;
+	iommu_set_fault_handler(d->iommu, NULL, NULL);
+	dpu_sysmmu_sync_irqs(d);
 	if (d->rpm_held) {
 		pm_runtime_put_sync(d->dev);
 		pm_runtime_disable(d->dev);
 		d->rpm_held = false;
 	}
+	if (dpu_hw_powered(d)) {
+		dpu_hw_trigger_reset_fault(d, d->trig_boot);
+		dev_info(d->dev, DPU_IOMMU_PFX "probe failed: fault handler removed, TE trigger back to %#x (now %#x)\n",
+			 d->trig_boot, decon_rd(d, HW_SW_TRIG_CONTROL));
+	}
+	d->iommu = NULL;
 }
 
 /* sysmmu_dpu0..2 non-secure SFR bases (4.9 DT) */
@@ -2771,6 +2885,8 @@ static int dpu_iommu_init(struct dpu_dev *d)
 		d->iommu = NULL;
 		return ret;
 	}
+	/* handed back by dpu_iommu_release() if probe fails after this */
+	d->trig_boot = decon_rd(d, HW_SW_TRIG_CONTROL);
 	iommu_set_fault_handler(dom, dpu_iommu_fault, d);
 	dev_info(d->dev, DPU_IOMMU_PFX "DMA domain attached: dma-bufs map to cached IOVAs, no bounce copies\n");
 	return 0;
@@ -2921,7 +3037,8 @@ int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig)
 		ret = -EIO;
 		goto err;
 	}
-	if (dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
+	/* SysMMU: the same bounded recovery as a commit (ALPM exit, recovery) */
+	if (dpu_pending_resolve(d, "command window")) {
 		ret = -EBUSY;
 		goto err;
 	}
