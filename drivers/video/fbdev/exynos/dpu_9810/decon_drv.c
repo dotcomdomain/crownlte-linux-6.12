@@ -2780,7 +2780,7 @@ static void dpu_stop(struct dpu_dev *d)
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->pb_status_work);	/* re-queues itself; cancel waits */
-	cancel_delayed_work_sync(&d->pb_alpm_work);	/* sends the exit even when stopping */
+	cancel_delayed_work_sync(&d->pb_alpm_work);	/* exit + brightness even when stopping */
 	cancel_delayed_work_sync(&d->st_work);
 	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {

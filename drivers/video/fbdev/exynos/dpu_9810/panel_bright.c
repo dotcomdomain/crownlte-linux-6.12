@@ -123,13 +123,15 @@ static bool pb_alpm_write_allowed(u8 ofs, const u8 *b, size_t len)
 	case 0xFC:			/* level 3 key on / off */
 		return !ofs && len == 3 && b[1] == b[2] && (b[1] == 0x5A || b[1] == 0xA5);
 	case 0xBB:			/* LPM nit (ALPM layer), LPM voltage, LPM off nit */
-		return (!ofs && len == 7 && b[1] == 0x07) ||
+		/* Sol review R1 S4: the full row-3 payload only */
+		return (!ofs && len == 7 && b[1] == 0x07 && b[2] == 0x0C && b[3] == 0x0B &&
+			b[4] == 0x10 && b[5] == 0x4F && b[6] == 0x04) ||
 		       (ofs == 0x25 && len == 3 && b[1] == 0x88 && b[2] == 0x80) ||
 		       (!ofs && len == 2 && b[1] == 0x03);
 	case 0xFD:			/* AVS on */
 		return ofs == 0x2B && len == 2 && b[1] == 0x03;
-	case 0x53:			/* LPM mode on (02/03) / exit (00) */
-		return !ofs && len == 2 && (b[1] == 0x00 || b[1] == 0x02 || b[1] == 0x03);
+	case 0x53:			/* LPM mode on (02, row 3) / exit (00) */
+		return !ofs && len == 2 && (b[1] == 0x00 || b[1] == 0x02);
 	case 0xF4:			/* AVC2 off / on */
 		return !ofs && len == 6 && b[1] == 0xEB && b[2] == 0x23 && b[3] == 0x0B &&
 		       b[4] == 0x17 && (b[5] == 0x8A || b[5] == 0xCA);
@@ -739,23 +741,35 @@ static const struct pb_step pb_alpm_exit[] = {
 };
 
 /*
- * Send a table; on any error stop and send both key-off packets (a failed
- * key on may still have reached the panel). Returns the first error.
+ * Send a table. Entry (best_effort false) stops at the first error; exit
+ * (best_effort true, Sol review R1 S1) still tries every packet so that
+ * "53 00" goes out after an earlier error. On any error both key-off
+ * packets follow (a failed key on may still have reached the panel).
+ * *attempted counts packets handed to the DSIM, failed ones included (R1
+ * S2: a timed-out packet may still have reached the panel). Returns the
+ * first error.
  */
-static int pb_steps(struct dpu_dev *d, const struct pb_step *st, int n, int *sent)
+static int pb_steps(struct dpu_dev *d, const struct pb_step *st, int n, bool best_effort,
+		    int *attempted)
 {
 	static const u8 key3_off[] = { 0xFC, 0xA5, 0xA5 };
-	int i, ret = 0;
+	int i, r, ret = 0;
 
 	for (i = 0; i < n; i++) {
 		pb_dbg("alpm step %d/%d: %s\n", i + 1, n, st[i].what);
-		ret = pb_write(d, st[i].ofs, st[i].data, st[i].len);
-		if (ret)
-			break;
+		*attempted = i + 1;
+		r = pb_write(d, st[i].ofs, st[i].data, st[i].len);
+		if (r) {
+			pr_err(DPU_PB_PFX "alpm step %d/%d (%s): %d\n", i + 1, n, st[i].what, r);
+			if (!ret)
+				ret = r;
+			if (!best_effort)
+				break;
+			continue;
+		}
 		if (st[i].delay_us)
 			usleep_range(st[i].delay_us, st[i].delay_us + 100);
 	}
-	*sent = i;
 	if (ret) {
 		if (pb_write(d, 0, key3_off, sizeof(key3_off)))
 			pr_err(DPU_PB_PFX "alpm: could not send level 3 key off\n");
@@ -766,13 +780,13 @@ static int pb_steps(struct dpu_dev *d, const struct pb_step *st, int n, int *sen
 }
 
 /* one window: optional status, a packet table, then RDDPM */
-static int pb_alpm_window(struct dpu_dev *d, const struct pb_step *st, int n,
-			  struct pb_status *s, u8 *pm, int *sent)
+static int pb_alpm_window(struct dpu_dev *d, const struct pb_step *st, int n, bool best_effort,
+			  struct pb_status *s, u8 *pm, int *attempted)
 {
 	u32 trig = 0;
 	int ret, ret_pm;
 
-	*sent = 0;
+	*attempted = 0;
 	ret = dpu_cmd_window_begin(d, &trig);
 	if (ret)
 		return ret;
@@ -782,7 +796,7 @@ static int pb_alpm_window(struct dpu_dev *d, const struct pb_step *st, int n,
 		if (s)
 			pb_status_read(d, s);
 		d->pb_alpm_active = true;
-		ret = pb_steps(d, st, n, sent);
+		ret = pb_steps(d, st, n, best_effort, attempted);
 		d->pb_alpm_active = false;
 		ret_pm = pb_read(d, MIPI_DCS_GET_POWER_MODE, 0, pm, 1);
 		if (ret_pm)
@@ -798,7 +812,7 @@ void dpu_panel_alpm_work(struct work_struct *work)
 	u64 ms = ktime_to_ms(ktime_get_boottime());
 	struct pb_status s0, sb, sa;
 	u8 pm_in = 0, pm_out = 0;
-	int ret, ret_exit, ret_bl = -ENODATA, n_in, n_out;
+	int ret, ret_exit, ret_bl = -ENODATA, n_in, n_out, tries;
 	u32 trig = 0;
 
 	if (READ_ONCE(d->stopping))
@@ -815,25 +829,37 @@ void dpu_panel_alpm_work(struct work_struct *work)
 		ms / 1000, ms % 1000);
 
 	/* 1. ALPM enter */
-	ret = pb_alpm_window(d, pb_alpm_enter, ARRAY_SIZE(pb_alpm_enter), &s0, &pm_in, &n_in);
+	ret = pb_alpm_window(d, pb_alpm_enter, ARRAY_SIZE(pb_alpm_enter), false, &s0, &pm_in,
+			     &n_in);
 	pb_status_log("before alpm", &s0);
-	pr_info(DPU_PB_PFX "alpm enter: %d, %d/%zu packets, RDDPM %#04x (idle %s)\n",
+	pr_info(DPU_PB_PFX "alpm enter: %d, %d/%zu packets attempted, RDDPM %#04x (idle %s)\n",
 		ret, n_in, ARRAY_SIZE(pb_alpm_enter), pm_in, pm_in & 0x40 ? "ON" : "off");
-	/* nothing reached the panel: nothing to undo */
-	if (ret && !n_in)
+	/* no enter packet was even attempted: nothing to undo */
+	if (!n_in)
 		return;
 
 	/* 2. 4.9 fix_green(): 126 ms (ALPM spec), frames keep running */
 	usleep_range(126 * 1000, 126 * 1000 + 10);
-	if (READ_ONCE(d->stopping))
-		pr_info(DPU_PB_PFX "alpm: stopping, still sending the exit\n");
 
-	/* 3. ALPM exit, then 4.9's backlight_update_status(): the set-bl sequence */
-	ret_exit = pb_alpm_window(d, pb_alpm_exit, ARRAY_SIZE(pb_alpm_exit), NULL, &pm_out,
-				  &n_out);
-	pr_info(DPU_PB_PFX "alpm exit: %d, %d/%zu packets, RDDPM %#04x (idle %s)\n",
+	/*
+	 * 3. ALPM exit (every packet tried), then 4.9's backlight_update_status():
+	 * the set-bl sequence, also when stopping (Sol review R1 S3: the enter
+	 * changed AOR, which only the set-bl sequence restores, and dpu_stop()
+	 * leaves the display running; cancel_delayed_work_sync() waits for it).
+	 * pb_sequence() itself refuses unless RDDPM shows normal display.
+	 */
+	for (tries = 0; tries < 5; tries++) {
+		ret_exit = pb_alpm_window(d, pb_alpm_exit, ARRAY_SIZE(pb_alpm_exit), true, NULL,
+					  &pm_out, &n_out);
+		if (n_out)		/* the exit went out (or was tried): done */
+			break;
+		/* no command window / DSIM not ready: nothing sent, try again */
+		pr_err(DPU_PB_PFX "alpm exit: nothing sent (%d), retry %d\n", ret_exit, tries + 1);
+		msleep(20);
+	}
+	pr_info(DPU_PB_PFX "alpm exit: %d, %d/%zu packets attempted, RDDPM %#04x (idle %s)\n",
 		ret_exit, n_out, ARRAY_SIZE(pb_alpm_exit), pm_out, pm_out & 0x40 ? "ON" : "off");
-	if (!ret_exit && !READ_ONCE(d->stopping) && !dpu_cmd_window_begin(d, &trig)) {
+	if (!dpu_cmd_window_begin(d, &trig)) {
 		ret_bl = dpu_dsim_check(d);
 		if (!ret_bl) {
 			dpu_dsim_clear_status(d);
