@@ -474,7 +474,7 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 	struct pb_pkt pkt[16];
 	struct pb_state before, after;
 	u8 rddpm, id[3], hbm[PB_HBM_GAMMA_LEN], gamma[PB_HBM_GAMMA_LEN], et1;
-	int i, n, ret, ret2;
+	int i, n, ret, ret2 = 0;
 	bool key2 = false;
 
 	/* 0. status before anything else (a failed status read stops nothing) */
@@ -501,13 +501,14 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 
 	/*
 	 * 3. calibration reads, under the level 2 key as 4.9's dim-flash
-	 * resource init re-reads the HBM gamma.
+	 * resource init re-reads the HBM gamma. A failed key on may still
+	 * have reached the panel, so key off follows every key-on attempt
+	 * (as dpu_panel_status_work()).
 	 */
-	ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
-	if (ret)
-		return ret;
 	key2 = true;
-	ret = pb_read(d, 0xB3, PB_HBM_GAMMA_OFS, hbm, sizeof(hbm));
+	ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
+	if (!ret)
+		ret = pb_read(d, 0xB3, PB_HBM_GAMMA_OFS, hbm, sizeof(hbm));
 	if (!ret)
 		ret = pb_read(d, 0xB5, PB_ELVSS_TEMP_1_OFS, &et1, 1);
 	if (!ret)
@@ -549,18 +550,20 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 	if (ret)
 		goto fail;
 
-	/* 5. read back (diagnostic only) */
+	/* 5. read back (diagnostic only); key off after every key-on attempt */
+	key2 = true;
 	ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
 	if (!ret) {
-		key2 = true;
 		ret = pb_snapshot(d, &after);
 		if (!ret)
 			pb_status_read_keyed(d, sa);	/* inside the existing key window */
-		ret2 = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
-		if (!ret2)
-			key2 = false;
 	}
-	if (!key2)
+	if (!pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)) ||
+	    !pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off)))
+		key2 = false;
+	if (key2)
+		pr_err(DPU_PB_PFX "could not send level 2 key off after the read-back\n");
+	else
 		pb_status_read(d, sa);		/* status after the sequence */
 	if (ret) {
 		d->pb_readback = "FAILED";
