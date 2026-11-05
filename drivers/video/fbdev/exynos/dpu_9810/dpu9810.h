@@ -132,6 +132,7 @@ struct dpu_dev {
 	atomic64_t fence_seqno;
 	spinlock_t fence_lock;
 	u32 nr_commits, nr_latch_timeouts, nr_rejects;
+	u32 nr_base_mismatch;			/* active IDMA base != programmed */
 	u32 hwc_ver;
 
 	/* vsync (TE EINT, as 4.9 decon_ext_irq_handler) */
@@ -185,7 +186,8 @@ u32 dpu_hw_dpp_to_channel(u32 dpp);
 u32 dpu_hw_dma_rd(struct dpu_dev *d, int dpp, u32 off);
 void dpu_hw_trigger(struct dpu_dev *d, bool enable);
 int dpu_hw_wait_shadow(struct dpu_dev *d, unsigned int timeout_us);
-void dpu_hw_update_req_global(struct dpu_dev *d);
+void dpu_hw_update_req(struct dpu_dev *d);
+u32 dpu_hw_dma_active_rd(struct dpu_dev *d, int dpp, u32 off);
 void dpu_hw_dpp_init(struct dpu_dev *d, int dpp);
 int dpu_hw_dpp_config(struct dpu_dev *d, int dpp, const struct decon_win_config *c,
 		      u32 dpp_fmt, dma_addr_t addr);

@@ -301,7 +301,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 		dpu_hw_win_config(d, i, &c->cfg[i],
 				  c->cfg[i].state != DECON_WIN_STATE_DISABLED);
 
-	dpu_hw_update_req_global(d);
+	dpu_hw_update_req(d);
 	dpu_hw_trigger(d, true);
 	t0 = ktime_get();
 	ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
@@ -311,6 +311,20 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 		d->nr_latch_timeouts++;
 		dev_warn_ratelimited(d->dev, "shadow update did not latch in %u us (FRAME_COUNT %u -> %u)\n",
 				     DPU_LATCH_US, c->fc_before, c->fc_after);
+	} else {
+		/* "latched" must mean the IDMA now scans the new buffer */
+		for (i = 0; i < DECON_MAX_WIN; i++) {
+			u32 act;
+
+			if (c->cfg[i].state != DECON_WIN_STATE_BUFFER)
+				continue;
+			act = dpu_hw_dma_active_rd(d, c->cfg[i].idma_type, IDMA_IN_BASE_ADDR_Y);
+			if (act == lower_32_bits(c->buf[i].addr))
+				continue;
+			d->nr_base_mismatch++;
+			dev_warn_ratelimited(d->dev, "win%d dpp%u: active IDMA base %#x, programmed %pad\n",
+					     i, c->cfg[i].idma_type, act, &c->buf[i].addr);
+		}
 	}
 out:
 	mutex_unlock(&d->hw_lock);
@@ -956,9 +970,12 @@ static int dpu_fb_takeover(struct dpu_dev *d)
 	ret = dpu_kcommit(d, wd, db, &us);
 	dma_buf_put(db);
 	kfree(wd);
-	dev_info(d->dev, "fb0 takeover: win%d dpp%d DPP BGRA_8888 at %pa: %d, latched after %u us, FRAME_COUNT %u -> %u\n",
+	dev_info(d->dev, "fb0 takeover: win%d dpp%d DPP BGRA_8888 at %pa: %d, latched after %u us, FRAME_COUNT %u -> %u, active IDMA base %#x IN_CON %#x (SFR IN_CON %#x)\n",
 		 d->boot_win, d->boot_dpp, &d->fb_phys, ret, us, fc0,
-		 dpu_hw_frame_count(d));
+		 dpu_hw_frame_count(d),
+		 dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y),
+		 dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_CON),
+		 dpu_hw_dma_rd(d, d->boot_dpp, IDMA_IN_CON));
 	if (!ret)
 		d->fb_taken = true;
 	return ret;
@@ -1019,7 +1036,8 @@ static void dpu_st_work(struct work_struct *work)
 	struct decon_win_config_data *wd;
 	struct dma_buf *buf[2] = { };
 	void *va[2] = { };
-	u32 fc0, te0, fc_prev, us, ok = 0, adv = 0, max_us = 0, i;
+	u32 fc0, te0, fc_prev, us, ok = 0, adv = 0, max_us = 0, i, based = 0;
+	bool restored_ok = !d->fb_taken;
 	int ret;
 	u64 ms = ktime_to_ms(ktime_get_boottime());
 
@@ -1045,19 +1063,26 @@ static void dpu_st_work(struct work_struct *work)
 	}
 
 	for (i = 0; i < d->st_flips && !READ_ONCE(d->stopping); i++) {
-		u32 fc, te;
+		dma_addr_t want = ((struct dpu_kbuf *)buf[i & 1]->priv)->dma;
+		u32 fc, te, act, sfr;
 
 		dpu_fb_window(d, wd);
 		ret = dpu_kcommit(d, wd, buf[i & 1], &us);
 		fc = dpu_hw_frame_count(d);
 		te = atomic_read(&d->te_count);
+		/* what the IDMA really scans, not just "a frame went out" */
+		act = dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y);
+		sfr = dpu_hw_dma_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y);
 		if (!ret)
 			ok++;
 		if (fc != fc_prev)
 			adv++;
+		if (act == lower_32_bits(want))
+			based++;
 		max_us = max(max_us, us);
-		pr_info(DPU_ST_PFX "flip %u -> %c: %d, fence after %u us, FRAME_COUNT %u (+%u) TE %u (+%u)\n",
-			i, 'A' + (i & 1), ret, us, fc, fc - fc_prev, te, te - te0);
+		pr_info(DPU_ST_PFX "flip %u -> %c: %d, fence after %u us, FRAME_COUNT %u (+%u) TE %u (+%u), IDMA base active %#x SFR %#x want %pad %s\n",
+			i, 'A' + (i & 1), ret, us, fc, fc - fc_prev, te, te - te0, act, sfr,
+			&want, act == lower_32_bits(want) ? "OK" : "WRONG");
 		fc_prev = fc;
 		msleep(d->st_period_ms);
 	}
@@ -1066,12 +1091,16 @@ out:
 	/* back to fb0 so the console is visible again; releases A and B */
 	if (d->fb_taken) {
 		struct dma_buf *fb = dpu_kbuf_create(d, d->fb_size, d->fb_phys, NULL);
+		u32 act;
 
 		if (!IS_ERR(fb)) {
 			dpu_fb_window(d, wd);
 			ret = dpu_kcommit(d, wd, fb, &us);
 			dma_buf_put(fb);
-			pr_info(DPU_ST_PFX "restored fb0: %d\n", ret);
+			act = dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y);
+			restored_ok = !ret && act == lower_32_bits(d->fb_phys);
+			pr_info(DPU_ST_PFX "restored fb0: %d, active IDMA base %#x %s\n", ret, act,
+				restored_ok ? "OK" : "WRONG");
 		}
 	}
 	for (i = 0; i < 2; i++)
@@ -1079,11 +1108,13 @@ out:
 			dma_buf_put(buf[i]);
 	kfree(wd);
 
-	pr_info(DPU_ST_PFX "%s: %u/%u flips latched, FRAME_COUNT %u -> %u (advanced in %u/%u flips), TE %u -> %u, max fence wait %u us, latch timeouts %u\n",
+	pr_info(DPU_ST_PFX "%s: %u/%u flips latched, active IDMA base right in %u/%u flips, fb0 restore %s, FRAME_COUNT %u -> %u (advanced in %u/%u flips), TE %u -> %u, max fence wait %u us, latch timeouts %u, base mismatches %u\n",
 		(d->st_flips && ok == d->st_flips && adv == d->st_flips &&
+		 based == d->st_flips && restored_ok &&
 		 (d->te_irq < 0 || atomic_read(&d->te_count) != te0)) ? "PASS" : "FAIL",
-		ok, d->st_flips, fc0, dpu_hw_frame_count(d), adv, d->st_flips, te0,
-		atomic_read(&d->te_count), max_us, d->nr_latch_timeouts);
+		ok, d->st_flips, based, d->st_flips, restored_ok ? "OK" : "WRONG",
+		fc0, dpu_hw_frame_count(d), adv, d->st_flips, te0,
+		atomic_read(&d->te_count), max_us, d->nr_latch_timeouts, d->nr_base_mismatch);
 	pr_info(DPU_ST_PFX "a person must confirm the panel alternated green 'A' / magenta 'B' and then showed the console again\n");
 }
 
@@ -1146,8 +1177,10 @@ static int dpu_adopt(struct dpu_dev *d)
 		off = dpu_hw_dma_rd(d, dpp, IDMA_SRC_OFFSET);
 		base = dpu_hw_dma_rd(d, dpp, IDMA_IN_BASE_ADDR_Y);
 		dimg = readl(d->dpp_regs + dpp * 0x1000 + DPP_IMG_SIZE);
-		dev_info(d->dev, "win%d -> dpp%d: IN_CON=%#x SRC=%#x IMG=%#x OFF=%#x BASE=%#x (DPP IMG=%#x)\n",
-			 w, dpp, in, src, img, off, base, dimg);
+		dev_info(d->dev, "win%d -> dpp%d: IN_CON=%#x SRC=%#x IMG=%#x OFF=%#x BASE=%#x (DPP IMG=%#x; active IN_CON=%#x BASE=%#x)\n",
+			 w, dpp, in, src, img, off, base, dimg,
+			 dpu_hw_dma_active_rd(d, dpp, IDMA_IN_CON),
+			 dpu_hw_dma_active_rd(d, dpp, IDMA_IN_BASE_ADDR_Y));
 		if (base == d->fb_phys && (src & 0xffff) * 4 == d->fb_stride &&
 		    ((src >> 16) & 0x3fff) >= d->lcd.yres &&
 		    (img & 0x1fff) == d->lcd.xres && ((img >> 16) & 0x1fff) == d->lcd.yres &&

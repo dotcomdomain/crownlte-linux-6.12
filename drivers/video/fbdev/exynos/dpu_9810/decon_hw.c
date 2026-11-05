@@ -103,10 +103,30 @@ int dpu_hw_wait_shadow(struct dpu_dev *d, unsigned int timeout_us)
 				  250, timeout_us);
 }
 
-/* 4.9 decon_reg_update_req_global() */
-void dpu_hw_update_req_global(struct dpu_dev *d)
+/*
+ * 4.9 __decon_update_regs(): decon_reg_all_win_shadow_update_req() (per-window
+ * bits [5:0]) and then decon_reg_start() -> decon_reg_update_req_global()
+ * (bit 31). The global bit only covers DECON 0x0000-0x011C and
+ * 0x0230-0x209C; the per-window requests are what make the window's DPP/IDMA
+ * channel take its new SFRs (base address, format, sizes). With the global
+ * bit alone (trials q39/q45) the DECON shadow cleared and FRAME_COUNT
+ * advanced, but IDMA kept scanning the old base.
+ */
+void dpu_hw_update_req(struct dpu_dev *d)
 {
+	decon_wr_mask(d, SHADOW_REG_UPDATE_REQ, ~0U, SHADOW_REG_UPDATE_REQ_FOR_DECON);
 	decon_wr_mask(d, SHADOW_REG_UPDATE_REQ, ~0U, SHADOW_REG_UPDATE_REQ_GLOBAL);
+}
+
+/*
+ * The IDMA SFRs in use: 4.9 dpp_drv.c dma_dump_regs() prints them as the
+ * "SHADOW SFR DUMP" at dma_regs + 0x800 (same layout as the SFRs at +0).
+ */
+#define IDMA_ACTIVE_OFS	0x800
+
+u32 dpu_hw_dma_active_rd(struct dpu_dev *d, int dpp, u32 off)
+{
+	return dma_rd(d, dpp, IDMA_ACTIVE_OFS + off);
 }
 
 /* ---- DPP ------------------------------------------------------------- */
