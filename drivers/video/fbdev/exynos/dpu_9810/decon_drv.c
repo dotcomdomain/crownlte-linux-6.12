@@ -624,9 +624,13 @@ static void dpu_bisect(struct dpu_dev *d, struct dpu_commit *c)
 		d->bisect_started = true;
 		d->bisect_t0 = ktime_get();
 		d->bisect_var = -1;
+		d->bisect_ms = READ_ONCE(hwc_bisect_ms);
+		/* restore at the deadline even if HWC submits nothing more */
+		kthread_queue_delayed_work(d->worker, &d->bisect_restore,
+					   msecs_to_jiffies(d->bisect_ms));
 	}
 	ms = ktime_ms_delta(ktime_get(), d->bisect_t0);
-	if (ms >= READ_ONCE(hwc_bisect_ms)) {
+	if (ms >= d->bisect_ms) {
 		d->bisect_done = true;
 		dev_info(d->dev, "hwc-bisect: done after %lld ms, back to variant A for good\n", ms);
 		return;
@@ -634,6 +638,13 @@ static void dpu_bisect(struct dpu_dev *d, struct dpu_commit *c)
 	v = (ms / 2000) % DPU_BIS_N;
 	if (v == DPU_BIS_C && test_bit(DECON_IDMA_VGF1, &used))
 		v = DPU_BIS_A;		/* VGF1 busy with another layer */
+	if (v != DPU_BIS_A) {
+		/* what dpu_bisect_restore() puts back */
+		c->bisect_win = tw;
+		c->orig_idma = c->cfg[tw].idma_type;
+		c->orig_comp = c->cfg[tw].compression;
+		c->bisect_altered = true;
+	}
 	if (v == DPU_BIS_C)
 		c->cfg[tw].idma_type = DECON_IDMA_VGF1;
 	if (v == DPU_BIS_B)
@@ -885,6 +896,63 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		old = c;
 	}
 	dpu_commit_free(old);
+}
+
+/*
+ * hwc-bisect deadline (Sol review S5): if HWC stops submitting while B or
+ * C is on screen, re-commit the frame being scanned with HWC's own window
+ * values, through the update worker (this is a kthread_delayed_work on
+ * it, so it is serialised with commits). The buffers are imported again
+ * from the active commit's dma-bufs; the active commit keeps its own
+ * references until the restored frame latches and dpu_process() frees it.
+ */
+static void dpu_bisect_restore(struct kthread_work *work)
+{
+	struct dpu_dev *d = container_of(work, struct dpu_dev, bisect_restore.work);
+	struct dpu_commit *a = d->active, *n;
+	const char *why = NULL;
+	int i, ret = 0;
+
+	if (d->bisect_done || !d->bisect_started)
+		return;			/* a commit already ended the bisect */
+	d->bisect_done = true;
+	if (!a || !a->bisect_altered) {
+		dev_info(d->dev, "hwc-bisect: deadline, variant A on screen, nothing to restore\n");
+		return;
+	}
+	n = kzalloc(sizeof(*n), GFP_KERNEL);
+	if (!n) {
+		dev_err(d->dev, "hwc-bisect: deadline, cannot restore (no memory)\n");
+		return;
+	}
+	for (i = 0; i < DECON_MAX_WIN && !ret; i++) {
+		struct decon_win_config *w = &n->cfg[i];
+		u64 need;
+
+		*w = a->cfg[i];
+		n->dpp_fmt[i] = a->dpp_fmt[i];
+		if (i == a->bisect_win) {
+			w->idma_type = a->orig_idma;
+			w->compression = a->orig_comp;
+		}
+		if (w->state == DECON_WIN_STATE_DISABLED)
+			continue;
+		n->nr_win++;
+		if (w->state != DECON_WIN_STATE_BUFFER)
+			continue;
+		get_dma_buf(a->buf[i].dmabuf);
+		need = (u64)w->src.f_w * w->src.f_h * dpu_fmt_bpp(n->dpp_fmt[i]) / 8;
+		ret = dpu_buf_import(d, a->buf[i].dmabuf, &n->buf[i], need,
+				     a->buf[i].bounce, &why);
+	}
+	if (ret) {
+		dev_err(d->dev, "hwc-bisect: deadline, cannot restore: %s (%d)\n", why, ret);
+		dpu_commit_free(n);
+		return;
+	}
+	n->queued = ktime_get();
+	dpu_process(d, n);	/* consumes n */
+	dev_info(d->dev, "hwc-bisect: deadline with no new HWC frame: restored the last HWC frame as sent\n");
 }
 
 static void dpu_update_work(struct kthread_work *work)
@@ -2034,6 +2102,7 @@ static int dpu_probe(struct platform_device *pdev)
 	}
 	sched_set_fifo(d->worker->task);
 	kthread_init_work(&d->work, dpu_update_work);
+	kthread_init_delayed_work(&d->bisect_restore, dpu_bisect_restore);
 
 	ret = dpu_register_fb(d);
 	if (ret)
@@ -2108,6 +2177,7 @@ static void dpu_stop(struct dpu_dev *d)
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->st_work);
+	kthread_cancel_delayed_work_sync(&d->bisect_restore);
 	kthread_flush_worker(d->worker);
 }
 

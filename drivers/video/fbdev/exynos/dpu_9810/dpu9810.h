@@ -103,6 +103,10 @@ struct dpu_commit {
 	unsigned long pattern_win;	/* hwc-bisect B: draw the test pattern here */
 	int bisect_var;			/* hwc-bisect variant of this frame */
 	bool bisect_log;		/* first frame of a new variant */
+	bool bisect_altered;		/* B or C applied to window bisect_win */
+	int bisect_win;
+	u32 orig_idma;			/* HWC's values for bisect_win */
+	u8 orig_comp;
 	ktime_t queued;
 	u32 latch_us;			/* filled by the worker */
 	u32 fc_before, fc_after;
@@ -164,6 +168,8 @@ struct dpu_dev {
 	bool bisect_started, bisect_done;	/* hwc-bisect (decon_drv.c) */
 	int bisect_var;
 	ktime_t bisect_t0;
+	u32 bisect_ms;
+	struct kthread_delayed_work bisect_restore;
 	u32 hwc_ver;
 
 	/* vsync (TE EINT, as 4.9 decon_ext_irq_handler) */
