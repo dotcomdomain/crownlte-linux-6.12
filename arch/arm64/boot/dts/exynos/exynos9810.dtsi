@@ -68,6 +68,7 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x0>;
 			enable-method = "psci";
+			cpu-idle-states = <&LITTLE_CPU_SLEEP>;
 		};
 
 		cpu1: cpu@1 {
@@ -75,6 +76,7 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x1>;
 			enable-method = "psci";
+			cpu-idle-states = <&LITTLE_CPU_SLEEP>;
 		};
 
 		cpu2: cpu@2 {
@@ -82,6 +84,7 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x2>;
 			enable-method = "psci";
+			cpu-idle-states = <&LITTLE_CPU_SLEEP>;
 		};
 
 		cpu3: cpu@3 {
@@ -89,6 +92,7 @@
 			compatible = "arm,cortex-a55";
 			reg = <0x3>;
 			enable-method = "psci";
+			cpu-idle-states = <&LITTLE_CPU_SLEEP>;
 		};
 
 		cpu4: cpu@100 {
@@ -96,6 +100,7 @@
 			compatible = "samsung,mongoose-m3";
 			reg = <0x100>;
 			enable-method = "psci";
+			cpu-idle-states = <&BIG_CPU_SLEEP>;
 		};
 
 		cpu5: cpu@101 {
@@ -103,6 +108,7 @@
 			compatible = "samsung,mongoose-m3";
 			reg = <0x101>;
 			enable-method = "psci";
+			cpu-idle-states = <&BIG_CPU_SLEEP>;
 		};
 
 		cpu6: cpu@102 {
@@ -110,6 +116,7 @@
 			compatible = "samsung,mongoose-m3";
 			reg = <0x102>;
 			enable-method = "psci";
+			cpu-idle-states = <&BIG_CPU_SLEEP>;
 		};
 
 		cpu7: cpu@103 {
@@ -117,6 +124,39 @@
 			compatible = "samsung,mongoose-m3";
 			reg = <0x103>;
 			enable-method = "psci";
+			cpu-idle-states = <&BIG_CPU_SLEEP>;
+		};
+
+		/*
+		 * Core power-down (C2) values from the crownlte 4.9 DT
+		 * (bootcl-cpu-sleep / nobootcl-cpu-sleep). Deliberately not
+		 * "arm,idle-state": entering C2 needs the FlexPMU steps of
+		 * drivers/cpuidle/cpuidle-exynos9810.c, which the generic
+		 * PSCI idle driver does not perform. The arch timer stops
+		 * when the core is powered down (4.9 ticked on the MCT local
+		 * timers), so these states need the MCT tick broadcast.
+		 * Cluster power-down (4.9 CPD) is not described.
+		 */
+		idle-states {
+			LITTLE_CPU_SLEEP: c2-little {
+				compatible = "samsung,exynos9810-idle-state";
+				idle-state-name = "c2";
+				arm,psci-suspend-param = <0x10000>;
+				entry-latency-us = <70>;
+				exit-latency-us = <160>;
+				min-residency-us = <2000>;
+				local-timer-stop;
+			};
+
+			BIG_CPU_SLEEP: c2-big {
+				compatible = "samsung,exynos9810-idle-state";
+				idle-state-name = "c2";
+				arm,psci-suspend-param = <0x10000>;
+				entry-latency-us = <235>;
+				exit-latency-us = <220>;
+				min-residency-us = <3500>;
+				local-timer-stop;
+			};
 		};
 	};
 
@@ -169,6 +209,20 @@
 			compatible = "samsung,exynos9810-chipid",
 				     "samsung,exynos850-chipid";
 			reg = <0x10000000 0x100>;
+		};
+
+		/*
+		 * Multi Core Timer. Only global comparator 0 (MCT G0) is
+		 * described, for the tick broadcast driver exynos9810-mct-bc.
+		 * 4.9 used SPIs 466-469 (G0-G3) and 470-477 (L0-L7).
+		 * Deliberately not "samsung,exynos4210-mct": that early
+		 * TIMER_OF driver panics on any clock or write failure.
+		 */
+		mct: timer@10040000 {
+			compatible = "samsung,exynos9810-mct-broadcast";
+			reg = <0x10040000 0x800>;
+			interrupts = <GIC_SPI 466 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
 		};
 
 		watchdog_cl0: watchdog@10050000 {
@@ -243,6 +297,18 @@
 			compatible = "samsung,exynos9810-pmu",
 				     "samsung,exynos7-pmu", "syscon";
 			reg = <0x14060000 0x10000>;
+		};
+
+		/*
+		 * reg is the FlexPMU interrupt generator (PMU_INTR_GEN). The
+		 * driver only reads it for diagnostics; the C2 sequences are
+		 * the PMUCAL ones, already mapped by CAL.
+		 */
+		cpuidle: cpuidle@14070000 {
+			compatible = "samsung,exynos9810-cpuidle";
+			reg = <0x14070000 0x1000>;
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			status = "disabled";
 		};
 
 		pinctrl_cmgp: pinctrl@14220000 {
