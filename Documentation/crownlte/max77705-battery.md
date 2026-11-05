@@ -178,6 +178,10 @@ the input limit itself).
 
 ## Next stages
 
+* Charger watchdog kick (CNFG_06 WDTCLR only, supervised, DT `samsung,charger-wdt-kick`,
+  off by default): implemented, see `power-gates.md`. With it enabled the driver is no
+  longer write-free; the self-test then counts the kicks as its only writes.
+
 * ADC thermistors (battery, USB, charger) → real `battery`/`ac` temperatures: done (soc-adc.md).
 * Charger RW only after register-by-register parity with 4.9 (ROADMAP risk 6),
   starting with re-enabling charging after a 4.9 reboot.

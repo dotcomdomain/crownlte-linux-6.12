@@ -82,25 +82,57 @@ enum mfd_func {
 #define ACPM_MFD_G3D_RAIL_OFF		0x00
 
 /*
+ * Touch IC rails (4.9 s2mps18.c s2m_enable() for the sec_ts consumers
+ * tsp_io/tsp_avdd): FUNC_UPDATE type 1 (PMIC), mask 0xc0 = the enable/mode
+ * field. The APM firmware treats every update other than 0x32a/0xc0 as a
+ * SPEEDY read-modify-write (rd & ~mask) | (val & mask), so only bits 7:6
+ * of the register can change; the voltage field (bits 5:0) is never sent.
+ *   LDO35 L35CTRL 0x6c, vsel 0x2c (1.8 V): on 0x80 (mode 0b10, 4.9
+ *         SEC_OPMODE_MIF) -> 0xac, off 0x00 -> 0x2c
+ *   LDO43 L43CTRL 0x74, vsel 0x30 (3.0 V): on 0xc0 (mode 0b11, always on)
+ *         -> 0xf0, off 0x00 -> 0x30
+ * Before sending, the transport reads the PMIC and also refuses:
+ *   - LDO35 on unless 0x6c reads vsel 0x2c with mode 0b00 or 0b10;
+ *   - LDO43 on unless 0x6c reads exactly 0xac (LDO35 on) and 0x74 reads
+ *     vsel 0x30 with mode 0b00 or 0b11;
+ *   - LDO35 off unless 0x74 reads mode 0b00 (LDO43 goes off first);
+ *   - the third and later "on" request per rail and boot.
+ */
+#define ACPM_MFD_TOUCH_RAIL_MASK	0xc0
+#define ACPM_MFD_TOUCH_VSEL_MASK	0x3f
+#define ACPM_MFD_TOUCH_L35_REG		0x6c
+#define ACPM_MFD_TOUCH_L35_VSEL		0x2c
+#define ACPM_MFD_TOUCH_L35_ON		0x80
+#define ACPM_MFD_TOUCH_L43_REG		0x74
+#define ACPM_MFD_TOUCH_L43_VSEL		0x30
+#define ACPM_MFD_TOUCH_L43_ON		0xc0
+#define ACPM_MFD_TOUCH_RAIL_OFF		0x00
+#define ACPM_MFD_TOUCH_MAX_ON		2
+
+/*
  * Write policy of the ACPM PMIC transport. Until a policy is sealed every
  * write/bulk-write/update request is refused with -EPERM. A sealed policy
  * can only open registers 0..31 of the RTC slave (type 2); writes to TOP,
  * PMIC (regulators, IRQ masks, power control) and any other type are always
  * refused. A write to @update_reg must not set any bit in @update_forbidden.
  * FUNC_UPDATE is refused, except, if @g3d_rail is set, the two exact G3D
- * rail requests above (type 3, reg 0x2a, mask 0xc0, value 0xc0 or 0x00).
- * The policy can be sealed once per boot.
+ * rail requests above (type 3, reg 0x2a, mask 0xc0, value 0xc0 or 0x00),
+ * and, if @touch_rails is set, the four exact touch rail requests above
+ * with their read-back preconditions. FUNC_WRITE/FUNC_BULK_WRITE to the
+ * PMIC stay refused in every case. The policy can be sealed once per boot.
  */
 struct acpm_mfd_write_policy {
 	u32 rtc_reg_mask;
 	u8 update_reg;
 	u8 update_forbidden;
 	bool g3d_rail;
+	bool touch_rails;
 };
 
 #ifdef CONFIG_EXYNOS_ACPM
 bool exynos_acpm_mfd_is_ready(void);
 int exynos_acpm_mfd_seal_write_policy(const struct acpm_mfd_write_policy *policy);
+int exynos_acpm_mfd_touch_rails_policy(void);
 extern int exynos_acpm_read_reg(u16 type, u8 reg, u8 *dest);
 extern int exynos_acpm_bulk_read(u16 type, u8 reg, int count, u8 *buf);
 extern int exynos_acpm_write_reg(u16 type, u8 reg, u8 value);
@@ -110,6 +142,10 @@ extern int exynos_acpm_update_reg(u16 type, u8 reg, u8 value, u8 mask);
 static inline bool exynos_acpm_mfd_is_ready(void) { return false; }
 static inline int
 exynos_acpm_mfd_seal_write_policy(const struct acpm_mfd_write_policy *policy)
+{
+	return -ENODEV;
+}
+static inline int exynos_acpm_mfd_touch_rails_policy(void)
 {
 	return -ENODEV;
 }

@@ -41,6 +41,18 @@
  * Read-only by construction: every bus access goes through mx_read(), which
  * issues I2C_SMBUS_READ transfers only. The write APIs are poisoned below, so
  * a future edit that calls one fails to compile.
+ *
+ * One exception, off unless the DT has samsung,charger-wdt-kick: the charger
+ * watchdog kick of 4.9 max77705_chg_set_wdtmr_kick() (charger.c:227-235,
+ * called from every health poll, :300). SBoot leaves fast charge on with
+ * CNFG_00.WDTEN=1, and without a kick the charger stops charging after
+ * ~80 s (CHG_DTLS 0xb). The kick is a read-modify-write of CNFG_06 (0x69
+ * reg 0xbd): bits 1:0 WDTCLR = 01, bits 7:2 as just read. It is sent every
+ * 10 s, and only while the supervisor below accepts a sample taken in the
+ * same poll; otherwise kicking stops and the watchdog ends charging by
+ * itself. The watchdog is never disabled and no other register is written.
+ * mx_chg_wdt_kick_write() is the only write and is defined before the
+ * poison, with the address, register and value fixed.
  */
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -59,6 +71,26 @@
 #include <linux/thermal.h>
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
+
+/*
+ * The only MAX77705 write in this driver (samsung,charger-wdt-kick): charger
+ * slave 0x69, CNFG_06 0xbd, (cnfg06 & ~0x03) | 0x01 = WDTCLR. @cnfg06 is the
+ * value read just before; the caller checks bits 7:2 before and after.
+ */
+#define MX_KICK_ADDR		0x69
+#define MX_KICK_REG		0xbd
+#define MX_KICK_MASK		0x03
+#define MX_KICK_WDTCLR		0x01
+
+static int mx_chg_wdt_kick_write(struct i2c_adapter *adap, u8 cnfg06)
+{
+	union i2c_smbus_data d = {
+		.byte = (cnfg06 & ~MX_KICK_MASK) | MX_KICK_WDTCLR,
+	};
+
+	return i2c_smbus_xfer(adap, MX_KICK_ADDR, 0, I2C_SMBUS_WRITE,
+			      MX_KICK_REG, I2C_SMBUS_BYTE_DATA, &d);
+}
 
 #pragma GCC poison i2c_smbus_write_byte i2c_smbus_write_byte_data
 #pragma GCC poison i2c_smbus_write_word_data i2c_smbus_write_block_data
@@ -100,6 +132,11 @@
 #define  DTLS00_WCIN(x)		(((x) >> 3) & 0x3)
 #define  DTLS00_CHGIN(x)	(((x) >> 5) & 0x3)
 #define  DTLS00_AUTOIBUS	BIT(7)
+/* CHGIN_DTLS / WCIN_DTLS (4.9 max77705_get_vbus_state()) */
+#define  IN_DTLS_UVLO		0x0	/* below UVLO: no input */
+#define  IN_DTLS_UV		0x1	/* above UVLO, below MBAT + headroom */
+#define  IN_DTLS_OV		0x2	/* above OVLO */
+#define  IN_DTLS_VALID		0x3
 #define CHG_REG_DTLS_01		0xb4
 #define  DTLS01_CHG(x)		((x) & 0xf)
 #define  DTLS01_BAT(x)		(((x) >> 4) & 0x7)
@@ -111,6 +148,7 @@
 #define  CNFG00_WDTEN		BIT(4)
 #define CHG_REG_CNFG_02		0xb9
 #define CHG_REG_CNFG_04		0xbb
+#define CHG_REG_CNFG_06		0xbd
 #define CHG_REG_CNFG_09		0xc0
 #define CHG_REG_CNFG_10		0xc1
 #define CHG_REG_CNFG_FIRST	0xb7	/* CNFG_00 */
@@ -195,6 +233,55 @@ static const struct {
 #define DC_FMT			"%s%d.%d"
 #define DC_ARG(x)		(x) < 0 ? "-" : "", abs(x) / 10, abs(x) % 10
 
+/*
+ * Charger watchdog kick supervisor (samsung,charger-wdt-kick). A kick is
+ * sent only if every check passes on a sample taken in the same poll:
+ *  - FG, charger and both SoC ADC thermistor reads succeeded in this poll
+ *    (no "previous value" fallback); the sample's first read was taken
+ *    less than 20 s ago, checked again right before the kick write;
+ *  - battery present per FG (STATUS.BST = 0) and charger (4.9
+ *    max77705_check_battery(): INT_OK.BATP_OK or !DTLS_00.BATP_DTLS);
+ *    health GOOD; a known charger state (CHG_DTLS) that agrees with the
+ *    input (no charging state without CHGIN/WCIN);
+ *  - a valid input from the raw DETAILS_00 fields, independent of the
+ *    cable classification (4.9 max77705_get_vbus_state() and
+ *    max77705_get_charging_health()): CHGIN_DTLS and WCIN_DTLS both not
+ *    01 (undervoltage) or 10 (overvoltage), and CHGIN_OK with CHGIN_DTLS
+ *    11 or WCIN_OK with WCIN_DTLS 11. 4.9 sec_bat_ovp_uvlo_result() stops
+ *    charging on input UV/OV;
+ *  - battery NTC (ch4) in its table range and 10.0 <= T < 41.0 C (resume
+ *    below 39.0 C; cold side: stop below 10.0 C, resume at 10.0 C). 4.9
+ *    swelling drops CV to 4.15 V above 41 C and, below 10 C after its
+ *    5 C block, only allows a restricted 4.15 V recharge; a kick cannot
+ *    lower CV, so it stops instead;
+ *  - charger NTC (ch3) in its table range and T < 44.0 C (resume < 42.0 C);
+ *  - 3000 mV <= VCELL, AvgVCELL <= 4400 mV (CV 4350 mV + 50 mV);
+ *  - CNFG_00 has WDTEN and CNFG_00/02/04 equal their probe values, with
+ *    CV <= 4350 mV and CC <= 1500 mA (<= 950 mA below 20.0 C, 4.9's 1st
+ *    cold-swelling tier with its recovery);
+ *  - CNFG_06 bits 7:2 equal their probe value, before and after the kick,
+ *    and CHGPROT (bits 3:2) reads 11 = unlocked, as 4.9 init leaves it
+ *    (max77705_charger.c:1008-1012). Locked: no kick, no unlock write.
+ * A changed CNFG_06 or locked CHGPROT stops kicking for the rest of the
+ * boot. Shutdown stops all works first (no charger write at shutdown).
+ */
+#define KICK_PERIOD_MS		10000	/* 4.9 battery,polling_time while charging */
+#define KICK_MAX_AGE_MS		20000
+#define KICK_BATT_MIN_DC	100	/* 4.9 swelling_low_temp_recov_2nd */
+#define KICK_BATT_COLD_RESUME_DC 100	/* no restricted-recharge band */
+#define KICK_BATT_MAX_DC	410	/* 4.9 swelling_high_temp_block */
+#define KICK_BATT_HOT_RESUME_DC	390	/* 4.9 swelling_high_temp_recov */
+#define KICK_CHG_MAX_DC		440
+#define KICK_CHG_HOT_RESUME_DC	420
+#define KICK_VCELL_MIN_MV	3000
+#define KICK_VCELL_MAX_MV	4400
+#define KICK_CV_MAX_MV		4350
+#define KICK_CC_MAX_MA		1500
+#define KICK_COOL_DC		200	/* 4.9 swelling_low_temp_recov_1st */
+#define KICK_COOL_CC_MAX_MA	950	/* 4.9 swelling_low_temp_current */
+#define KICK_LOG_MAX		16	/* stop/start messages per boot */
+#define KICK_CHGPROT_MASK	0x0c	/* CNFG_06 bits 3:2, 11 = unlocked */
+
 #define MX_ADC_RETRY_CNT	3	/* 4.9 sec_adc.h RETRY_CNT */
 #define MX_ADC_MAX_COUNT	16
 
@@ -204,6 +291,7 @@ struct mx_therm {
 	s32 *adc, *temp;		/* ascending ADC codes, 0.1 degC */
 	int prev_raw;			/* sec_bat_adc_ap_read() prev_value */
 	bool have_raw;
+	bool used_prev;			/* a read fell back to prev_raw */
 	unsigned long reads, errors;
 };
 
@@ -225,6 +313,8 @@ struct mx_snap {
 	/* raw */
 	u16 fg_status, config;
 	u8 int_ok, dtls0, dtls1, dtls2, cnfg00, cnfg02, cnfg04, cnfg09, cnfg10;
+	u64 t_ms;		/* boottime before the sample's first read */
+	const char *in_fault;	/* raw input check, NULL = valid input */
 	int bc;			/* USBC BC_STATUS or -errno */
 	/* converted, 4.9 units */
 	int vcell_mv, avgvcell_mv, vfocv_mv, vbyp_mv;
@@ -232,6 +322,8 @@ struct mx_snap {
 	int temp_dc;		/* 0.1 degC: ADC battery NTC, else FG TEMP */
 	int fg_temp_dc;		/* FG TEMP register, 0.1 degC */
 	bool therm_ok[THERM_NUM];
+	bool therm_fresh[THERM_NUM];	/* every conversion read in this poll */
+	bool therm_in_table[THERM_NUM];	/* not clamped to a table end */
 	int therm_raw[THERM_NUM];	/* trimmed-mean ADC code */
 	int therm_dc[THERM_NUM];	/* 0.1 degC */
 	int repsoc_dp;		/* 0.1 % */
@@ -260,6 +352,7 @@ struct mx_ro {
 
 	struct mutex lock;		/* snap, scaling state, counters */
 	struct mx_snap snap;
+	bool stopping;			/* shutdown: no more kicks */
 
 	/* DT, 4.9 names in comments */
 	u32 fg_resistor;		/* fuelgauge,fg_resistor */
@@ -298,6 +391,17 @@ struct mx_ro {
 	unsigned long writes;		/* no write path exists; stays 0 */
 	int muic_writes_at_probe;
 	u8 pmic_id, pmic_rev;
+
+	/* charger watchdog kick, samsung,charger-wdt-kick (under lock) */
+	bool kick_en;
+	bool kicking;			/* last decision was "kick" */
+	bool kick_dead;			/* CNFG_06 changed: never again */
+	bool kick_batt_hot, kick_batt_cold, kick_chg_hot;	/* hysteresis */
+	bool kick_expired_logged;
+	const char *kick_why;		/* last stop reason */
+	unsigned int kick_logs;
+	unsigned long kicks, kick_stops;
+	u64 last_kick_ms;
 
 	struct power_supply *psy_bat, *psy_ac, *psy_usb, *psy_wl;
 	struct delayed_work monitor;
@@ -615,6 +719,7 @@ static int mx_adc_read_one(struct mx_therm *t, int *raw)
 	}
 	if (!t->have_raw)
 		return ret < 0 ? ret : -EIO;
+	t->used_prev = true;
 	*raw = t->prev_raw;
 	return 0;
 }
@@ -684,8 +789,11 @@ static void mx_sample_therm(struct mx_ro *m, struct mx_snap *s)
 		struct mx_therm *t = &m->therm[i];
 
 		s->therm_ok[i] = false;
+		s->therm_fresh[i] = false;
+		s->therm_in_table[i] = false;
 		if (!t->ch)
 			continue;
+		t->used_prev = false;
 		ret = mx_adc_avg(m, t, NULL, &raw);
 		if (ret) {
 			dev_warn_ratelimited(m->dev, "%s thermistor ADC read failed: %d\n",
@@ -693,6 +801,8 @@ static void mx_sample_therm(struct mx_ro *m, struct mx_snap *s)
 			continue;
 		}
 		s->therm_ok[i] = true;
+		s->therm_fresh[i] = !t->used_prev;
+		s->therm_in_table[i] = raw > t->adc[0] && raw < t->adc[t->n - 1];
 		s->therm_raw[i] = raw;
 		s->therm_dc[i] = mx_adc_to_temp(t, raw);
 	}
@@ -761,6 +871,8 @@ static int mx_sample(struct mx_ro *m, struct mx_snap *s)
 	};
 
 	BUILD_BUG_ON(ARRAY_SIZE(regs) > ARRAY_SIZE(w));
+	/* age of the oldest measurement: the kick supervisor checks it */
+	s->t_ms = ktime_to_ms(ktime_get_boottime());
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
 		ret = mx_fg_word(m, regs[i], &w[i]);
 		if (ret)
@@ -822,6 +934,20 @@ static int mx_sample(struct mx_ro *m, struct mx_snap *s)
 		s->cable = CABLE_NONE;
 		s->input_ma = 0;
 	}
+	/*
+	 * Raw input state, independent of the cable classification above
+	 * (that one only looks at INT_OK and would call a UV/OV input "none").
+	 */
+	if (DTLS00_CHGIN(s->dtls0) == IN_DTLS_OV || DTLS00_WCIN(s->dtls0) == IN_DTLS_OV)
+		s->in_fault = "input overvoltage (CHGIN/WCIN_DTLS 10)";
+	else if (DTLS00_CHGIN(s->dtls0) == IN_DTLS_UV || DTLS00_WCIN(s->dtls0) == IN_DTLS_UV)
+		s->in_fault = "input undervoltage (CHGIN/WCIN_DTLS 01)";
+	else if (!((s->int_ok & INT_OK_CHGIN) && DTLS00_CHGIN(s->dtls0) == IN_DTLS_VALID) &&
+		 !((s->int_ok & INT_OK_WCIN) && DTLS00_WCIN(s->dtls0) == IN_DTLS_VALID))
+		s->in_fault = "no valid input (CHGIN/WCIN_OK with DTLS 11)";
+	else
+		s->in_fault = NULL;
+
 	s->vmax_uv = s->cable == CABLE_NONE ? 0 :
 		     (s->vbyp_mv > 7500 ? 9000000 : 5000000);
 
@@ -891,6 +1017,189 @@ static int mx_sample(struct mx_ro *m, struct mx_snap *s)
 	return 0;
 }
 
+/* --- charger watchdog kick ------------------------------------------------ */
+
+static bool mx_sample_fresh(const struct mx_snap *s, u64 now)
+{
+	return now >= s->t_ms && now - s->t_ms < KICK_MAX_AGE_MS;
+}
+
+static const char *mx_kick_therm_bad(const struct mx_snap *s, int id)
+{
+	if (!s->therm_ok[id])
+		return "read failed";
+	if (!s->therm_fresh[id])
+		return "stale (ADC fallback value)";
+	if (!s->therm_in_table[id])
+		return "outside its table (open/short?)";
+	return NULL;
+}
+
+/* NULL = kick allowed; else the reason. Caller holds m->lock. */
+static const char *mx_kick_check(struct mx_ro *m, const struct mx_snap *s,
+				 u64 now)
+{
+	int tb, tc;
+
+	if (!s || !s->valid)
+		return "FG/charger read failed";
+	if (!mx_sample_fresh(s, now))
+		return "sample not fresh";
+	if (!m->therm[THERM_BATT].ch || !m->therm[THERM_CHG].ch)
+		return "battery/charger NTC not wired";
+	if (mx_kick_therm_bad(s, THERM_BATT))
+		return "battery NTC not usable";
+	if (mx_kick_therm_bad(s, THERM_CHG))
+		return "charger NTC not usable";
+	if (!s->present)
+		return "battery not present";
+
+	tb = s->therm_dc[THERM_BATT];
+	tc = s->therm_dc[THERM_CHG];
+	if (tb >= KICK_BATT_MAX_DC)
+		m->kick_batt_hot = true;
+	else if (tb < KICK_BATT_HOT_RESUME_DC)
+		m->kick_batt_hot = false;
+	if (tb < KICK_BATT_MIN_DC)
+		m->kick_batt_cold = true;
+	else if (tb >= KICK_BATT_COLD_RESUME_DC)
+		m->kick_batt_cold = false;
+	if (tc >= KICK_CHG_MAX_DC)
+		m->kick_chg_hot = true;
+	else if (tc < KICK_CHG_HOT_RESUME_DC)
+		m->kick_chg_hot = false;
+	if (m->kick_batt_hot)
+		return "battery hot";
+	if (m->kick_batt_cold)
+		return "battery cold";
+	if (m->kick_chg_hot)
+		return "charger NTC hot";
+
+	if (s->vcell_mv > KICK_VCELL_MAX_MV || s->avgvcell_mv > KICK_VCELL_MAX_MV)
+		return "VCELL high";
+	if (s->vcell_mv < KICK_VCELL_MIN_MV || s->avgvcell_mv < KICK_VCELL_MIN_MV)
+		return "VCELL implausibly low";
+	/* UNKNOWN = input undervoltage (4.9 HEALTH_UNDERVOLTAGE: charging off) */
+	if (s->health != POWER_SUPPLY_HEALTH_GOOD)
+		return "battery/input health not good";
+	if (!((s->int_ok & INT_OK_BATP) || !DTLS00_BATP(s->dtls0)))
+		return "charger reports no battery";
+	if (s->status == POWER_SUPPLY_STATUS_UNKNOWN ||
+	    chg_dtls_status(DTLS01_CHG(s->dtls1)) == POWER_SUPPLY_STATUS_UNKNOWN)
+		return "unknown charger state";
+	if (s->cable == CABLE_NONE && DTLS01_CHG(s->dtls1) <= 0x3)
+		return "charging state without input";
+	if (s->in_fault)
+		return s->in_fault;
+
+	if (!(s->cnfg00 & CNFG00_WDTEN))
+		return "CNFG_00 WDTEN clear (nothing to kick)";
+	if (s->cnfg00 != m->chg_cfg0[CHG_REG_CNFG_00 - CHG_REG_CNFG_FIRST] ||
+	    s->cnfg02 != m->chg_cfg0[CHG_REG_CNFG_02 - CHG_REG_CNFG_FIRST] ||
+	    s->cnfg04 != m->chg_cfg0[CHG_REG_CNFG_04 - CHG_REG_CNFG_FIRST])
+		return "CNFG_00/02/04 changed since probe";
+	if (conv_float_mv(s->cnfg04) > KICK_CV_MAX_MV)
+		return "CV above 4350 mV";
+	if (conv_chg_cc_ma(s->cnfg02) > KICK_CC_MAX_MA)
+		return "CC above 1500 mA";
+	/* 4.9 1st cold-swelling tier: 950 mA below 15 C until 20 C */
+	if (s->therm_dc[THERM_BATT] < KICK_COOL_DC &&
+	    conv_chg_cc_ma(s->cnfg02) > KICK_COOL_CC_MAX_MA)
+		return "CC above 950 mA below 20.0 C";
+	return NULL;
+}
+
+/*
+ * CNFG_06 RMW: bits 7:2 must equal the probe value before and after, with
+ * CHGPROT unlocked, and the sample must still be fresh right before the write.
+ */
+static const char *mx_kick_send(struct mx_ro *m, const struct mx_snap *s)
+{
+	u8 want = m->chg_cfg0[CHG_REG_CNFG_06 - CHG_REG_CNFG_FIRST] & ~MX_KICK_MASK;
+	u8 old, rb;
+	int ret;
+
+	if (mx_read_u8(m, MX_ADDR_CHG, CHG_REG_CNFG_06, &old))
+		return "CNFG_06 read failed";
+	if ((old & ~MX_KICK_MASK) != want) {
+		m->kick_dead = true;
+		return "CNFG_06 bits 7:2 changed since probe";
+	}
+	if ((old & KICK_CHGPROT_MASK) != KICK_CHGPROT_MASK) {
+		m->kick_dead = true;
+		return "CNFG_06 CHGPROT locked (bits 3:2 != 11), not unlocking";
+	}
+	if (!mx_sample_fresh(s, ktime_to_ms(ktime_get_boottime())))
+		return "sample not fresh at kick time";
+	ret = mx_chg_wdt_kick_write(m->adap, old);
+	m->writes++;
+	if (ret < 0)
+		return "kick write failed";
+	if (mx_read_u8(m, MX_ADDR_CHG, CHG_REG_CNFG_06, &rb))
+		return "CNFG_06 read-back failed";
+	if ((rb & ~MX_KICK_MASK) != want) {
+		m->kick_dead = true;
+		return "CNFG_06 bits 7:2 changed by the kick";
+	}
+	return NULL;
+}
+
+/* After every sample attempt; @s is NULL when the sample failed. */
+static void mx_kick_supervise(struct mx_ro *m, const struct mx_snap *s)
+{
+	u64 now = ktime_to_ms(ktime_get_boottime());
+	const char *why;
+
+	if (!m->kick_en || m->stopping)
+		return;
+	why = m->kick_dead ? m->kick_why : mx_kick_check(m, s, now);
+	if (!why)
+		why = mx_kick_send(m, s);
+
+	if (!why) {
+		m->kicks++;
+		m->last_kick_ms = now;
+		if (!m->kicking && m->kick_logs < KICK_LOG_MAX) {
+			m->kick_logs++;
+			dev_info(m->dev,
+				 "charger wdt kick: %s (batt " DC_FMT "C chg " DC_FMT "C vcell %dmV cv %dmV cc %dmA chg_dtls %x %s)\n",
+				 m->kicks == 1 ? "started" : "resumed",
+				 DC_ARG(s->therm_dc[THERM_BATT]),
+				 DC_ARG(s->therm_dc[THERM_CHG]), s->vcell_mv,
+				 conv_float_mv(s->cnfg04), conv_chg_cc_ma(s->cnfg02),
+				 DTLS01_CHG(s->dtls1), chg_dtls_name(DTLS01_CHG(s->dtls1)));
+		}
+		m->kicking = true;
+		if (DTLS01_CHG(s->dtls1) == 0xb && !m->kick_expired_logged) {
+			m->kick_expired_logged = true;
+			dev_warn(m->dev,
+				 "charger wdt kick: watchdog had already expired (chg_dtls b); a kick does not restart charging\n");
+		}
+		return;
+	}
+
+	if ((m->kicking || !m->kick_why) && m->kick_logs < KICK_LOG_MAX) {
+		m->kick_logs++;
+		if (s && s->valid)
+			dev_warn(m->dev,
+				 "charger wdt kick: %s: %s (batt %s" DC_FMT "C chg %s" DC_FMT "C vcell %dmV avg %dmV cnfg00 %02x cnfg02 %02x cnfg04 %02x); the charger watchdog ends charging within ~80 s\n",
+				 m->kicking ? "stopped" : "not started", why,
+				 s->therm_ok[THERM_BATT] ? "" : "?",
+				 DC_ARG(s->therm_dc[THERM_BATT]),
+				 s->therm_ok[THERM_CHG] ? "" : "?",
+				 DC_ARG(s->therm_dc[THERM_CHG]), s->vcell_mv,
+				 s->avgvcell_mv, s->cnfg00, s->cnfg02, s->cnfg04);
+		else
+			dev_warn(m->dev,
+				 "charger wdt kick: %s: %s; the charger watchdog ends charging within ~80 s\n",
+				 m->kicking ? "stopped" : "not started", why);
+	}
+	if (m->kicking)
+		m->kick_stops++;
+	m->kicking = false;
+	m->kick_why = why;
+}
+
 static void mx_update(struct mx_ro *m)
 {
 	struct mx_snap s = {};
@@ -899,6 +1208,7 @@ static void mx_update(struct mx_ro *m)
 
 	mutex_lock(&m->lock);
 	ret = mx_sample(m, &s);
+	mx_kick_supervise(m, ret ? NULL : &s);
 	if (ret) {
 		mutex_unlock(&m->lock);
 		dev_warn_ratelimited(m->dev, "sample failed: %d\n", ret);
@@ -922,12 +1232,18 @@ static void mx_monitor_work(struct work_struct *work)
 {
 	struct mx_ro *m = container_of(to_delayed_work(work), struct mx_ro,
 				       monitor);
+	bool stopping;
 	u32 ms;
 
 	mx_update(m);
 	mutex_lock(&m->lock);
 	ms = m->snap.cable != CABLE_NONE ? m->poll_chg_ms : m->poll_ms;
+	stopping = m->stopping;
 	mutex_unlock(&m->lock);
+	if (stopping)
+		return;
+	if (m->kick_en)
+		ms = KICK_PERIOD_MS;
 	queue_delayed_work(system_power_efficient_wq, &m->monitor,
 			   msecs_to_jiffies(ms));
 }
@@ -1246,7 +1562,10 @@ static void mx_selftest_work(struct work_struct *work)
 				 fg_learn_regs[i], m->fg_learn0[i], fg_learn[i]);
 		}
 		for (i = 0; i < CHG_NUM_CNFG; i++) {
-			if (chg_cfg[i] == m->chg_cfg0[i])
+			u8 mask = m->kick_en && CHG_REG_CNFG_FIRST + i == CHG_REG_CNFG_06 ?
+				  (u8)~MX_KICK_MASK : 0xff;
+
+			if (!((chg_cfg[i] ^ m->chg_cfg0[i]) & mask))
 				continue;
 			chg_diff++;
 			dev_warn(m->dev,
@@ -1287,15 +1606,31 @@ static void mx_selftest_work(struct work_struct *work)
 		 mx_src_online(POWER_SUPPLY_TYPE_USB, s.cable),
 		 mx_src_online(POWER_SUPPLY_TYPE_WIRELESS, s.cable), s.status);
 
+	mutex_lock(&m->lock);
+	if (m->kick_en)
+		dev_info(m->dev,
+			 "battery selftest: charger wdt kick on: %s, kicks=%lu stops=%lu last kick %lld ms ago%s%s\n",
+			 m->kicking ? "kicking" : "NOT kicking", m->kicks,
+			 m->kick_stops,
+			 m->kicks ? (s64)(ktime_to_ms(ktime_get_boottime()) -
+					  m->last_kick_ms) : -1LL,
+			 m->kick_why && !m->kicking ? ", reason: " : "",
+			 m->kick_why && !m->kicking ? m->kick_why : "");
+	else
+		dev_info(m->dev, "battery selftest: charger wdt kick off (no samsung,charger-wdt-kick)\n");
+	mutex_unlock(&m->lock);
+
 	sane = s.present && s.vcell_mv >= 3000 && s.vcell_mv <= 4500 &&
 	       s.capacity >= 0 && s.capacity <= 100 &&
 	       s.temp_dc > -200 && s.temp_dc < 800;
-	pass = !ret && sane && m->writes == 0 && fg_diff == 0 && chg_diff == 0;
+	pass = !ret && sane && (m->kick_en || m->writes == 0) && fg_diff == 0 &&
+	       chg_diff == 0;
 	dev_info(m->dev,
-		 "battery selftest: i2c reads=%lu read_errors=%lu writes=%lu (no write path compiled) fg_cfg_changed=%d chg_cnfg_changed=%d learned_changed=%d muic_opcode_writes=%d (at probe %d) sane=%d -> %s\n",
-		 m->reads, m->read_errors, m->writes, fg_diff, chg_diff,
-		 learn_diff, muic_now, m->muic_writes_at_probe, sane,
-		 pass ? "PASS" : "FAIL");
+		 "battery selftest: i2c reads=%lu read_errors=%lu writes=%lu (%s) fg_cfg_changed=%d chg_cnfg_changed=%d learned_changed=%d muic_opcode_writes=%d (at probe %d) sane=%d -> %s\n",
+		 m->reads, m->read_errors, m->writes,
+		 m->kick_en ? "CNFG_06 WDTCLR kicks only" : "no write enabled",
+		 fg_diff, chg_diff, learn_diff, muic_now, m->muic_writes_at_probe,
+		 sane, pass ? "PASS" : "FAIL");
 }
 
 /*
@@ -1398,9 +1733,10 @@ static void mx_adc_selftest_work(struct work_struct *work)
 		pass = false;
 
 	dev_info(m->dev,
-		 "adc selftest: thermistors wired=%d ok=%d max77705_writes=%lu -> %s\n",
+		 "adc selftest: thermistors wired=%d ok=%d max77705_writes=%lu%s -> %s\n",
 		 n_wired, n_ok, m->writes,
-		 pass && n_wired && m->writes == 0 ? "PASS" : "FAIL");
+		 m->kick_en ? " (charger wdt kicks)" : "",
+		 pass && n_wired && (m->kick_en || m->writes == 0) ? "PASS" : "FAIL");
 }
 
 /* --- probe ------------------------------------------------------------- */
@@ -1434,6 +1770,7 @@ static void mx_parse_dt(struct mx_ro *m)
 	if (of_property_read_s32(np, "samsung,temp-low-recovery", &m->t_low_rec))
 		m->t_low_rec = 50;
 	m->current_ma = of_property_read_bool(np, "samsung,legacy-current-ma");
+	m->kick_en = of_property_read_bool(np, "samsung,charger-wdt-kick");
 
 	if (!m->fg_resistor)
 		m->fg_resistor = 1;
@@ -1449,9 +1786,25 @@ static void mx_cancel(void *data)
 {
 	struct mx_ro *m = data;
 
+	mutex_lock(&m->lock);
+	m->stopping = true;
+	mutex_unlock(&m->lock);
 	cancel_delayed_work_sync(&m->adc_selftest);
 	cancel_delayed_work_sync(&m->selftest);
 	cancel_delayed_work_sync(&m->monitor);
+}
+
+/*
+ * Shutdown does not release devres, so mx_cancel() would not run: stop the
+ * kicks and all works here. No charger register is written; the charger
+ * watchdog then ends charging by itself if the system stays up.
+ */
+static void mx_shutdown(struct i2c_client *client)
+{
+	struct mx_ro *m = i2c_get_clientdata(client);
+
+	if (m)
+		mx_cancel(m);
 }
 
 static int mx_probe(struct i2c_client *client)
@@ -1540,13 +1893,15 @@ static int mx_probe(struct i2c_client *client)
 		return dev_err_probe(dev, ret, "first sample failed\n");
 
 	dev_info(dev,
-		 "MAX77705 PMIC id %02x rev %02x; FG DesignCap %04x (DT %04x%s), CONFIG %04x (TEX=%d: temperature %s), fg_resistor %u, capacity max %d min %u type 0x%x; read-only, no writes\n",
+		 "MAX77705 PMIC id %02x rev %02x; FG DesignCap %04x (DT %04x%s), CONFIG %04x (TEX=%d: temperature %s), fg_resistor %u, capacity max %d min %u type 0x%x; %s\n",
 		 m->pmic_id, m->pmic_rev, designcap, m->design_cap,
 		 designcap == m->design_cap ? ", model present" : ", MISMATCH",
 		 m->snap.config, !!(m->snap.config & FG_CONFIG_TEX),
 		 (m->snap.config & FG_CONFIG_TEX) ? "is host-written (stale until a host writes it)" :
 						    "measured by the gauge",
-		 m->fg_resistor, m->capacity_max, m->cap_min, m->cap_calc_type);
+		 m->fg_resistor, m->capacity_max, m->cap_min, m->cap_calc_type,
+		 m->kick_en ? "only write: charger CNFG_06 WDTCLR kick while supervised" :
+			      "read-only, no writes");
 	dev_info(dev,
 		 "first sample: soc %d%% (repsoc %d.%d%%) vcell %dmV inow %dmA temp %d.%dC cable %d status %d chg_dtls %x(%s) cnfg00 %02x\n",
 		 m->snap.capacity, m->snap.repsoc_dp / 10, m->snap.repsoc_dp % 10,
@@ -1591,8 +1946,18 @@ static int mx_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	if (m->kick_en)
+		dev_info(dev,
+			 "charger wdt kick enabled: CNFG_06 %02x at probe, every %d ms while batt %d.%d..%d.%d C, chg < %d.%d C, %d..%d mV, CV <= %d mV, CC <= %d mA\n",
+			 m->chg_cfg0[CHG_REG_CNFG_06 - CHG_REG_CNFG_FIRST],
+			 KICK_PERIOD_MS, KICK_BATT_MIN_DC / 10, KICK_BATT_MIN_DC % 10,
+			 KICK_BATT_MAX_DC / 10, KICK_BATT_MAX_DC % 10,
+			 KICK_CHG_MAX_DC / 10, KICK_CHG_MAX_DC % 10,
+			 KICK_VCELL_MIN_MV, KICK_VCELL_MAX_MV, KICK_CV_MAX_MV,
+			 KICK_CC_MAX_MA);
+	/* with the kick, the first poll (and kick) runs right away */
 	queue_delayed_work(system_power_efficient_wq, &m->monitor,
-			   msecs_to_jiffies(m->poll_chg_ms));
+			   m->kick_en ? 0 : msecs_to_jiffies(m->poll_chg_ms));
 
 	if (m->selftest_ms) {
 		u64 now = ktime_to_ms(ktime_get_boottime());
@@ -1627,8 +1992,9 @@ static struct i2c_driver mx_driver = {
 		.of_match_table = mx_of_match,
 	},
 	.probe = mx_probe,
+	.shutdown = mx_shutdown,
 };
 module_i2c_driver(mx_driver);
 
-MODULE_DESCRIPTION("MAX77705 read-only battery monitor (Exynos9810 Note9)");
+MODULE_DESCRIPTION("MAX77705 battery monitor, read-only plus optional charger WDT kick (Exynos9810 Note9)");
 MODULE_LICENSE("GPL");
