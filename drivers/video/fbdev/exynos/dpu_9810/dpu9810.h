@@ -27,6 +27,7 @@
 
 #define DPU_PFX			"decon: "
 #define DPU_ST_PFX		"decon selftest: "
+#define DPU_MX_PFX		"decon matrix: "
 #define DPU_PB_PFX		"panel-bright: "
 
 /*
@@ -172,6 +173,10 @@ struct dpu_dev {
 	struct delayed_work st_work;
 	u32 st_at_ms, st_flips, st_period_ms;
 	bool stopping;
+
+	/* display matrix self-test (decon_drv.c dpu_mx_thread) */
+	struct task_struct *mx_thread;
+	u32 mx_at_ms;
 
 	/* DSIM0 command path (dsim_cmd.c), only inside a command window */
 	void __iomem *dsim;

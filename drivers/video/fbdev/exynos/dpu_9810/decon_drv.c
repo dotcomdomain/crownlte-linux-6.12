@@ -1205,20 +1205,21 @@ static int dpu_fb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
  * B,G,R,A) with DPP BGRA_8888 and the owner saw the intended colours, and
  * the SBoot buffer (IDMA ARGB8888) holds bytes A,R,G,B.
  */
+/* memory byte index of R, G, B, A for the 32-bit DPP-level formats */
+static const u8 dpu_fmt_pos[8][4] = {
+	[DECON_PIXEL_FORMAT_ARGB_8888] = { 1, 2, 3, 0 },
+	[DECON_PIXEL_FORMAT_ABGR_8888] = { 3, 2, 1, 0 },
+	[DECON_PIXEL_FORMAT_RGBA_8888] = { 0, 1, 2, 3 },
+	[DECON_PIXEL_FORMAT_BGRA_8888] = { 2, 1, 0, 3 },
+	[DECON_PIXEL_FORMAT_XRGB_8888] = { 1, 2, 3, 0 },
+	[DECON_PIXEL_FORMAT_XBGR_8888] = { 3, 2, 1, 0 },
+	[DECON_PIXEL_FORMAT_RGBX_8888] = { 0, 1, 2, 3 },
+	[DECON_PIXEL_FORMAT_BGRX_8888] = { 2, 1, 0, 3 },
+};
+
 static void dpu_fb_layout(u32 dpp_fmt, struct fb_var_screeninfo *v)
 {
-	/* memory byte index of R, G, B, A */
-	static const u8 pos[8][4] = {
-		[DECON_PIXEL_FORMAT_ARGB_8888] = { 1, 2, 3, 0 },
-		[DECON_PIXEL_FORMAT_ABGR_8888] = { 3, 2, 1, 0 },
-		[DECON_PIXEL_FORMAT_RGBA_8888] = { 0, 1, 2, 3 },
-		[DECON_PIXEL_FORMAT_BGRA_8888] = { 2, 1, 0, 3 },
-		[DECON_PIXEL_FORMAT_XRGB_8888] = { 1, 2, 3, 0 },
-		[DECON_PIXEL_FORMAT_XBGR_8888] = { 3, 2, 1, 0 },
-		[DECON_PIXEL_FORMAT_RGBX_8888] = { 0, 1, 2, 3 },
-		[DECON_PIXEL_FORMAT_BGRX_8888] = { 2, 1, 0, 3 },
-	};
-	const u8 *p = pos[dpp_fmt < 8 ? dpp_fmt : DECON_PIXEL_FORMAT_BGRA_8888];
+	const u8 *p = dpu_fmt_pos[dpp_fmt < 8 ? dpp_fmt : DECON_PIXEL_FORMAT_BGRA_8888];
 	bool alpha = dpp_fmt <= DECON_PIXEL_FORMAT_BGRA_8888;
 
 	v->red = (struct fb_bitfield){ 8 * p[0], 8, 0 };
@@ -1376,9 +1377,9 @@ static struct dma_buf *dpu_kbuf_create(struct dpu_dev *d, size_t size, dma_addr_
 	return db;
 }
 
-/* synchronous in-kernel commit of one window */
-static int dpu_kcommit(struct dpu_dev *d, struct decon_win_config_data *wd,
-		       struct dma_buf *db, u32 *latch_us)
+/* synchronous in-kernel commit of one buffer window (@win) */
+static int dpu_kcommit_win(struct dpu_dev *d, struct decon_win_config_data *wd, int win,
+			   struct dma_buf *db, u32 *latch_us)
 {
 	struct dma_buf *kbufs[DECON_MAX_WIN] = { };
 	struct dma_fence *f = NULL;
@@ -1386,7 +1387,7 @@ static int dpu_kcommit(struct dpu_dev *d, struct decon_win_config_data *wd,
 	long t;
 	int ret;
 
-	kbufs[d->boot_win] = db;
+	kbufs[win] = db;
 	ret = dpu_win_config(d, wd, kbufs, &f);
 	if (ret)
 		return ret;
@@ -1398,6 +1399,13 @@ static int dpu_kcommit(struct dpu_dev *d, struct decon_win_config_data *wd,
 		*latch_us = ktime_us_delta(ktime_get(), t0);
 	dma_fence_put(f);
 	return ret;
+}
+
+/* synchronous in-kernel commit of the boot window */
+static int dpu_kcommit(struct dpu_dev *d, struct decon_win_config_data *wd,
+		       struct dma_buf *db, u32 *latch_us)
+{
+	return dpu_kcommit_win(d, wd, d->boot_win, db, latch_us);
 }
 
 static int dpu_fb_takeover(struct dpu_dev *d)
@@ -1566,6 +1574,205 @@ out:
 		fc0, dpu_hw_frame_count(d), adv, d->st_flips, te0,
 		atomic_read(&d->te_count), max_us, d->nr_latch_timeouts, d->nr_base_mismatch);
 	pr_info(DPU_ST_PFX "a person must confirm the panel alternated green 'A' / magenta 'B' and then showed the console again\n");
+}
+
+/* ---- display matrix self-test (kernel buffers only) ------------------- */
+
+/*
+ * Opt-in by DT (decon_f samsung,decon-matrix): a fixed, boot-relative
+ * sequence of kernel-buffer commits through the normal commit/latch path,
+ * each held for DPU_MX_STEP_MS, to see on camera which windows, channels
+ * and formats reach the panel. No HWC, no fences from userspace, no DSIM,
+ * panel or PMIC access. Two decon-pool buffers alternate so the buffer on
+ * screen is never redrawn. fb0 as SBoot left it is always restored at the
+ * end, also after an error, a stop or the time box.
+ */
+#define DPU_MX_STEP_MS		4000
+#define DPU_MX_TIMEBOX_MS	40000
+
+enum { MX_NONE, MX_BANDS_WR, MX_GREEN_CROSS, MX_MAGENTA };
+
+struct dpu_mx_step {
+	const char *name;
+	int win;		/* -1: boot window */
+	int dpp;		/* -1: boot DPP */
+	int dpp_fmt;		/* -1: the format SBoot left */
+	int pattern;
+};
+
+static const struct dpu_mx_step dpu_mx_steps[] = {
+	{ "1 baseline: fb0 as is (SBoot window)", -1, -1, -1, MX_NONE },
+	{ "2 fb0 window, linear, SBoot format: white top / red bottom", -1, -1, -1, MX_BANDS_WR },
+	{ "3 fb0 window, linear XBGR8888 (HWC format): white top / red bottom", -1, -1,
+	  DECON_PIXEL_FORMAT_XBGR_8888, MX_BANDS_WR },
+	{ "4 win0 on VGF0 (ch1), linear XBGR8888: green with white cross, fb0 window off", 0,
+	  DECON_IDMA_VGF0, DECON_PIXEL_FORMAT_XBGR_8888, MX_GREEN_CROSS },
+	/* 5 (AFBC solid-colour on VGF0) is not implemented, see the commit */
+	{ "6 win0 on G1 (ch3), linear XBGR8888: magenta with white border, fb0 window off", 0,
+	  DECON_IDMA_G1, DECON_PIXEL_FORMAT_XBGR_8888, MX_MAGENTA },
+};
+
+static u32 dpu_mx_px(u32 dpp_fmt, u8 r, u8 g, u8 b)
+{
+	const u8 *p = dpu_fmt_pos[dpp_fmt];
+
+	return (u32)r << (8 * p[0]) | (u32)g << (8 * p[1]) | (u32)b << (8 * p[2]) |
+	       0xffU << (8 * p[3]);
+}
+
+static void dpu_mx_draw(struct dpu_dev *d, u32 *p, int pattern, u32 fmt)
+{
+	u32 w = d->lcd.xres, h = d->lcd.yres;
+	u32 white = dpu_mx_px(fmt, 0xff, 0xff, 0xff);
+
+	switch (pattern) {
+	case MX_BANDS_WR:
+		st_fill(p, w, 0, 0, w, h / 2, white);
+		st_fill(p, w, 0, h / 2, w, h - h / 2, dpu_mx_px(fmt, 0xff, 0, 0));
+		break;
+	case MX_GREEN_CROSS:
+		st_fill(p, w, 0, 0, w, h, dpu_mx_px(fmt, 0, 0xff, 0));
+		st_fill(p, w, (w - 120) / 2, 0, 120, h, white);
+		st_fill(p, w, 0, (h - 120) / 2, w, 120, white);
+		break;
+	case MX_MAGENTA:
+		st_fill(p, w, 0, 0, w, h, white);
+		st_fill(p, w, 48, 48, w - 96, h - 96, dpu_mx_px(fmt, 0xff, 0, 0xff));
+		break;
+	}
+	wmb();
+}
+
+/* boot time, UTC, and the window/channel registers as latched */
+static void dpu_mx_log(struct dpu_dev *d, const char *what, int win, int dpp, int ret,
+		       u32 us, dma_addr_t want)
+{
+	u64 ms = ktime_to_ms(ktime_get_boottime());
+	struct timespec64 ts;
+	struct tm tm;
+
+	ktime_get_real_ts64(&ts);
+	time64_to_tm(ts.tv_sec, 0, &tm);
+	pr_info(DPU_MX_PFX "%s: at boot %llu.%03llu s, UTC %02d:%02d:%02d.%03ld: commit %d, latched after %u us, FRAME_COUNT %u\n",
+		what, ms / 1000, ms % 1000, tm.tm_hour, tm.tm_min, tm.tm_sec,
+		ts.tv_nsec / NSEC_PER_MSEC, ret, us, dpu_hw_frame_count(d));
+	pr_info(DPU_MX_PFX "  active: DP0 %#x DP1 %#x win%d CTL0 %#x START %#x END %#x | IDMA%d IN_CON %#x (afbc %d fmt %u) BASE %#x (want %pad) SRC %#x IMG %#x | DPP%d IN_CON %#x IMG %#x\n",
+		decon_rd_shd(d, DATA_PATH_CONTROL_0), decon_rd_shd(d, DATA_PATH_CONTROL_1),
+		win, decon_rd_shd(d, WIN_CONTROL_0(win)), decon_rd_shd(d, WIN_START_POSITION(win)),
+		decon_rd_shd(d, WIN_END_POSITION(win)), dpp,
+		dpu_hw_dma_active_rd(d, dpp, IDMA_IN_CON),
+		!!(dpu_hw_dma_active_rd(d, dpp, IDMA_IN_CON) & IDMA_AFBC_EN),
+		(dpu_hw_dma_active_rd(d, dpp, IDMA_IN_CON) >> 11) & 0x1f,
+		dpu_hw_dma_active_rd(d, dpp, IDMA_IN_BASE_ADDR_Y), &want,
+		dpu_hw_dma_active_rd(d, dpp, IDMA_SRC_SIZE),
+		dpu_hw_dma_active_rd(d, dpp, IDMA_IMG_SIZE), dpp,
+		readl(d->dpp_regs + dpp * 0x1000 + DPP_IN_CON),
+		readl(d->dpp_regs + dpp * 0x1000 + DPP_IMG_SIZE));
+}
+
+static bool dpu_mx_stop(struct dpu_dev *d)
+{
+	return kthread_should_stop() || READ_ONCE(d->stopping);
+}
+
+/* sleep until @ms of boot time; false if asked to stop */
+static bool dpu_mx_wait(struct dpu_dev *d, u64 ms)
+{
+	for (;;) {
+		u64 now = ktime_to_ms(ktime_get_boottime());
+
+		if (dpu_mx_stop(d))
+			return false;
+		if (now >= ms)
+			return true;
+		msleep_interruptible(min_t(u64, ms - now, 100));
+	}
+}
+
+static int dpu_mx_thread(void *data)
+{
+	struct dpu_dev *d = data;
+	size_t sz = (size_t)d->lcd.xres * d->lcd.yres * 4;
+	struct decon_win_config_data *wd = kzalloc(sizeof(*wd), GFP_KERNEL);
+	struct dma_buf *buf[2] = { }, *fb;
+	void *va[2] = { };
+	u64 t0 = d->mx_at_ms;
+	u32 us = 0;
+	int i, n = 0, ret = 0;
+
+	if (!wd)
+		goto out;
+	pr_info(DPU_MX_PFX "scheduled at %llu ms boot time, %zu steps of %u ms, fb0 restored at %llu ms\n",
+		t0, ARRAY_SIZE(dpu_mx_steps), DPU_MX_STEP_MS,
+		t0 + ARRAY_SIZE(dpu_mx_steps) * DPU_MX_STEP_MS);
+	if (!dpu_mx_wait(d, t0))
+		goto out;
+	for (i = 0; i < 2; i++) {
+		buf[i] = dpu_kbuf_create(d, sz, 0, &va[i]);
+		if (IS_ERR(buf[i])) {
+			pr_err(DPU_MX_PFX "cannot allocate %zu-byte buffer %d: %ld\n", sz, i,
+			       PTR_ERR(buf[i]));
+			buf[i] = NULL;
+			goto restore;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(dpu_mx_steps); i++) {
+		const struct dpu_mx_step *s = &dpu_mx_steps[i];
+		int win = s->win < 0 ? d->boot_win : s->win;
+		int dpp = s->dpp < 0 ? d->boot_dpp : s->dpp;
+		u32 fmt = s->dpp_fmt < 0 ? d->fb_dpp_fmt : s->dpp_fmt;
+		struct decon_win_config *w = &wd->config[win];
+		dma_addr_t want = d->fb_phys;
+
+		if (!dpu_mx_wait(d, t0 + (u64)i * DPU_MX_STEP_MS) ||
+		    ktime_to_ms(ktime_get_boottime()) > t0 + DPU_MX_TIMEBOX_MS)
+			goto restore;
+		if (i == 4)
+			pr_info(DPU_MX_PFX "5 AFBC solid colour on VGF0: skipped (no validated AFBC encoder)\n");
+		if (s->pattern == MX_NONE) {
+			dpu_mx_log(d, s->name, win, dpp, 0, 0, want);
+			continue;
+		}
+		dpu_mx_draw(d, va[n], s->pattern, fmt);
+		want = ((struct dpu_kbuf *)buf[n]->priv)->dma;
+		memset(wd, 0, sizeof(*wd));
+		w->state = DECON_WIN_STATE_BUFFER;
+		w->idma_type = dpp;
+		w->format = dpu_translate_fmt_to_dpp(fmt);	/* user-level */
+		w->blending = DECON_BLENDING_NONE;
+		w->plane_alpha = 0xff;
+		w->src.w = w->src.f_w = w->dst.w = w->dst.f_w = d->lcd.xres;
+		w->src.h = w->src.f_h = w->dst.h = w->dst.f_h = d->lcd.yres;
+		ret = dpu_kcommit_win(d, wd, win, buf[n], &us);
+		dpu_mx_log(d, s->name, win, dpp, ret, us, want);
+		n ^= 1;
+	}
+	dpu_mx_wait(d, t0 + ARRAY_SIZE(dpu_mx_steps) * DPU_MX_STEP_MS);
+
+restore:
+	/* 7: fb0 exactly as SBoot left it (the takeover configuration) */
+	fb = dpu_kbuf_create(d, d->fb_size, d->fb_phys, NULL);
+	if (IS_ERR(fb)) {
+		pr_err(DPU_MX_PFX "7 restore: cannot wrap fb0: %ld\n", PTR_ERR(fb));
+	} else {
+		for (i = 0; i < 2; i++) {
+			dpu_fb_window(d, wd, d->fb_dpp_fmt);
+			ret = dpu_kcommit(d, wd, fb, &us);
+			if (!ret)
+				break;
+		}
+		dpu_mx_log(d, "7 restore fb0 as SBoot left it", d->boot_win, d->boot_dpp, ret, us,
+			   d->fb_phys);
+		dma_buf_put(fb);
+	}
+	for (i = 0; i < 2; i++)
+		if (buf[i])
+			dma_buf_put(buf[i]);	/* commits keep their own references */
+	pr_info(DPU_MX_PFX "done%s\n", dpu_mx_stop(d) ? " (stopped early)" : "");
+out:
+	kfree(wd);
+	return 0;
 }
 
 /* ---- adopt ----------------------------------------------------------- */
@@ -1969,6 +2176,20 @@ static int dpu_probe(struct platform_device *pdev)
 				   msecs_to_jiffies(d->st_at_ms > now ? d->st_at_ms - now : 0));
 	}
 
+	/* opt-in kernel-buffer display matrix (dpu_mx_thread) */
+	if (of_property_read_bool(np, "samsung,decon-matrix")) {
+		d->mx_at_ms = 60000;
+		of_property_read_u32(np, "samsung,decon-matrix-at-ms", &d->mx_at_ms);
+		d->mx_thread = kthread_create(dpu_mx_thread, d, "decon_matrix");
+		if (IS_ERR(d->mx_thread)) {
+			dev_warn(dev, "display matrix thread: %ld\n", PTR_ERR(d->mx_thread));
+			d->mx_thread = NULL;
+		} else {
+			get_task_struct(d->mx_thread);	/* for kthread_stop() after it ends */
+			wake_up_process(d->mx_thread);
+		}
+	}
+
 	/* opt-in: the 4.9 fault-display brightness, sent once (panel_bright.c) */
 	ret = dpu_panel_bright_init(d);
 	if (!ret) {
@@ -2004,6 +2225,12 @@ static void dpu_stop(struct dpu_dev *d)
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->st_work);
+	if (d->mx_thread) {
+		/* the matrix restores fb0 through the worker before it returns */
+		kthread_stop(d->mx_thread);
+		put_task_struct(d->mx_thread);
+		d->mx_thread = NULL;
+	}
 	kthread_flush_worker(d->worker);
 }
 
