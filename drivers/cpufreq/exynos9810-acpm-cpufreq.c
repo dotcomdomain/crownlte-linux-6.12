@@ -27,7 +27,7 @@
  *    lock, before the CPU goes up and lowered only after the CPU went down;
  *  - every transition checks the requested level's skew against the MIF
  *    rate actually reached (CMU readback). If MIF could not get there (a
- *    failed MIF/INT FREQ_REQ, MIF OPPs disabled) the highest level that
+ *    failed MIF/INT FREQ_REQ) the highest level that
  *    rate satisfies runs instead, and the request is retried with an
  *    exponential backoff (100 ms .. 5 s).
  * Without a supplier, MIF stays at its
@@ -318,8 +318,8 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 		if (ret)
 			return ret;
 		/*
-		 * Short of the skew (a failed MIF/INT FREQ_REQ, MIF OPPs not
-		 * available): run the highest level the reached rate satisfies,
+		 * Short of the skew (a failed MIF/INT FREQ_REQ, a skew above
+		 * every MIF level): run the highest level the reached rate satisfies,
 		 * as the 4.9 DVFS Manager's CPU maximum from the MIF side did.
 		 */
 		pick = exynos9810_skew_safe(domain, index, mif_khz);
@@ -367,20 +367,12 @@ static int exynos9810_target_index(struct cpufreq_policy *policy,
 	return 0;
 }
 
-/*
- * Drop this domain's MIF demands. For ->exit (the last CPU of the cluster
- * went offline, or the policy is torn down after its ->init succeeded) and
- * for a failed ->init.
- */
-static void exynos9810_domain_release(struct exynos9810_domain *domain)
+/* no re-request pending any more (cluster stops, or its policy goes away) */
+static void exynos9810_domain_stop_retry(struct exynos9810_domain *domain)
 {
-	unsigned long mif_khz;
-
 	cancel_delayed_work(&domain->retry_work);
 	WRITE_ONCE(domain->skew_short, false);
 	domain->retry_ms = 0;
-	if (provider->mif && dev_pm_qos_request_active(&domain->mif_request))
-		exynos9810_set_mif(domain, 0, 0, &mif_khz);
 }
 
 static unsigned int exynos9810_domain_get(struct exynos9810_domain *domain)
@@ -401,8 +393,14 @@ static unsigned int exynos9810_get(unsigned int cpu)
 	return domain ? exynos9810_domain_get(domain) : 0;
 }
 
-static int __exynos9810_policy_init(struct cpufreq_policy *policy,
-				    struct exynos9810_domain *domain)
+/*
+ * Bring a cluster's rate onto the table with its MIF floors in place: at
+ * ->init and when the cluster comes back (->online). The current rate is
+ * the CMU readback. On failure the hard floor that covers the current
+ * rate stays: nothing has confirmed that the CPU left that rate.
+ */
+static int exynos9810_domain_start(struct exynos9810_domain *domain,
+				   unsigned int *cur_khz)
 {
 	unsigned int rate, target, ti, i;
 	bool listed = false;
@@ -435,47 +433,71 @@ static int __exynos9810_policy_init(struct cpufreq_policy *policy,
 			floor = max(floor, domain->mif_khz[i]);
 			hard = max(hard, domain->skew_khz[i]);
 		}
-		ret = exynos9810_set_mif(domain, floor, hard, &mif_khz);
+		/* only raise: an earlier (failed) start may hold a higher floor */
+		ret = exynos9810_set_mif(domain, max(floor, domain->mif_floor),
+					 max(hard, domain->hard_khz), &mif_khz);
 		if (ret)
 			return ret;
 		if (mif_khz < floor)
-			dev_warn(provider->dev, "domain%u: boot rate %u kHz with MIF %lu kHz below its %u kHz floor\n",
+			dev_warn(provider->dev, "domain%u: start rate %u kHz with MIF %lu kHz below its %u kHz floor\n",
 				 domain->id, rate, mif_khz, floor);
 		/*
-		 * The level the policy starts at (the boot rate, or the table
-		 * level an unlisted one moves to) must have its ECT skew met by
-		 * the MIF rate reached; else start at the highest level that is.
+		 * The level the policy starts at (the current rate, or the
+		 * table level an unlisted one moves to) must have its ECT skew
+		 * met by the MIF rate reached; else start at the highest level
+		 * that is.
 		 */
 		i = exynos9810_skew_safe(domain, ti, mif_khz);
 		if (i != ti) {
 			ti = i;
-			dev_warn(provider->dev, "domain%u: boot rate %u kHz needs more MIF than %lu kHz (ECT skew): starting at %u kHz\n",
+			dev_warn(provider->dev, "domain%u: start rate %u kHz needs more MIF than %lu kHz (ECT skew): starting at %u kHz\n",
 				 domain->id, rate, mif_khz, domain->table[ti].frequency);
 			target = domain->table[ti].frequency;
 			listed = false;
 		}
 	}
 	/*
-	 * Move an unlisted boot rate (e.g. above samsung,max-freq-cap) onto the
+	 * Move an unlisted rate (e.g. above samsung,max-freq-cap) onto the
 	 * table here. CPUFREQ_NEED_INITIAL_FREQ_CHECK would do it in the core,
 	 * which BUG()s if that transition fails.
 	 */
 	if (!listed) {
 		ret = cal_dfs_set_rate(domain->cal_id, target);
 		if (ret) {
-			pr_err("exynos9810-cpufreq: domain%u boot rate %u kHz is not in the table and FREQ_REQ %u kHz failed: %d\n",
-			       domain->id, rate, target, ret);
+			pr_err("exynos9810-cpufreq: domain%u rate %u kHz is not usable and FREQ_REQ %u kHz failed: %d; MIF hard floor stays at %u kHz\n",
+			       domain->id, rate, target, ret, domain->hard_khz);
 			return ret > 0 ? -EIO : ret;
 		}
 		WRITE_ONCE(domain->last_khz, target);
 		rate = target;
 	}
-	/* the CPU runs table[ti]: its own floors only */
+	/* confirmed: the CPU runs table[ti], its own floors only */
 	if (provider->mif) {
 		ret = exynos9810_set_mif(domain, domain->mif_khz[ti],
 					 domain->skew_khz[ti], &mif_khz);
 		if (ret)
 			return ret;
+	}
+	*cur_khz = rate;
+	return 0;
+}
+
+static int exynos9810_policy_init(struct cpufreq_policy *policy)
+{
+	struct exynos9810_domain *domain = exynos9810_find_domain(policy->cpu);
+	unsigned int rate;
+	int ret;
+
+	if (!domain || !domain->levels)
+		return -ENODEV;
+	ret = exynos9810_domain_start(domain, &rate);
+	if (ret) {
+		/*
+		 * cpufreq_online() frees the new policy; nothing was attached
+		 * to it. The MIF floors stay (see exynos9810_domain_start()).
+		 */
+		exynos9810_domain_stop_retry(domain);
+		return ret;
 	}
 	cpumask_copy(policy->cpus, &domain->cpus);
 	policy->driver_data = domain;
@@ -487,41 +509,82 @@ static int __exynos9810_policy_init(struct cpufreq_policy *policy,
 	return 0;
 }
 
-static int exynos9810_policy_init(struct cpufreq_policy *policy)
+/*
+ * The cluster comes back (inactive policy, light-weight online). The core
+ * reads policy->cur back through ->get. On failure the core calls ->exit
+ * and frees the policy.
+ */
+static int exynos9810_policy_online(struct cpufreq_policy *policy)
 {
-	struct exynos9810_domain *domain = exynos9810_find_domain(policy->cpu);
-	int ret;
+	struct exynos9810_domain *domain = policy->driver_data;
+	unsigned int rate;
 
-	if (!domain || !domain->levels)
-		return -ENODEV;
-	ret = __exynos9810_policy_init(policy, domain);
-	if (!ret)
-		return 0;
-	/*
-	 * cpufreq_online() frees the policy after a failed ->init, also an
-	 * inactive one coming back online (out_free_policy). Leave nothing
-	 * behind: drop the MIF demands, and unregister the cooling device
-	 * that a previous ->ready attached to this policy (it holds a freq_qos
-	 * request on the policy's constraints). A later successful online
-	 * registers a new one under the same name.
-	 */
-	exynos9810_domain_release(domain);
-	if (policy->cdev) {
-		dev_warn(provider->dev, "domain%u: re-init failed (%d): cooling device %s unregistered with the policy\n",
-			 domain->id, ret, policy->cdev->type);
-		cpufreq_cooling_unregister(policy->cdev);
-		policy->cdev = NULL;
-	}
-	return ret;
+	return exynos9810_domain_start(domain, &rate);
 }
 
-/* the last CPU of the cluster went offline (or a post-init step failed) */
+/*
+ * The last CPU of the cluster goes offline (light-weight; the policy and
+ * its cooling device stay). The governor has stopped. Move the cluster
+ * synchronously to its lowest level and only then drop the MIF floors to
+ * that level's; if the FREQ_REQ fails they stay where they are.
+ */
+static int exynos9810_policy_offline(struct cpufreq_policy *policy)
+{
+	struct exynos9810_domain *domain = policy->driver_data;
+	unsigned int low = domain->levels - 1;
+	struct cpufreq_freqs freqs = {
+		.old = policy->cur,
+		.new = domain->table[low].frequency,
+	};
+	unsigned long mif_khz;
+	int ret = 0;
+
+	exynos9810_domain_stop_retry(domain);
+	if (freqs.new != freqs.old) {
+		cpufreq_freq_transition_begin(policy, &freqs);
+		ret = cal_dfs_set_rate(domain->cal_id, freqs.new);
+		if (!ret)
+			WRITE_ONCE(domain->last_khz, freqs.new);
+		cpufreq_freq_transition_end(policy, &freqs, ret);
+	}
+	if (ret) {
+		pr_err("exynos9810-cpufreq: domain%u offline: FREQ_REQ %u kHz failed: %d; MIF floors kept\n",
+		       domain->id, freqs.new, ret);
+		return 0;
+	}
+	if (provider->mif)
+		exynos9810_set_mif(domain, 0, domain->skew_khz[low], &mif_khz);
+	return 0;
+}
+
+/*
+ * The policy is destroyed (with ->offline/->online the core calls ->exit
+ * only before freeing it: a failed ->online, or CPU device removal). The
+ * cooling device holds a freq_qos request on the policy's constraints, so
+ * it goes with it; a new policy registers a new one under the same name.
+ * The MIF hard floor is dropped only if no CPU of the cluster is online:
+ * otherwise nothing confirmed that the CPU left the rate it protects.
+ */
 static void exynos9810_policy_exit(struct cpufreq_policy *policy)
 {
 	struct exynos9810_domain *domain = policy->driver_data;
+	unsigned long mif_khz;
 
-	if (domain)
-		exynos9810_domain_release(domain);
+	if (policy->cdev) {
+		cpufreq_cooling_unregister(policy->cdev);
+		policy->cdev = NULL;
+	}
+	if (!domain)
+		return;
+	exynos9810_domain_stop_retry(domain);
+	if (!provider->mif || !dev_pm_qos_request_active(&domain->mif_request))
+		return;
+	if (cpumask_intersects(&domain->cpus, cpu_online_mask)) {
+		dev_warn(provider->dev, "domain%u: policy gone with the cluster online: MIF hard floor stays at %u kHz\n",
+			 domain->id, domain->hard_khz);
+		return;
+	}
+	exynos9810_set_mif(domain, 0, 0, &mif_khz);
 }
 
 /* 4.9 cpu_cooling.c name for acme domain N: "thermal-cpufreq-N". */
@@ -535,9 +598,9 @@ static void exynos9810_cooling_register(struct cpufreq_policy *policy,
 	 * ->ready also runs when an inactive policy comes back online; the
 	 * device stays registered across CPU offline (as the core's own
 	 * CPUFREQ_IS_COOLING_DEV device does), so the cdev-by-name links made
-	 * once at boot stay valid. The policy object survives offline; only a
-	 * failed ->init frees it, and exynos9810_policy_init() unregisters the
-	 * device first.
+	 * once at boot stay valid. The policy object survives offline
+	 * (->offline); every path that frees it after ->ready calls ->exit
+	 * first, which unregisters the device (exynos9810_policy_exit()).
 	 */
 	if (policy->cdev)
 		return;
@@ -592,6 +655,8 @@ static struct cpufreq_driver exynos9810_driver = {
 	.get = exynos9810_get,
 	.init = exynos9810_policy_init,
 	.exit = exynos9810_policy_exit,
+	.online = exynos9810_policy_online,
+	.offline = exynos9810_policy_offline,
 	.ready = exynos9810_policy_ready,
 	.suspend = cpufreq_generic_suspend,
 	.attr = exynos9810_attrs,

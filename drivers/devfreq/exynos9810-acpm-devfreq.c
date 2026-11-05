@@ -21,7 +21,7 @@
  *  - CPU->MIF ECT skew (the 4.9 DVFS Manager's "guidance" constraint) as a
  *    hard floor per CPU cluster (exynos9810_mif_hard_floor(), set by the
  *    Exynos9810 cpufreq driver): MIF is never programmed below it, whatever
- *    the governor or a MAX QoS request asks, only below the OPPs available.
+ *    the governor, a MAX QoS request or OPP availability ask.
  *  - The MIF level/constraint table is sent to the firmware FVP on ACPM
  *    channel 1 (DATA_INIT/SET_CONST), sleep entry/exit are announced with
  *    DATA_INIT/RELEASE, suspend runs at CAL's resume rate, reboot at
@@ -228,10 +228,12 @@ static int xdf_target(struct device *dev, unsigned long *freq, u32 flags)
 	dev_pm_opp_put(opp);
 
 	/*
-	 * CPU skew floors win over the governor and over MAX QoS requests:
-	 * the lowest available OPP at or above the highest one, or the top
-	 * available OPP if none reaches it (the cpufreq side checks the rate
-	 * reached and runs a lower CPU level then).
+	 * CPU skew floors win over the governor, MAX QoS requests and OPP
+	 * availability; MIF is never programmed below an active one: the
+	 * lowest available OPP at or above it; if a disabled OPP is the only
+	 * one that reaches it, the lowest table level at or above it anyway;
+	 * if the floor is above every level, no lower than now. Each CPU
+	 * cluster lowers its own floor only after it moved down.
 	 */
 	floor = 0;
 	for (i = 0; i < EXYNOS9810_MIF_HARD_SLOTS; i++)
@@ -240,17 +242,23 @@ static int xdf_target(struct device *dev, unsigned long *freq, u32 flags)
 		unsigned long f = floor;
 
 		opp = dev_pm_opp_find_freq_ceil(dev, &f);
-		if (IS_ERR(opp)) {
-			f = ULONG_MAX;
-			opp = dev_pm_opp_find_freq_floor(dev, &f);
-		}
 		if (!IS_ERR(opp)) {
 			f = dev_pm_opp_get_freq(opp);
 			dev_pm_opp_put(opp);
-			if (f > hz) {
-				hz = f;
-				bus->hard_floor_raises++;
-			}
+		} else {
+			/* levels[] are all the OPPs, descending, available or not */
+			f = 0;
+			for (i = 0; i < bus->nr_levels; i++)
+				if ((unsigned long)bus->levels[i].khz * 1000 >= floor)
+					f = (unsigned long)bus->levels[i].khz * 1000;
+			if (!f)
+				f = max(hz, bus->cur_hz);
+			dev_warn_ratelimited(dev, "CPU hard floor %lu kHz: no available OPP reaches it, %lu kHz\n",
+					     floor / 1000, f / 1000);
+		}
+		if (f > hz) {
+			hz = f;
+			bus->hard_floor_raises++;
 		}
 	}
 
