@@ -518,3 +518,94 @@ hung restart into a reset, as it did on q40.
    `restart: armed for 30 s and no longer petted` and
    `restart with lost CPUs N: cpuidle_pause() skipped`. Then a WDT reset
    follows, and the shim bounce returns the phone to Lineage, as on q40.
+
+## 8. Trial q43-idled result and the q44-idlee policy
+
+q43 ran on 2026-11-04 (Image 518a3ebe, recovery dfe0cb0c). The log is in
+`trial-acpm-q43-idled-s2-20261104/serial-ready.bin`.
+
+### 8.1 Result (CONFIRMED from the log and timeline)
+
+- `PSCI_VERSION` returns -1: the firmware is PSCI v0.1, so it has no
+  AFFINITY_INFO. PSCI CPU_ON returns 0 for a stuck core and has no effect.
+- little-1, big-1 and little-2 passed. **little-3-lim failed even with the
+  limit**: at most two LITTLE cores were in C2 (`little_in_c2=2`; guarded
+  +3/+8/+27), and cpu1 was lost. So it is not "three concurrent C2
+  entries": three LITTLE cores *armed* is enough. little-2 (two armed,
+  cpu3 in plain WFI) has passed twice. The difference is that cpu3 also
+  enters C2 sometimes.
+- cpu1 had one `early` return (-95: EL3 aborted the suspend because an
+  interrupt was pending) shortly before it was lost.
+- **Timeline** (sampler on cpu7; cpu1's last power-down falls in the
+  unsampled gap between 26 and 78 ms):
+  - Normal cycle: config 0 → STATUS 11000f → 4x000c → 880000, and the
+    APM sets the core's GRP1_EN bit during the power-down. Wake: the
+    GRP1_PEND bit latches, the APM sets config f (STATUS c50f0c/890f00 →
+    e40f0e → 100f0f), clears the core's GRP1_EN and GRP1_PEND bits, and the
+    core returns about 70 µs later.
+  - Early return: an IPI latches GRP1_PEND while the core is already in
+    EL3 (stage 2, still powered), EL3 aborts, and the kernel then clears
+    the stale PEND bit in its next core-off sequence.
+  - cpu1 was off from before +78 ms with GRP1_EN bit5 set. GRP1_PEND bit5
+    stayed 0 through ping 2 (+46.6 ms) and its timer IPIs, while cpu2
+    kept cycling normally. The disarm IPIs at +147.0 ms latched bit5 at
+    once, and the APM powered cpu1 on within 50 µs. After that cpu1 stayed
+    at stage `firmware`, powered and **executing** (the pmu-cycle
+    power-down request did not complete within 5 ms, so the core was not in
+    WFI).
+- The safety chain worked again: watchdog guard, SoC reset, shim bounce.
+
+### 8.2 EL3 monitor: not readable
+
+- No bootloader package (bl31/el3_mon/sboot/tzsw/ldfw) exists on gekko
+  or in the backups.
+- The raw boot LUN (`watchdog-research/sdb-analysis.elf`) has plaintext
+  AArch64 EL3 entry code only at 0x4900, 0x16000, 0x31c00 and 0x7e000
+  (boot stages: CurrentEL, VBAR_EL3, SCR_EL3 setup) and sboot. sboot
+  *issues* SMCs; it does not handle them.
+- No aligned PSCI function-ID constants exist in plaintext.
+- The blocks at 0x160000 (64 KB) and 0x200000-0x21ffff (128 KB) have
+  entropy 8.00, i.e. they are encrypted: these are the EL3 monitor / LDFW.
+
+CONFIRMED that static RE of the PSCI path is not possible with what we
+have.
+
+### 8.3 Reading (INFERRED)
+
+There are two linked faults, both inside firmware we cannot see:
+1. a LITTLE core's power-down sometimes leaves its GIC wake output not
+   reaching GRP1_PEND (a lost edge);
+2. after a long, unexpected power-off, EL3's warm boot of that core
+   spins (CPU_ON then reports it as OFF).
+
+The trigger involves activity of the third LITTLE secondary. Remaining
+4.9 differences that could matter:
+- CPU0 also takes C2 in 4.9;
+- 4.9 wakes each core with its own MCT local-timer SPI, while 6.12 uses
+  SGIs from CPU0.
+
+### 8.4 q44-idlee (commit 3bbe1acf3): measured BIG-only C2
+
+- LITTLE arming is refused unless DT `samsung,c2-little-enable`. The
+  self-test checks the refusal ("LITTLE arm check: refused (...)").
+- Phases: big-1, big-2, big-3 (1 s each), big-4 (2 s), big-4-soak (10 s),
+  about 90-106 s. They overlap the cpufreq (100 s) and devfreq/TMU (105 s)
+  self-tests on purpose.
+- The timeline samples all four BIG cores from cpu1. Its 1024-entry ring
+  is frozen at the failure, so the moments before a loss survive.
+- Image ccc96b45, DTB 787591e2, recovery 0efedc73.
+
+Reading q44:
+- **Pass:** `LITTLE arm check: refused`, five phase PASS lines, and
+  `done result=PASS phases_passed=5/5 lost=`. Then check:
+  - per BIG CPU in the soak, `c2_enter` ≈ `resumed` + `early` +
+    `psci_fail`;
+  - `ping answered=N/N`;
+  - `pmu_off_seen` > 0;
+  - `mct_bc irqs` > 0.
+
+  The later cpufreq/devfreq/TMU self-tests should PASS and the 120 s
+  restart should work without the watchdog (no "CPU-LOST" lines).
+- **A BIG failure:** the frozen timeline (`tl#`) shows the four BIG cores
+  around the loss. Then BIG-only C2 is not safe either, and C2 stays off
+  (WFI only) until the EL3 behaviour is understood.
