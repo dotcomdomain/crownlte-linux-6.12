@@ -94,17 +94,31 @@ through that one IOVA space. Here all three are in decon_f's `iommus` and share 
   the panel command window, take it), log. While the inhibit is set, every restore of a saved
   trigger value (command window end or idle timeout, adopt, SysMMU enable) keeps the trigger
   masked; only a commit's own unmask in `dpu_apply()` clears it.
-- Recovery: if the fault masked the trigger while a shadow update waited for it, that update
-  could never latch and every later frame would stop at the pending-update wait. The commit
-  path (`dpu_process()`) then unmasks once, lets the pending update latch (up to 100 ms) and logs
-  `pending shadow update held by a SysMMU fault mask: one unmask, latched (recovery #n)`. The
-  pending frame is `d->active` and the frame before it stays on `d->stale` until the latch is
-  seen, so their IOVAs stay mapped throughout.
+- Recovery (`dpu_pending_resolve()`, under `hw_lock`): if the fault masked the trigger while a
+  shadow update waited for it, that update could never latch, and every later commit and panel
+  command window would stop at the pending-update wait. Both paths (`dpu_process()` and
+  `dpu_cmd_window_begin()`, so the ALPM exit and the panel-recovery branch too) then unmask once
+  and wait up to 100 ms for the latch, logging
+  `<who>: update #n held by a SysMMU fault mask: unmask k/3, latched|still pending`. Each held
+  update gets at most 3 such unmasks in total. After that DECON is **quiesced**: the trigger
+  stays masked (logged once: `update #n still held after 3 unmasks: quiesced …`), command
+  windows return -EBUSY, and a commit with the same buffers is skipped. A commit with a
+  different buffer set and no bounce copy replaces the held update (the trigger is masked, so
+  its shadow registers can be rewritten), and the quiesce ends with the next latch. Nothing is
+  freed by the recovery: the held frame is `d->active`, the frame before it stays on
+  `d->stale` until a latch is seen, so their IOVAs stay mapped throughout.
 - Probe requires `iommus` to name exactly sysmmu_dpu0..2 (0x160a0000/0x160b0000/0x160c0000,
-  each once) with a read-only view of each, and all three translating after the runtime resume
-  (CTRL readback 0x7). Anything else fails the probe: with `iommus` the device's DMA ops are
-  iommu-dma, so even the bounce path would hand out IOVAs. The DTB without `iommus` is the
+  each once) with a read-only view of each, and all three translating after the runtime resume:
+  CTRL bit 0 (enable) set in each of them, i.e. the controller bitmask is 0x7 (an enabled
+  SysMMU reads CTRL = 0x5). Anything else fails the probe: with `iommus` the device's DMA ops
+  are iommu-dma, so even the bounce path would hand out IOVAs. The DTB without `iommus` is the
   fallback.
+- A probe that fails after the fault handler was installed removes it, waits for running
+  handlers (`synchronize_irq()` on the three SysMMU IRQs), drops DECON's runtime PM hold (the
+  SysMMUs go to bypass once the driver core releases the probe's supplier references; until
+  then they translate the boot fb 1:1), clears the fault inhibit and writes back the trigger
+  saved before the handler was installed, so the splash is never left frozen by a probe-time
+  fault.
 
 ## Test DTB: exynos9810-crownlte-romram-iommu.dtb vs exynos9810-crownlte-romram-v18.dtb
 
@@ -130,6 +144,7 @@ exynos9810-decon 16030000.decon_f: sysmmu_dpuN CTRL=0x5 VERSION=…
 exynos9810-decon 16030000.decon_f: decon iommu: SysMMUs 0x7 already translating at probe (…)
 exynos9810-decon 16030000.decon_f: decon iommu: sysmmu_dpuN after runtime resume: CTRL=0x5 …
 exynos9810-decon 16030000.decon_f: decon iommu: SysMMUs translating (0x7 -> 0x7), FRAME_COUNT …
+  (0x7 / "SysMMUs 0x7" are controller bitmasks of CTRL bit 0, not CTRL values; CTRL reads 0x5)
 exynos9810-decon 16030000.decon_f: fb0 takeover: … : 0, latched …
 … once HWC runs:
 exynos9810-decon 16030000.decon_f: decon iommu: map #1: 17305600-byte dma-buf, N physical chunks -> IOVA 0x… (cached 1, hits 0, unmapped 0)
@@ -149,7 +164,9 @@ wizard), with no copy latency.
 | `decon iommu: boot fb IOVA … not identity` | `iommu-addresses` not applied: DECON refuses to probe, SysMMUs return to bypass, splash stays |
 | `decon iommu: SysMMUs 0x… of 0x7 translating` | runtime PM/device link did not enable all three: DECON refuses |
 | `decon iommu: SysMMU read fault #n at IOVA …` + `TE trigger masked` | a buffer was unmapped while scanned (lifetime bug); the panel freezes on its last frame until the next commit |
-| `decon iommu: pending shadow update held by a SysMMU fault mask: one unmask, …` | recovery of an update the fault mask had blocked; `still pending` means the frame was skipped and the next commit tries again |
+| `decon iommu: <who>: update #n held by a SysMMU fault mask: unmask k/3, …` | recovery of an update the fault mask had blocked; `still pending` means that commit or command window was skipped and the next one tries again |
+| `decon iommu: <who>: update #n still held after 3 unmasks: quiesced …` | the held update never latched: trigger masked until a commit with other buffers (`quiesced: a commit with other buffers replaces held update #n`) |
+| `decon iommu: probe failed: fault handler removed, TE trigger back to …` | DECON did not probe; the trigger as SBoot left it (read before the handler) is restored |
 | `decon iommu: no IOVA for a …-byte dma-buf (…)` | mapping failed; that frame bounces as before |
 
 ## Not ported from crownlte-dpu-iommu
