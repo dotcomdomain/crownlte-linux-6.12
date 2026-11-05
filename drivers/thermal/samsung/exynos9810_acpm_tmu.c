@@ -373,6 +373,56 @@ static void acpm_tmu_report_hw_trip(struct acpm_tmu_sensor *s, void __iomem *bas
 	}
 }
 
+/*
+ * Placeholder cooling device (DT samsung,stub-cooling-device = "<type>").
+ * 4.9 registered isp_cooling as "thermal-isp-0"; the vendor thermal HAL
+ * (thermal_info_config.json) lists it and aborts if no cooling device of
+ * that type exists. There is no ISP driver on 6.12, so the stub has a
+ * single state 0 ("no throttling"), refuses any other state and touches no
+ * hardware. Nothing binds it to a zone (no cooling-maps reference it).
+ */
+static int acpm_tmu_stub_cdev_get_max_state(struct thermal_cooling_device *cdev,
+					    unsigned long *state)
+{
+	*state = 0;
+	return 0;
+}
+
+static int acpm_tmu_stub_cdev_get_cur_state(struct thermal_cooling_device *cdev,
+					    unsigned long *state)
+{
+	*state = 0;
+	return 0;
+}
+
+static int acpm_tmu_stub_cdev_set_cur_state(struct thermal_cooling_device *cdev,
+					    unsigned long state)
+{
+	return state ? -EINVAL : 0;
+}
+
+static const struct thermal_cooling_device_ops acpm_tmu_stub_cdev_ops = {
+	.get_max_state = acpm_tmu_stub_cdev_get_max_state,
+	.get_cur_state = acpm_tmu_stub_cdev_get_cur_state,
+	.set_cur_state = acpm_tmu_stub_cdev_set_cur_state,
+};
+
+static void acpm_tmu_register_stub_cdev(struct device *dev, struct device_node *np)
+{
+	struct thermal_cooling_device *cdev;
+	const char *type;
+
+	if (of_property_read_string(np, "samsung,stub-cooling-device", &type))
+		return;
+	cdev = devm_thermal_of_cooling_device_register(dev, NULL, type, NULL,
+						       &acpm_tmu_stub_cdev_ops);
+	if (IS_ERR(cdev))
+		dev_warn(dev, "stub cooling device %s: %ld\n", type, PTR_ERR(cdev));
+	else
+		dev_info(dev, "stub cooling device %s = cooling_device%d, max_state 0 (no driver behind it, never throttles)\n",
+			 type, cdev->id);
+}
+
 static int acpm_tmu_sensor_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -423,6 +473,8 @@ static int acpm_tmu_sensor_probe(struct platform_device *pdev)
 		dev_err(dev, "%s tzid=%u thermal zone NOT registered: %s\n", s->name, s->id,
 			!ready ? "ACPM TMU not initialised" : "TMU CORE_EN is clear");
 	}
+
+	acpm_tmu_register_stub_cdev(dev, np);
 
 	mutex_lock(&acpm_tmu_state_lock);
 	if (acpm_tmu.num_sensors < ACPM_TMU_MAX_SENSORS)
