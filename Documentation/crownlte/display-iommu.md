@@ -101,20 +101,24 @@ through that one IOVA space. Here all three are in decon_f's `iommus` and share 
   and wait up to 100 ms for the latch, logging
   `<who>: update #n held by a SysMMU fault mask: unmask k/3, latched|still pending`. Each held
   update gets at most 3 such unmasks in total. After that DECON is **quiesced**: the trigger
-  stays masked (logged once: `update #n still held after 3 unmasks: quiesced …`), command
-  windows return -EBUSY, and a commit with the same buffers is skipped. A commit with a
-  different buffer set and no bounce copy replaces the held update (the trigger is masked, so
-  its shadow registers can be rewritten), and the quiesce ends with the next latch. Nothing is
-  freed by the recovery: the held frame is `d->active`, the frame before it stays on
-  `d->stale` until a latch is seen, so their IOVAs stay mapped throughout.
+  stays masked and every commit and command window returns -EBUSY, logged once
+  (`update #n still held after 3 unmasks: quiesced …`; the per-frame "still pending" warning
+  is not repeated). No register is rewritten while that update is pending, as in 4.9
+  `__decon_update_regs()`. The quiesce lasts until a latch is seen (`no update pending any
+  more, quiesce over`) or the driver stops; the command-mode panel keeps its last GRAM frame.
+  Nothing is freed by the recovery or the quiesce: the held frame is `d->active`, the frame
+  before it stays on `d->stale` until a latch is seen, so their IOVAs stay mapped throughout.
 - Probe requires `iommus` to name exactly sysmmu_dpu0..2 (0x160a0000/0x160b0000/0x160c0000,
   each once) with a read-only view of each, and all three translating after the runtime resume:
   CTRL bit 0 (enable) set in each of them, i.e. the controller bitmask is 0x7 (an enabled
   SysMMU reads CTRL = 0x5). Anything else fails the probe: with `iommus` the device's DMA ops
   are iommu-dma, so even the bounce path would hand out IOVAs. The DTB without `iommus` is the
   fallback.
-- A probe that fails after the fault handler was installed removes it, waits for running
-  handlers (`synchronize_irq()` on the three SysMMU IRQs), drops DECON's runtime PM hold (the
+- The fault callback is installed and removed with the three SysMMU fault IRQs disabled
+  (`dpu_iommu_set_handler()`): `iommu_set_fault_handler()` writes callback and token
+  separately, and `disable_irq()` also waits for a handler running on another CPU.
+  `dpu_iommu_fault()` ignores a NULL token as well.
+- A probe that fails after the fault handler was installed removes it that way, drops DECON's runtime PM hold (the
   SysMMUs go to bypass once the driver core releases the probe's supplier references; until
   then they translate the boot fb 1:1), clears the fault inhibit and writes back the trigger
   saved before the handler was installed, so the splash is never left frozen by a probe-time
@@ -165,7 +169,7 @@ wizard), with no copy latency.
 | `decon iommu: SysMMUs 0x… of 0x7 translating` | runtime PM/device link did not enable all three: DECON refuses |
 | `decon iommu: SysMMU read fault #n at IOVA …` + `TE trigger masked` | a buffer was unmapped while scanned (lifetime bug); the panel freezes on its last frame until the next commit |
 | `decon iommu: <who>: update #n held by a SysMMU fault mask: unmask k/3, …` | recovery of an update the fault mask had blocked; `still pending` means that commit or command window was skipped and the next one tries again |
-| `decon iommu: <who>: update #n still held after 3 unmasks: quiesced …` | the held update never latched: trigger masked until a commit with other buffers (`quiesced: a commit with other buffers replaces held update #n`) |
+| `decon iommu: <who>: update #n still held after 3 unmasks: quiesced …` | the held update never latched: trigger masked, commits and command windows refused (panel keeps its last frame) until a latch is seen (`quiesce over`) or the driver stops |
 | `decon iommu: probe failed: fault handler removed, TE trigger back to …` | DECON did not probe; the trigger as SBoot left it (read before the handler) is restored |
 | `decon iommu: no IOVA for a …-byte dma-buf (…)` | mapping failed; that frame bounces as before |
 
