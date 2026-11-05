@@ -566,6 +566,32 @@ out:
 	return ret;
 }
 
+/*
+ * Pixel layout of the 32-bit DPP-level formats. The IDMA format name lists
+ * the components of a little-endian 32-bit word from bit 31 down, as DRM
+ * fourccs do: ARGB8888 = 0xAARRGGBB = memory bytes B,G,R,A; XBGR8888 =
+ * memory bytes R,G,B,X. Evidence:
+ *  - 4.9 Android is correct on this panel, and HWC's RGBX_8888 client
+ *    target (Android: memory bytes R,G,B,X) reaches IDMA as XBGR8888
+ *    (4.9 dpu_translate_fmt_to_dpp());
+ *  - trial q48 (camera): with the opposite table every pattern came out
+ *    exactly as this layout predicts, on G0, G1 and VGF0 alike (format 0
+ *    red -> cyan, fbcon black -> blue; XBGR green -> magenta, magenta ->
+ *    yellow), so no DPP differs.
+ * SBoot's buffer (IDMA format 0) therefore holds 0xAARRGGBB words.
+ */
+/* memory byte index of R, G, B, A (X) */
+static const u8 dpu_fmt_pos[8][4] = {
+	[DECON_PIXEL_FORMAT_ARGB_8888] = { 2, 1, 0, 3 },
+	[DECON_PIXEL_FORMAT_ABGR_8888] = { 0, 1, 2, 3 },
+	[DECON_PIXEL_FORMAT_RGBA_8888] = { 3, 2, 1, 0 },
+	[DECON_PIXEL_FORMAT_BGRA_8888] = { 1, 2, 3, 0 },
+	[DECON_PIXEL_FORMAT_XRGB_8888] = { 2, 1, 0, 3 },
+	[DECON_PIXEL_FORMAT_XBGR_8888] = { 0, 1, 2, 3 },
+	[DECON_PIXEL_FORMAT_RGBX_8888] = { 3, 2, 1, 0 },
+	[DECON_PIXEL_FORMAT_BGRX_8888] = { 1, 2, 3, 0 },
+};
+
 /* ---- content / register diagnostics ----------------------------------- */
 
 /* latched copy of a DECON SFR (4.9 decon_dump(): regs + SHADOW_OFFSET) */
@@ -1198,32 +1224,6 @@ static int dpu_fb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 		     (v->transp.length ? 0xffU << v->transp.offset : 0);
 	return 0;
 }
-
-/*
- * Pixel layout of the 32-bit DPP-level formats. The IDMA format name lists
- * the components of a little-endian 32-bit word from bit 31 down, as DRM
- * fourccs do: ARGB8888 = 0xAARRGGBB = memory bytes B,G,R,A; XBGR8888 =
- * memory bytes R,G,B,X. Evidence:
- *  - 4.9 Android is correct on this panel, and HWC's RGBX_8888 client
- *    target (Android: memory bytes R,G,B,X) reaches IDMA as XBGR8888
- *    (4.9 dpu_translate_fmt_to_dpp());
- *  - trial q48 (camera): with the opposite table every pattern came out
- *    exactly as this layout predicts, on G0, G1 and VGF0 alike (format 0
- *    red -> cyan, fbcon black -> blue; XBGR green -> magenta, magenta ->
- *    yellow), so no DPP differs.
- * SBoot's buffer (IDMA format 0) therefore holds 0xAARRGGBB words.
- */
-/* memory byte index of R, G, B, A (X) */
-static const u8 dpu_fmt_pos[8][4] = {
-	[DECON_PIXEL_FORMAT_ARGB_8888] = { 2, 1, 0, 3 },
-	[DECON_PIXEL_FORMAT_ABGR_8888] = { 0, 1, 2, 3 },
-	[DECON_PIXEL_FORMAT_RGBA_8888] = { 3, 2, 1, 0 },
-	[DECON_PIXEL_FORMAT_BGRA_8888] = { 1, 2, 3, 0 },
-	[DECON_PIXEL_FORMAT_XRGB_8888] = { 2, 1, 0, 3 },
-	[DECON_PIXEL_FORMAT_XBGR_8888] = { 0, 1, 2, 3 },
-	[DECON_PIXEL_FORMAT_RGBX_8888] = { 3, 2, 1, 0 },
-	[DECON_PIXEL_FORMAT_BGRX_8888] = { 1, 2, 3, 0 },
-};
 
 static void dpu_fb_layout(u32 dpp_fmt, struct fb_var_screeninfo *v)
 {
