@@ -9,7 +9,9 @@
  * ABI the vendor HWC (libexynosdisplay.so) uses, the 16030000.decon_f
  * "vsync" and "psr_info" sysfs files, TE-EINT vsync events, and applies
  * S3CFB_WIN_CONFIG(_OLD) window configurations through the DPP channels for
- * physically contiguous dma-bufs (no SysMMU yet).
+ * physically contiguous dma-bufs (no SysMMU yet), including AFBC on the VGF
+ * channels. A scattered buffer (gralloc's dma-buf system heap) is copied
+ * into a contiguous decon-pool buffer per frame until the DPU SysMMU lands.
  *
  * Register sequences follow 4.9 __decon_update_regs(): wait for the
  * previous shadow update, mask the TE trigger, program the DPPs, then the
@@ -94,45 +96,140 @@ static void dpu_buf_release(struct dpu_buf *b)
 
 /*
  * Import one plane. Without a SysMMU the DPP takes a physical address, so
- * the mapped buffer must be one contiguous run below 4 GiB.
+ * the buffer must be one contiguous run below 4 GiB. Gralloc allocates from
+ * the dma-buf system heap (libion_exynos dma-heap mode), which is scattered;
+ * with @may_bounce such a buffer is accepted and copied into a contiguous
+ * decon-pool buffer before it is scanned (dpu_bounce()). Kernel buffers
+ * (fb0, self-test) are always contiguous.
  */
 static int dpu_buf_import(struct dpu_dev *d, struct dma_buf *db, struct dpu_buf *b,
-			  u64 need)
+			  u64 need, bool may_bounce, const char **why)
 {
 	struct scatterlist *sg;
-	dma_addr_t addr;
+	dma_addr_t addr = 0;
 	u64 len = 0;
+	bool contig = true;
 	int i, ret;
 
 	b->dmabuf = db;
+	if (db->size < need) {
+		*why = "dma-buf smaller than the frame";
+		return -EINVAL;
+	}
 	b->att = dma_buf_attach(db, d->dev);
 	if (IS_ERR(b->att)) {
 		ret = PTR_ERR(b->att);
 		b->att = NULL;
+		*why = "dma_buf_attach failed";
 		return ret;
 	}
 	b->sgt = dma_buf_map_attachment_unlocked(b->att, DMA_TO_DEVICE);
 	if (IS_ERR(b->sgt)) {
 		ret = PTR_ERR(b->sgt);
 		b->sgt = NULL;
-		return ret;
-	}
-	addr = sg_dma_address(b->sgt->sgl);
-	for_each_sgtable_dma_sg(b->sgt, sg, i) {
-		if (sg_dma_address(sg) != addr + len) {
-			dev_warn_ratelimited(d->dev, "buffer not contiguous (segment %d); needs the DPU SysMMU\n",
-					     i);
-			return -EINVAL;
+		if (!may_bounce) {
+			*why = "dma_buf_map_attachment failed";
+			return ret;
 		}
-		len += sg_dma_len(sg);
+		contig = false;		/* e.g. pages above 4 GiB for a 32-bit device */
+	} else {
+		addr = sg_dma_address(b->sgt->sgl);
+		for_each_sgtable_dma_sg(b->sgt, sg, i) {
+			if (sg_dma_address(sg) != addr + len)
+				contig = false;
+			len += sg_dma_len(sg);
+		}
+		b->nsegs = b->sgt->nents;
+		if (contig && (len < need || addr + need > SZ_4G))
+			contig = false;
 	}
-	if (len < need || addr + need > SZ_4G) {
-		dev_warn_ratelimited(d->dev, "buffer %pad+%#llx unusable (need %#llx below 4 GiB)\n",
-				     &addr, len, need);
+	if (contig) {
+		b->addr = addr;
+		b->len = len;
+		return 0;
+	}
+	if (!may_bounce) {
+		*why = "buffer not contiguous below 4 GiB (needs the DPU SysMMU)";
 		return -EINVAL;
 	}
-	b->addr = addr;
-	b->len = len;
+	/* no device mapping for a bounced buffer: only the CPU reads it */
+	if (b->sgt)
+		dma_buf_unmap_attachment_unlocked(b->att, b->sgt, DMA_TO_DEVICE);
+	dma_buf_detach(db, b->att);
+	b->sgt = NULL;
+	b->att = NULL;
+	b->bounce = true;
+	b->len = db->size;
+	return 0;
+}
+
+/*
+ * Copy the scattered buffers of a commit into the decon-pool double buffer
+ * (stopgap until the DPU SysMMU, branch crownlte-dpu-iommu, is merged). An
+ * AFBC stream is position independent relative to its base, so a byte copy
+ * scans out identically. Runs in the update worker after the acquire fences,
+ * outside hw_lock. The buffer not used by the last latched commit is written,
+ * so the one being scanned is never touched. At most one window per commit
+ * is bounced (dpu_build_commit()).
+ */
+static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
+{
+	int i, ret;
+
+	for (i = 0; i < DECON_MAX_WIN; i++) {
+		struct dpu_buf *b = &c->buf[i];
+		struct dpu_bounce *t = &d->bounce[d->bounce_next];
+		struct iosys_map map;
+		ktime_t t0 = ktime_get();
+		u32 us;
+
+		if (c->cfg[i].state != DECON_WIN_STATE_BUFFER || !b->bounce)
+			continue;
+		if (t->size < b->len) {
+			if (t->vaddr)
+				dma_free_wc(d->dev, t->size, t->vaddr, t->dma);
+			t->size = PAGE_ALIGN(b->len);
+			t->vaddr = dma_alloc_wc(d->dev, t->size, &t->dma, GFP_KERNEL);
+			if (!t->vaddr || upper_32_bits(t->dma + t->size - 1)) {
+				dev_err_ratelimited(d->dev, "bounce buffer %d: cannot allocate %zu bytes below 4 GiB from decon-pool\n",
+						    d->bounce_next, t->size);
+				if (t->vaddr)
+					dma_free_wc(d->dev, t->size, t->vaddr, t->dma);
+				t->vaddr = NULL;
+				t->size = 0;
+				return -ENOMEM;
+			}
+			dev_info(d->dev, "bounce buffer %d: %zu bytes at %pad\n",
+				 d->bounce_next, t->size, &t->dma);
+		}
+		ret = dma_buf_begin_cpu_access(b->dmabuf, DMA_FROM_DEVICE);
+		if (ret)
+			return ret;
+		ret = dma_buf_vmap_unlocked(b->dmabuf, &map);
+		if (!ret && map.is_iomem) {
+			dma_buf_vunmap_unlocked(b->dmabuf, &map);
+			ret = -EINVAL;
+		}
+		if (!ret) {
+			memcpy(t->vaddr, map.vaddr, b->len);
+			dma_buf_vunmap_unlocked(b->dmabuf, &map);
+		}
+		dma_buf_end_cpu_access(b->dmabuf, DMA_FROM_DEVICE);
+		if (ret) {
+			dev_err_ratelimited(d->dev, "win%d: cannot map the dma-buf for the bounce copy: %d\n",
+					    i, ret);
+			return ret;
+		}
+		wmb();
+		b->addr = t->dma;
+		c->bounced = true;	/* dpu_process() flips bounce_next once latched */
+		us = ktime_us_delta(ktime_get(), t0);
+		d->bounce_max_us = max(d->bounce_max_us, us);
+		if (!d->nr_bounces++ || us > 40000)
+			dev_info_ratelimited(d->dev, "win%d: scattered buffer (%u segments, %zu bytes%s) copied to %pad in %u us (bounce #%u, max %u us)\n",
+					     i, b->nsegs, b->len, c->cfg[i].compression ? ", AFBC" : "",
+					     &b->addr, us, d->nr_bounces, d->bounce_max_us);
+	}
 	return 0;
 }
 
@@ -154,28 +251,44 @@ static void dpu_commit_free(struct dpu_commit *c)
 
 /* ---- validation (4.9 decon_prepare_win_config / check_limitation) --- */
 
-static int dpu_check_buffer_win(struct dpu_dev *d, int i, const struct decon_win_config *w,
-				u32 dpp_fmt)
+/* NULL if the buffer window can be scanned, else the reason it cannot */
+static const char *dpu_check_buffer_win(struct dpu_dev *d, const struct decon_win_config *w,
+					u32 dpp_fmt)
 {
 	const struct decon_frame *s = &w->src, *t = &w->dst;
 	int bpp = dpu_fmt_bpp(dpp_fmt);
 
-	if (w->idma_type >= DPU_NR_DPP || !bpp)
-		return -EINVAL;
+	if (w->idma_type >= DPU_NR_DPP)
+		return "idma_type out of range";
+	if (!bpp)
+		return "format not supported (RGB 32-bit and RGB565 only)";
 	if (s->w < 16 || s->h < 16 || s->w > 4096 || s->h > 4096 ||
 	    s->f_w < 16 || s->f_h < 16 || s->f_w > 65534 || s->f_h > 8190 ||
 	    s->x < 0 || s->y < 0 || s->x + s->w > s->f_w || s->y + s->h > s->f_h)
-		return -EINVAL;
+		return "source size/crop out of range";
 	if (t->x < 0 || t->y < 0 || t->x + t->w > d->lcd.xres ||
 	    t->y + t->h > d->lcd.yres)
-		return -EINVAL;
-	/* no scaler, rotation, AFBC, protected or block-area support yet */
-	if (t->w != s->w || t->h != s->h || w->dpp_parm.rot || w->compression ||
-	    w->protection || w->blending > DECON_BLENDING_COVERAGE)
-		return -EINVAL;
+		return "destination outside the panel";
+	if (t->w != s->w || t->h != s->h)
+		return "scaling not supported";
+	if (w->dpp_parm.rot)
+		return "rotation not supported";
+	if (w->protection)
+		return "protected content not supported";
+	if (w->blending > DECON_BLENDING_COVERAGE)
+		return "unknown blending mode";
+	if (w->block_area.w || w->block_area.h)
+		return "block area not supported";
+	if (w->compression) {
+		/* 4.9 dpp_check_format() / dpp_check_limitation() */
+		if (w->idma_type != DECON_IDMA_VGF0 && w->idma_type != DECON_IDMA_VGF1)
+			return "AFBC on a non-VGF channel";
+		if (w->dpp_parm.hdr_std)
+			return "AFBC with HDR";
+	}
 	if (bpp == 16 && (s->x & 1))
-		return -EINVAL;
-	return 0;
+		return "odd x offset for RGB565";
+	return NULL;
 }
 
 static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
@@ -184,7 +297,8 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 {
 	struct dpu_commit *c = kzalloc(sizeof(*c), GFP_KERNEL);
 	unsigned long used = 0;
-	int i, ret = 0;
+	int i, ret = 0, nbounce = 0;
+	const char *why = NULL;
 
 	if (!c) {
 		*err = -ENOMEM;
@@ -198,31 +312,38 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 		u64 need;
 
 		c->cfg[i] = *w;
+		why = NULL;
 		switch (w->state) {
 		case DECON_WIN_STATE_DISABLED:
 			break;
 		case DECON_WIN_STATE_COLOR:
 			if (w->dst.x < 0 || w->dst.y < 0 || !w->dst.w || !w->dst.h ||
 			    w->dst.x + w->dst.w > d->lcd.xres ||
-			    w->dst.y + w->dst.h > d->lcd.yres)
+			    w->dst.y + w->dst.h > d->lcd.yres) {
+				why = "color window outside the panel";
 				ret = -EINVAL;
-			else
+			} else {
 				c->nr_win++;
+			}
 			break;
 		case DECON_WIN_STATE_BUFFER:
 		case DECON_WIN_STATE_CURSOR:
 			c->cfg[i].state = DECON_WIN_STATE_BUFFER;
 			c->dpp_fmt[i] = dpu_translate_fmt_to_dpp(w->format);
-			ret = dpu_check_buffer_win(d, i, w, c->dpp_fmt[i]);
-			if (ret)
+			why = dpu_check_buffer_win(d, w, c->dpp_fmt[i]);
+			if (why) {
+				ret = -EINVAL;
 				break;
+			}
 			if (test_and_set_bit(w->idma_type, &used)) {
-				ret = -EINVAL;	/* 4.9: channel mapped to multiple windows */
+				why = "channel used by two windows";	/* 4.9 chmap check */
+				ret = -EINVAL;
 				break;
 			}
 			if (kbufs) {
 				db = kbufs[i];
 				if (!db) {
+					why = "no kernel buffer";
 					ret = -EINVAL;
 					break;
 				}
@@ -230,31 +351,47 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
 			} else {
 				db = dma_buf_get(w->fd_idma[0]);
 				if (IS_ERR(db)) {
+					why = "fd_idma[0] is not a dma-buf";
 					ret = PTR_ERR(db);
 					break;
 				}
 			}
+			/* AFBC: header + compressed payload, never smaller than this */
 			need = (u64)w->src.f_w * w->src.f_h * dpu_fmt_bpp(c->dpp_fmt[i]) / 8;
-			ret = dpu_buf_import(d, db, &c->buf[i], need);
+			ret = dpu_buf_import(d, db, &c->buf[i], need, !kbufs, &why);
 			if (ret)
 				break;
+			if (c->buf[i].bounce && ++nbounce > 1) {
+				why = "more than one scattered buffer (only one bounce copy per frame)";
+				ret = -EINVAL;
+				break;
+			}
+			if (w->compression)
+				d->nr_afbc++;
 			if (!kbufs && w->acq_fence >= 0) {
 				c->acq[i] = sync_file_get_fence(w->acq_fence);
-				if (!c->acq[i])
+				if (!c->acq[i]) {
+					why = "acq_fence is not a sync_file";
 					ret = -EINVAL;
+				}
 			}
 			c->nr_win++;
 			break;
 		default:
+			why = "unknown window state";
 			ret = -EINVAL;
 			break;
 		}
 		if (ret)
-			dev_warn_ratelimited(d->dev, "win%d rejected (state %u fmt %u idma %u src %ux%u@%d,%d f %ux%u dst %ux%u@%d,%d): %d\n",
-					     i, w->state, w->format, w->idma_type,
-					     w->src.w, w->src.h, w->src.x, w->src.y,
-					     w->src.f_w, w->src.f_h, w->dst.w, w->dst.h,
-					     w->dst.x, w->dst.y, ret);
+			dev_warn_ratelimited(d->dev, "win%d rejected: %s (%d) [state %u fmt %u idma %u comp %u rot %u prot %u blend %u pa %d hdr %u fd %d/%d/%d acq %d block %ux%u src %ux%u@%d,%d f %ux%u dst %ux%u@%d,%d]\n",
+					     i, why ? why : "?", ret, w->state, w->format,
+					     w->idma_type, w->compression, w->dpp_parm.rot,
+					     w->protection, w->blending, w->plane_alpha,
+					     w->dpp_parm.hdr_std, w->fd_idma[0], w->fd_idma[1],
+					     w->fd_idma[2], w->acq_fence, w->block_area.w,
+					     w->block_area.h, w->src.w, w->src.h, w->src.x,
+					     w->src.y, w->src.f_w, w->src.f_h, w->dst.w,
+					     w->dst.h, w->dst.x, w->dst.y);
 	}
 	if (ret) {
 		dpu_commit_free(c);
@@ -346,8 +483,13 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		c->acq[i] = NULL;
 	}
 
-	c->result = dpu_apply(d, c);
+	c->result = dpu_bounce(d, c);
+	if (!c->result)
+		c->result = dpu_apply(d, c);
 	d->nr_commits++;
+	/* the bounce buffer just written is now (or may be) scanned */
+	if (c->bounced && (c->result == 0 || c->result == -ETIMEDOUT))
+		d->bounce_next ^= 1;
 
 	if (c->fence) {
 		if (c->result)
@@ -695,11 +837,12 @@ static int dpu_fb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long ar
 		return -ENODEV;		/* no DisplayPort on decon_f */
 
 	case EXYNOS_DPU_DUMP:
-		dev_info(d->dev, "dump: FRAME_COUNT=%u TRIG=%#x DP0=%#x DP1=%#x commits=%u timeouts=%u rejects=%u te=%d\n",
+		dev_info(d->dev, "dump: FRAME_COUNT=%u TRIG=%#x DP0=%#x DP1=%#x commits=%u timeouts=%u rejects=%u te=%d base_mismatch=%u afbc=%u bounces=%u (max %u us)\n",
 			 dpu_hw_frame_count(d), decon_rd(d, HW_SW_TRIG_CONTROL),
 			 decon_rd(d, DATA_PATH_CONTROL_0), decon_rd(d, DATA_PATH_CONTROL_1),
 			 d->nr_commits, d->nr_latch_timeouts, d->nr_rejects,
-			 atomic_read(&d->te_count));
+			 atomic_read(&d->te_count), d->nr_base_mismatch, d->nr_afbc,
+			 d->nr_bounces, d->bounce_max_us);
 		return 0;
 
 	case S3CFB_POWER_MODE:

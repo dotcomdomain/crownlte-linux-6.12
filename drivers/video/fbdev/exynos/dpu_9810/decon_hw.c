@@ -155,6 +155,14 @@ void dpu_hw_dpp_init(struct dpu_dev *d, int id)
 	/* dpp_reg_set_plane_alpha_fixed() */
 	dma_wr_mask(d, id, IDMA_OUT_CON, IDMA_OUT_FRAME_ALPHA(0xff),
 		    IDMA_OUT_FRAME_ALPHA_MASK);
+
+	/*
+	 * 4.9 dpp_reg_init(), CONFIG_EXYNOS_AFBC: dma_reg_set_recovery_num(id,
+	 * INIT_RCV_NUM), AFBC error-recovery window in ACLK cycles (630000 =
+	 * 1 ms at 630 MHz) in the DPU DMA common block.
+	 */
+	writel((readl(d->dma_com + DPU_DMA_RECOVERY_NUM_CTRL) & ~DPU_DMA_RECOVERY_NUM_MASK) |
+	       DPU_DMA_RECOVERY_NUM(630000), d->dma_com + DPU_DMA_RECOVERY_NUM_CTRL);
 }
 
 static int sc_ratio_sel(u32 ratio)
@@ -271,7 +279,23 @@ int dpu_hw_dpp_config(struct dpu_dev *d, int id, const struct decon_win_config *
 	/* dpp_reg_set_block_area(): no block */
 	dma_wr_mask(d, id, IDMA_IN_CON, 0, IDMA_BLOCK_EN);
 
-	return dpp_set_format(d, id, dpp_fmt);
+	if (dpp_set_format(d, id, dpp_fmt))
+		return -EINVAL;
+
+	/*
+	 * 4.9 dpp_reg_set_format() tail (CONFIG_EXYNOS_AFBC=y): AFBC decoding
+	 * and its recovery on the VGF channels only, cleared otherwise. An AFBC
+	 * stream uses one plane and BASE_ADDR_C = BASE_ADDR_Y (set above).
+	 */
+	if (id == DECON_IDMA_VGF0 || id == DECON_IDMA_VGF1) {
+		bool afbc = c->compression;
+
+		dma_wr_mask(d, id, IDMA_IN_CON, afbc ? ~0U : 0, IDMA_AFBC_EN);
+		dma_wr_mask(d, id, IDMA_RECOVERY_CTRL, afbc ? ~0U : 0, IDMA_RECOVERY_EN);
+	} else if (c->compression) {
+		return -EINVAL;		/* 4.9: AFBC decoding is VGF only */
+	}
+	return 0;
 }
 
 /* ---- DECON windows (4.9 decon_reg_set_window_control) ---------------- */

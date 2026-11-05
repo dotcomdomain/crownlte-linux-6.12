@@ -77,6 +77,15 @@ struct dpu_buf {
 	struct sg_table *sgt;
 	dma_addr_t addr;		/* 0 = no buffer */
 	size_t len;
+	bool bounce;			/* scattered: copied into a decon-pool buffer */
+	u32 nsegs;
+};
+
+/* contiguous copy target for scattered buffers until the DPU SysMMU is in */
+struct dpu_bounce {
+	void *vaddr;
+	dma_addr_t dma;
+	size_t size;
 };
 
 /* One S3CFB_WIN_CONFIG request, as queued to the update worker */
@@ -89,6 +98,7 @@ struct dpu_commit {
 	struct dma_fence *fence;	/* retire = release fence, may be NULL */
 	unsigned int nr_win;
 	bool internal;			/* kernel-owned buffers (fb, self-test) */
+	bool bounced;			/* a window scans d->bounce[d->bounce_next] */
 	ktime_t queued;
 	u32 latch_us;			/* filled by the worker */
 	u32 fc_before, fc_after;
@@ -143,6 +153,9 @@ struct dpu_dev {
 	spinlock_t fence_lock;
 	u32 nr_commits, nr_latch_timeouts, nr_rejects;
 	u32 nr_base_mismatch;			/* active IDMA base != programmed */
+	struct dpu_bounce bounce[2];
+	int bounce_next;
+	u32 nr_bounces, bounce_max_us, nr_afbc;
 	u32 hwc_ver;
 
 	/* vsync (TE EINT, as 4.9 decon_ext_irq_handler) */
