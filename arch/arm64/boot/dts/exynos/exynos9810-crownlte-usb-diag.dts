@@ -92,3 +92,5 @@
 	snps,dis_u3_susphy_quirk;
 	status = "okay";
 };
+
+#include "exynos9810-crownlte-max77705.dtsi"

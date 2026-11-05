@@ -329,6 +329,19 @@
 			status = "disabled";
 		};
 
+		/*
+		 * CMGP ADC, 12 channels, 12 bit (4.9 adc@14230000,
+		 * "samsung,exynos-adc-v3", SPI 8). The gate clock
+		 * (GATE_ADC_CMGP) comes from the board clock provider.
+		 */
+		adc: adc@14230000 {
+			compatible = "samsung,exynos9810-adc";
+			reg = <0x14230000 0x100>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>;
+			#io-channel-cells = <1>;
+			status = "disabled";
+		};
+
 		pinctrl_aud: pinctrl@17c60000 {
 			compatible = "samsung,exynos9810-pinctrl";
 			reg = <0x17c60000 0x1000>;

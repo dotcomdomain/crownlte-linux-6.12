@@ -1018,4 +1018,18 @@ config FUEL_GAUGE_MM8013
 	  the state of charge, temperature, cycle count, actual and design
 	  capacity, etc.
 
+config BATTERY_MAX77705_RO
+	tristate "MAX77705 read-only battery monitor (Exynos9810 Note9)"
+	depends on I2C && OF && IIO
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	help
+	  Read-only monitor for the Maxim MAX77705 fuel gauge and charger on
+	  the Samsung Galaxy Note9 (crownlte). It registers the "battery",
+	  "ac", "usb" and "wireless" power supplies that the Android health
+	  HAL reads, using only I2C reads; it never changes charger or fuel
+	  gauge settings. Battery percentage follows the 4.9 Samsung
+	  capacity scaling. Battery, charger ("ac") and USB-connector
+	  temperatures come from the SoC ADC thermistors (EXYNOS_ADC) with
+	  the 4.9 tables when the DT wires them.
+
 endif # POWER_SUPPLY

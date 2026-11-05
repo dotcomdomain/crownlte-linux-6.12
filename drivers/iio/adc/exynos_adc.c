@@ -25,6 +25,9 @@
 #include <linux/err.h>
 #include <linux/input.h>
 
+#include <linux/ktime.h>
+#include <linux/workqueue.h>
+
 #include <linux/iio/iio.h>
 #include <linux/iio/machine.h>
 #include <linux/iio/driver.h>
@@ -54,6 +57,9 @@
 #define ADC_V2_INT_EN(x)	((x) + 0x10)
 #define ADC_V2_INT_ST(x)	((x) + 0x14)
 #define ADC_V2_VER(x)		((x) + 0x20)
+
+/* Exynos9810 ADC (4.9 "samsung,exynos-adc-v3"): V2 layout, data at 0x08 */
+#define ADC_V3_DAT(x)		((x) + 0x08)
 
 /* Bit definitions for ADC_V1 */
 #define ADC_V1_CON_RES		(1u << 16)
@@ -92,6 +98,7 @@
 
 /* Bit definitions for ADC_V2 */
 #define ADC_V2_CON1_SOFT_RESET	(1u << 2)
+#define ADC_V2_CON1_SOFT_NON_RESET	(1u << 1)
 
 #define ADC_V2_CON2_OSEL	(1u << 10)
 #define ADC_V2_CON2_ESEL	(1u << 9)
@@ -105,6 +112,7 @@
 #define MAX_EXYNOS3250_ADC_CHANNELS	2
 #define MAX_EXYNOS4212_ADC_CHANNELS	4
 #define MAX_S5PV210_ADC_CHANNELS	10
+#define MAX_EXYNOS9810_ADC_CHANNELS	12
 
 /* Bit definitions common for ADC_V1 and ADC_V2 */
 #define ADC_CON_EN_START	(1u << 0)
@@ -151,6 +159,13 @@ struct exynos_adc {
 	 * current conversion result.
 	 */
 	struct mutex		lock;
+
+	/* Exynos9810: register-write evidence and the DT-gated self-test */
+	unsigned long		reg_writes;
+	unsigned long		conversions;
+	unsigned long		timeouts;
+	u32			selftest_ms;
+	struct delayed_work	selftest;
 };
 
 struct exynos_adc_data {
@@ -159,11 +174,17 @@ struct exynos_adc_data {
 	bool needs_adc_phy;
 	int phy_offset;
 	u32 mask;
+	/*
+	 * Program the block for every conversion (init_hw before, exit_hw
+	 * after) instead of once at probe, as the vendor driver does.
+	 */
+	bool init_per_read;
 
 	void (*init_hw)(struct exynos_adc *info);
 	void (*exit_hw)(struct exynos_adc *info);
 	void (*clear_irq)(struct exynos_adc *info);
 	void (*start_conv)(struct exynos_adc *info, unsigned long addr);
+	u32 (*read_data)(struct exynos_adc *info);
 };
 
 static void exynos_adc_unprepare_clk(struct exynos_adc *info)
@@ -484,6 +505,75 @@ static const struct exynos_adc_data exynos7_adc_data = {
 	.start_conv	= exynos_adc_v2_start_conv,
 };
 
+/*
+ * Exynos9810 (CMGP ADC at 0x14230000). Register sequence of the 4.9 vendor
+ * driver for "samsung,exynos-adc-v3" (exynos_adc_v3_init_hw/exit_hw/isr,
+ * exynos_adc_v2_clear_irq/start_conv): every conversion is
+ *   CON1 = SOFT_RESET; CON1 = SOFT_NON_RESET; CON2 = C_TIME(6); INT_EN = 1;
+ *   CON2 = (CON2 & ~ACH) | ch; CON1 |= EN_START;
+ *   IRQ: read DAT (0x08); INT_ST = 1;
+ *   CON2 &= ~C_TIME(7); INT_EN = 0.
+ * No PMU ADC-PHY write (the crownlte DT has no samsung,adc-phy-control), no
+ * CHUB semaphore (no sysreg property), no clock rate change.
+ */
+static void exynos9810_adc_writel(struct exynos_adc *info, u32 val, void __iomem *reg)
+{
+	info->reg_writes++;
+	writel(val, reg);
+}
+
+static void exynos9810_adc_init_hw(struct exynos_adc *info)
+{
+	exynos9810_adc_writel(info, ADC_V2_CON1_SOFT_RESET, ADC_V2_CON1(info->regs));
+	exynos9810_adc_writel(info, ADC_V2_CON1_SOFT_NON_RESET, ADC_V2_CON1(info->regs));
+	exynos9810_adc_writel(info, ADC_V2_CON2_C_TIME(6), ADC_V2_CON2(info->regs));
+	exynos9810_adc_writel(info, 1, ADC_V2_INT_EN(info->regs));
+}
+
+static void exynos9810_adc_exit_hw(struct exynos_adc *info)
+{
+	u32 con2 = readl(ADC_V2_CON2(info->regs));
+
+	con2 &= ~ADC_V2_CON2_C_TIME(7);
+	exynos9810_adc_writel(info, con2, ADC_V2_CON2(info->regs));
+	exynos9810_adc_writel(info, 0, ADC_V2_INT_EN(info->regs));
+}
+
+static void exynos9810_adc_clear_irq(struct exynos_adc *info)
+{
+	exynos9810_adc_writel(info, 1, ADC_V2_INT_ST(info->regs));
+}
+
+static void exynos9810_adc_start_conv(struct exynos_adc *info, unsigned long addr)
+{
+	u32 con1, con2;
+
+	con2 = readl(ADC_V2_CON2(info->regs));
+	con2 &= ~ADC_V2_CON2_ACH_MASK;
+	con2 |= ADC_V2_CON2_ACH_SEL(addr);
+	exynos9810_adc_writel(info, con2, ADC_V2_CON2(info->regs));
+
+	con1 = readl(ADC_V2_CON1(info->regs));
+	exynos9810_adc_writel(info, con1 | ADC_CON_EN_START, ADC_V2_CON1(info->regs));
+}
+
+static u32 exynos9810_adc_read_data(struct exynos_adc *info)
+{
+	return readl(ADC_V3_DAT(info->regs));
+}
+
+static const struct exynos_adc_data exynos9810_adc_data = {
+	.num_channels	= MAX_EXYNOS9810_ADC_CHANNELS,
+	.mask		= ADC_DATX_MASK, /* 12 bit ADC resolution */
+	.init_per_read	= true,
+
+	.init_hw	= exynos9810_adc_init_hw,
+	.exit_hw	= exynos9810_adc_exit_hw,
+	.clear_irq	= exynos9810_adc_clear_irq,
+	.start_conv	= exynos9810_adc_start_conv,
+	.read_data	= exynos9810_adc_read_data,
+};
+
 static const struct of_device_id exynos_adc_match[] = {
 	{
 		.compatible = "samsung,s3c2410-adc",
@@ -518,6 +608,9 @@ static const struct of_device_id exynos_adc_match[] = {
 	}, {
 		.compatible = "samsung,exynos7-adc",
 		.data = &exynos7_adc_data,
+	}, {
+		.compatible = "samsung,exynos9810-adc",
+		.data = &exynos9810_adc_data,
 	},
 	{ }
 };
@@ -558,6 +651,9 @@ static int exynos_read_raw(struct iio_dev *indio_dev,
 	mutex_lock(&info->lock);
 	reinit_completion(&info->completion);
 
+	if (info->data->init_per_read)
+		info->data->init_hw(info);
+
 	/* Select the channel to be used and Trigger conversion */
 	if (info->data->start_conv)
 		info->data->start_conv(info, chan->address);
@@ -566,14 +662,19 @@ static int exynos_read_raw(struct iio_dev *indio_dev,
 						EXYNOS_ADC_TIMEOUT);
 	if (time_left == 0) {
 		dev_warn(&indio_dev->dev, "Conversion timed out! Resetting\n");
-		if (info->data->init_hw)
+		info->timeouts++;
+		if (info->data->init_hw && !info->data->init_per_read)
 			info->data->init_hw(info);
 		ret = -ETIMEDOUT;
 	} else {
+		info->conversions++;
 		*val = info->value;
 		*val2 = 0;
 		ret = IIO_VAL_INT;
 	}
+
+	if (info->data->init_per_read)
+		info->data->exit_hw(info);
 
 	mutex_unlock(&info->lock);
 
@@ -626,6 +727,8 @@ static irqreturn_t exynos_adc_isr(int irq, void *dev_id)
 		info->ts_x = readl(ADC_V1_DATX(info->regs));
 		info->ts_y = readl(ADC_V1_DATY(info->regs));
 		writel(ADC_TSC_WAIT4INT | ADC_S3C2443_TSC_UD_SEN, ADC_V1_TSC(info->regs));
+	} else if (info->data->read_data) {
+		info->value = info->data->read_data(info) & mask;
 	} else {
 		info->value = readl(ADC_V1_DATX(info->regs)) & mask;
 	}
@@ -719,7 +822,80 @@ static const struct iio_chan_spec exynos_adc_iio_channels[] = {
 	ADC_CHANNEL(7, "adc7"),
 	ADC_CHANNEL(8, "adc8"),
 	ADC_CHANNEL(9, "adc9"),
+	ADC_CHANNEL(10, "adc10"),
+	ADC_CHANNEL(11, "adc11"),
 };
+
+/*
+ * DT-gated self-test (samsung,adc-selftest-ms): convert every channel five
+ * times through the normal read path and log the raw codes. Only the
+ * conversion registers are written (9 writes per conversion on Exynos9810).
+ */
+#define EXYNOS_ADC_SELFTEST_SAMPLES	5
+
+static void exynos_adc_selftest_work(struct work_struct *work)
+{
+	struct exynos_adc *info = container_of(to_delayed_work(work),
+					       struct exynos_adc, selftest);
+	struct iio_dev *indio_dev = dev_get_drvdata(info->dev);
+	unsigned long w0 = info->reg_writes, c0 = info->conversions;
+	unsigned long t0 = info->timeouts;
+	int ch, i, errors = 0, stuck = 0, distinct = 0, first = -1;
+	bool pass;
+
+	dev_info(info->dev,
+		 "adc selftest: regs before: CON1=%08x CON2=%08x DAT=%08x INT_EN=%08x INT_ST=%08x VER=%08x\n",
+		 readl(ADC_V2_CON1(info->regs)), readl(ADC_V2_CON2(info->regs)),
+		 readl(ADC_V3_DAT(info->regs)), readl(ADC_V2_INT_EN(info->regs)),
+		 readl(ADC_V2_INT_ST(info->regs)), readl(ADC_V2_VER(info->regs)));
+
+	for (ch = 0; ch < info->data->num_channels; ch++) {
+		int v[EXYNOS_ADC_SELFTEST_SAMPLES], lo = INT_MAX, hi = INT_MIN;
+		int ret = 0, dummy;
+		ktime_t start = ktime_get();
+		s64 us;
+
+		for (i = 0; i < EXYNOS_ADC_SELFTEST_SAMPLES; i++) {
+			ret = exynos_read_raw(indio_dev, &indio_dev->channels[ch],
+					      &v[i], &dummy, IIO_CHAN_INFO_RAW);
+			if (ret < 0)
+				break;
+			lo = min(lo, v[i]);
+			hi = max(hi, v[i]);
+		}
+		us = ktime_us_delta(ktime_get(), start);
+		if (ret < 0) {
+			errors++;
+			dev_warn(info->dev, "adc selftest: ch%d read %d failed: %d\n",
+				 ch, i, ret);
+			continue;
+		}
+		if (lo == 0 || hi == ADC_DATX_MASK)
+			stuck++;
+		if (first < 0)
+			first = v[0];
+		else if (v[0] != first)
+			distinct++;
+		dev_info(info->dev,
+			 "adc selftest: ch%-2d raw %4d %4d %4d %4d %4d (spread %d) %lldus/5\n",
+			 ch, v[0], v[1], v[2], v[3], v[4], hi - lo, us);
+	}
+
+	pass = !errors && info->timeouts == t0 && distinct > 0 &&
+	       (!info->data->init_per_read ||
+		info->reg_writes - w0 == 9 * (info->conversions - c0));
+	dev_info(info->dev,
+		 "adc selftest: regs after: CON1=%08x CON2=%08x INT_EN=%08x INT_ST=%08x\n",
+		 readl(ADC_V2_CON1(info->regs)), readl(ADC_V2_CON2(info->regs)),
+		 readl(ADC_V2_INT_EN(info->regs)), readl(ADC_V2_INT_ST(info->regs)));
+	dev_info(info->dev,
+		 "adc selftest: conversions=%lu (total %lu) timeouts=%lu errors=%d rail-codes=%d mux-varies=%d reg_writes=%lu (%lu per conversion, total %lu) -> %s\n",
+		 info->conversions - c0, info->conversions, info->timeouts - t0,
+		 errors, stuck, distinct > 0, info->reg_writes - w0,
+		 info->conversions - c0 ?
+			(info->reg_writes - w0) / (info->conversions - c0) : 0,
+		 info->reg_writes, pass ? "PASS" : "FAIL");
+}
 
 
 
@@ -900,7 +1076,7 @@ static int exynos_adc_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_irq;
 
-	if (info->data->init_hw)
+	if (info->data->init_hw && !info->data->init_per_read)
 		info->data->init_hw(info);
 
 	if (pdata)
@@ -917,6 +1093,25 @@ static int exynos_adc_probe(struct platform_device *pdev)
 	if (ret < 0) {
 		dev_err(&pdev->dev, "failed adding child nodes\n");
 		goto err_of_populate;
+	}
+
+	if (info->data->init_per_read)
+		dev_info(&pdev->dev,
+			 "%d channels, programmed per conversion; idle regs CON1=%08x CON2=%08x INT_EN=%08x INT_ST=%08x\n",
+			 info->data->num_channels, readl(ADC_V2_CON1(info->regs)),
+			 readl(ADC_V2_CON2(info->regs)),
+			 readl(ADC_V2_INT_EN(info->regs)),
+			 readl(ADC_V2_INT_ST(info->regs)));
+
+	INIT_DELAYED_WORK(&info->selftest, exynos_adc_selftest_work);
+	if (!of_property_read_u32(np, "samsung,adc-selftest-ms", &info->selftest_ms)) {
+		u64 now = ktime_to_ms(ktime_get_boottime());
+
+		dev_info(&pdev->dev, "adc selftest armed for %u ms after boot\n",
+			 info->selftest_ms);
+		queue_delayed_work(system_power_efficient_wq, &info->selftest,
+				   msecs_to_jiffies(now < info->selftest_ms ?
+						    info->selftest_ms - now : 0));
 	}
 
 	return 0;
@@ -947,6 +1142,7 @@ static void exynos_adc_remove(struct platform_device *pdev)
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct exynos_adc *info = iio_priv(indio_dev);
 
+	cancel_delayed_work_sync(&info->selftest);
 	if (IS_REACHABLE(CONFIG_INPUT) && info->input) {
 		free_irq(info->tsirq, info);
 		input_unregister_device(info->input);
@@ -966,7 +1162,7 @@ static int exynos_adc_suspend(struct device *dev)
 	struct iio_dev *indio_dev = dev_get_drvdata(dev);
 	struct exynos_adc *info = iio_priv(indio_dev);
 
-	if (info->data->exit_hw)
+	if (info->data->exit_hw && !info->data->init_per_read)
 		info->data->exit_hw(info);
 	exynos_adc_disable_clk(info);
 	regulator_disable(info->vdd);
@@ -988,7 +1184,7 @@ static int exynos_adc_resume(struct device *dev)
 	if (ret)
 		return ret;
 
-	if (info->data->init_hw)
+	if (info->data->init_hw && !info->data->init_per_read)
 		info->data->init_hw(info);
 
 	return 0;

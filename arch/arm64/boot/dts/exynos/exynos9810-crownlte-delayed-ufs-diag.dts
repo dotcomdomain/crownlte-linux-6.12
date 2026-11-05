@@ -336,3 +336,34 @@
 	samsung,selftest-khz = <455000 338000>;
 	status = "okay";
 };
+
+/*
+ * MAX77705 read-only battery monitor: "battery", "ac", "usb" and "wireless"
+ * power supplies plus the tripless "battery" thermal zone, from I2C reads
+ * only. The self-test at ~107 s ("battery selftest:") logs SOC, voltage,
+ * current, temperature, charger state and online source, and checks that the
+ * FG and charger configuration registers are unchanged since probe.
+ */
+&max77705_battery {
+	samsung,selftest-ms = <107000>;
+	samsung,adc-selftest-ms = <104500>;
+	status = "okay";
+};
+
+/*
+ * CMGP SoC ADC for the battery (ch4), charger (ch3, thermal zone "ac") and
+ * USB-connector (ch1) thermistors, 4.9 tables, read-only use: only the ADC
+ * conversion registers are written (9 per conversion, 4.9 v3 sequence).
+ * Clock: GATE_ADC_CMGP = 4.9 "gate_adcif", a CMU_CMGP HWACG Q-channel vclk
+ * with no parent and CLK_IGNORE_UNUSED; its enable/disable ops return before
+ * calling CAL (VCLK_GATE without VCLK_QCH_DIS), so no CMU register is
+ * written and no PERIS/PERIC bus mux can move. Self-tests ("adc selftest:"):
+ * raw codes of all 12 channels at 104 s, thermistor temperatures and FG TEMP
+ * comparison at 104.5 s.
+ */
+&adc {
+	clocks = <&legacy_cmu GATE_ADC_CMGP>;
+	clock-names = "adc";
+	samsung,adc-selftest-ms = <104000>;
+	status = "okay";
+};
