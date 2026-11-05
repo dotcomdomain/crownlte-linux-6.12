@@ -150,7 +150,7 @@ static const char * const e9810_stage_name[] = {
 };
 
 /* Self-test timing. The diag PID1 restarts the phone at about 120 s. */
-/* After the MCT report (86-90 s); eleven phases end at about 100 s. */
+/* After the MCT report (86-90 s); the BIG ramp and soak end at about 106 s. */
 #define E9810_SELFTEST_MS		90000
 #define E9810_PHASE_MS			800
 #define E9810_POLL_MS			20
@@ -234,6 +234,16 @@ static u32 e9810_psci_cpu_on_fn;
 static int e9810_little_limit = E9810_LITTLE_LIMIT_DEFAULT;
 /* The configured value (default or DT), restored after each test phase. */
 static int e9810_little_limit_cfg = E9810_LITTLE_LIMIT_DEFAULT;
+
+/*
+ * LITTLE (cluster 0) C2 is off unless DT samsung,c2-little-enable. With
+ * three LITTLE cores armed, one core was lost in q22b, q40 and q43 (q43 even
+ * with at most two in C2): powered off, its GRP1 wakeup never latched, and
+ * once powered on again it kept running inside EL3 and never returned from
+ * CPU_SUSPEND. The EL3 monitor is encrypted in the boot LUN, so the cause
+ * is not known. BIG C2 never failed. See cpuidle-secondaries-q22b.md.
+ */
+static bool e9810_little_c2;
 static atomic_t e9810_little_in_c2 = ATOMIC_INIT(0);
 
 /* Called with interrupts off from the idle path: no plain printk here. */
@@ -587,6 +597,8 @@ static const char *e9810_arm_refused(unsigned int cpu)
 		return e9810_setup_why;
 	if (!e9810_clusters[e9810_cluster_of[cpu]].registered)
 		return "cluster not registered";
+	if (e9810_cluster_of[cpu] == 0 && !e9810_little_c2)
+		return "LITTLE C2 disabled (cores lost in EL3 in q22b/q40/q43; DT samsung,c2-little-enable)";
 	if (!cpu_online(cpu))
 		return "cpu offline";
 	if (atomic_read(&e9810_deep_off))
@@ -822,21 +834,24 @@ struct e9810_phase {
 	struct cpumask cpus;
 	int little_limit;	/* cluster-0 C2 limit for this phase, 0 = none */
 	bool busy0;		/* CPU0 busy-polls: never in WFI during the phase */
-	bool bisect;		/* expected to fail on q40 firmware; runs last */
+	bool bisect;		/* may lose a CPU; runs last */
+	unsigned int ms;	/* armed time */
 };
 
 /*
- * Timeline of the LITTLE cores (phy 1-3) and the INTR_GEN group bits,
- * sampled by a kthread on a CPU outside the phase (cpu7), one entry per
- * change. Printed when a phase fails.
+ * Timeline of one cluster (all four cores) and the INTR_GEN group bits,
+ * sampled by a kthread on a CPU outside the phase, one entry per change.
+ * The ring is frozen when a phase fails, so the moments before the failure
+ * survive. Printed when a phase fails.
  */
-#define E9810_TL_ENTRIES		256
+#define E9810_TL_ENTRIES		1024
+#define E9810_TL_DUMP_MAX		700
 #define E9810_TL_MARKS			64
-#define E9810_TL_CPU			7
+#define E9810_TL_FIRST			128
 
 struct e9810_tl_state {
-	u32 status[3];
-	u8 config[3], inform[3], stage[3];
+	u32 status[4];
+	u8 config[4], inform[4], stage[4];
 	u8 grp1_en, grp1_pend, grp2_en, grp2_pend;
 };
 
@@ -851,17 +866,16 @@ struct e9810_tl_mark {
 	int arg;
 };
 
-#define E9810_TL_FIRST			128
-
 struct e9810_tl {
 	/* The first changes after arming are kept apart from the ring. */
 	struct e9810_tl_entry first[E9810_TL_FIRST];
 	struct e9810_tl_entry e[E9810_TL_ENTRIES];
-	struct e9810_tl_mark m[E9810_TL_MARKS];
+	struct e9810_tl_mark m[E9810_TL_MARKS];	/* ring */
 	unsigned int n, nm;
+	unsigned int cluster, cpu;
 	u64 samples, t0;
 	struct task_struct *task;
-	bool stop, exited;
+	bool stop, exited, frozen;
 };
 
 static struct e9810_tl *e9810_tl;
@@ -869,29 +883,33 @@ static struct e9810_tl *e9810_tl;
 static void e9810_tl_mark(const char *what, int arg)
 {
 	struct e9810_tl *tl = e9810_tl;
+	struct e9810_tl_mark *m;
 
-	if (!tl || !tl->task || tl->nm >= E9810_TL_MARKS)
+	if (!tl || !tl->task || READ_ONCE(tl->frozen))
 		return;
-	tl->m[tl->nm].t = ktime_get_ns();
-	tl->m[tl->nm].what = what;
-	tl->m[tl->nm].arg = arg;
+	m = &tl->m[tl->nm % E9810_TL_MARKS];
+	m->t = ktime_get_ns();
+	m->what = what;
+	m->arg = arg;
 	tl->nm++;
 }
 
-static void e9810_tl_sample(struct e9810_tl_state *s)
+static void e9810_tl_sample(const struct e9810_tl *tl,
+			    struct e9810_tl_state *s)
 {
-	unsigned int phy, v;
+	unsigned int i, phy, v;
 
 	memset(s, 0, sizeof(*s));
-	for (phy = 1; phy <= 3; phy++) {
-		regmap_read(e9810_pmu, pmu_cpu_status[phy], &s->status[phy - 1]);
+	for (i = 0; i < 4; i++) {
+		phy = tl->cluster * 4 + i;
+		regmap_read(e9810_pmu, pmu_cpu_status[phy], &s->status[i]);
 		regmap_read(e9810_pmu, PMU_CPU_CONFIG(phy), &v);
-		s->config[phy - 1] = v;
+		s->config[i] = v;
 		regmap_read(e9810_pmu, PMU_CPU_INFORM(phy), &v);
-		s->inform[phy - 1] = v | ((v >> 16) ? 0x80 : 0);
+		s->inform[i] = v | ((v >> 16) ? 0x80 : 0);
 		/* stage of the logical CPU on this core */
-		s->stage[phy - 1] = READ_ONCE(per_cpu(e9810_stage,
-						       e9810_cpu_of_phy[phy]));
+		s->stage[i] = READ_ONCE(per_cpu(e9810_stage,
+						e9810_cpu_of_phy[phy]));
 	}
 	s->grp1_en = readl(e9810_intr_gen + INTR_GEN_GRP1_ENABLE);
 	s->grp1_pend = readl(e9810_intr_gen + INTR_GEN_GRP1_PEND);
@@ -908,7 +926,11 @@ static int e9810_tl_fn(void *data)
 	while (!READ_ONCE(tl->stop) && !kthread_should_stop()) {
 		u64 t = ktime_get_ns();
 
-		e9810_tl_sample(&cur);
+		if (READ_ONCE(tl->frozen)) {
+			usleep_range(1000, 2000);
+			continue;
+		}
+		e9810_tl_sample(tl, &cur);
 		tl->samples++;
 		if (first || memcmp(&cur, &prev, sizeof(cur))) {
 			struct e9810_tl_entry *e = &tl->e[tl->n % E9810_TL_ENTRIES];
@@ -927,26 +949,37 @@ static int e9810_tl_fn(void *data)
 	return 0;
 }
 
-static void e9810_tl_start(void)
+/* Sample @cluster from @cpu, which must not be part of the phase. */
+static void e9810_tl_start(unsigned int cluster, unsigned int cpu)
 {
 	struct e9810_tl *tl = e9810_tl;
 
-	if (!tl || !cpu_online(E9810_TL_CPU))
+	if (!tl || cpu >= nr_cpu_ids || !cpu_online(cpu))
 		return;
 	tl->n = 0;
 	tl->nm = 0;
 	tl->samples = 0;
 	tl->stop = false;
 	tl->exited = false;
+	tl->frozen = false;
+	tl->cluster = cluster;
+	tl->cpu = cpu;
 	tl->t0 = ktime_get_ns();
-	tl->task = kthread_create(e9810_tl_fn, tl, "c2tl/%u", E9810_TL_CPU);
+	tl->task = kthread_create(e9810_tl_fn, tl, "c2tl/%u", cpu);
 	if (IS_ERR(tl->task)) {
 		tl->task = NULL;
 		return;
 	}
-	kthread_bind(tl->task, E9810_TL_CPU);
+	kthread_bind(tl->task, cpu);
 	get_task_struct(tl->task);
 	wake_up_process(tl->task);
+}
+
+/* Keep the ring as it is at the failure; marks stop too. */
+static void e9810_tl_freeze(void)
+{
+	if (e9810_tl && e9810_tl->task)
+		WRITE_ONCE(e9810_tl->frozen, true);
 }
 
 static void e9810_tl_stop(void)
@@ -968,42 +1001,50 @@ static void e9810_tl_stop(void)
 }
 
 static void e9810_tl_print(const char *tag, unsigned int idx,
-			   const struct e9810_tl_entry *e, u64 t0)
+			   const struct e9810_tl_entry *e, u64 t0,
+			   unsigned int c0)
 {
 	const struct e9810_tl_state *s = &e->s;
 
-	pr_info("cpuidle selftest: %s#%u +%lluus c1=%x/%x/%x/%u c2=%x/%x/%x/%u c3=%x/%x/%x/%u g1e=%02x g1p=%02x g2e=%02x g2p=%02x\n",
+	pr_info("cpuidle selftest: %s#%u +%lluus c%u=%x/%x/%x/%u c%u=%x/%x/%x/%u c%u=%x/%x/%x/%u c%u=%x/%x/%x/%u g1e=%02x g1p=%02x g2e=%02x g2p=%02x\n",
 		tag, idx, div_u64(e->t - t0, NSEC_PER_USEC),
-		s->status[0], s->config[0], s->inform[0], s->stage[0],
-		s->status[1], s->config[1], s->inform[1], s->stage[1],
-		s->status[2], s->config[2], s->inform[2], s->stage[2],
+		c0, s->status[0], s->config[0], s->inform[0], s->stage[0],
+		c0 + 1, s->status[1], s->config[1], s->inform[1], s->stage[1],
+		c0 + 2, s->status[2], s->config[2], s->inform[2], s->stage[2],
+		c0 + 3, s->status[3], s->config[3], s->inform[3], s->stage[3],
 		s->grp1_en, s->grp1_pend, s->grp2_en, s->grp2_pend);
 }
 
 /*
  * Times are microseconds after arming. "tl-first" = the first changes after
- * arming, "tl" = the last changes before the sampler stopped (after the
- * recovery attempts). Entry numbers are global, so overlaps are visible.
+ * arming, "tl" = the last changes before the ring was frozen at the
+ * failure (at most E9810_TL_DUMP_MAX). Entry numbers are global, so gaps
+ * and overlaps are visible. cN = logical CPU N (cluster 0: cpu0-3, cluster
+ * 1: cpu4-7, logical == physical on crownlte).
  */
 static void e9810_tl_dump(const char *phase)
 {
 	struct e9810_tl *tl = e9810_tl;
-	unsigned int n, i, first;
+	unsigned int n, i, first, c0, nm;
 
 	if (!tl)
 		return;
 	n = smp_load_acquire(&tl->n);
-	first = n > E9810_TL_ENTRIES ? n - E9810_TL_ENTRIES : 0;
-	pr_info("cpuidle selftest: timeline %s: samples=%llu changes=%u marks=%u (cN=status/config/inform[0x80=bit16]/stage 0 kernel 1 cal_off 2 firmware 3 cal_on 4 pm_exit; INTR_GEN bytes, LITTLE cpuN = bit 4+N)\n",
-		phase, tl->samples, n, tl->nm);
-	for (i = 0; i < tl->nm; i++)
-		pr_info("cpuidle selftest: tl-mark +%lluus %s %d\n",
-			div_u64(tl->m[i].t - tl->t0, NSEC_PER_USEC),
-			tl->m[i].what, tl->m[i].arg);
+	c0 = e9810_cpu_of_phy[tl->cluster * 4];
+	first = n > E9810_TL_DUMP_MAX ? n - E9810_TL_DUMP_MAX : 0;
+	pr_info("cpuidle selftest: timeline %s: cluster%u sampled on cpu%u samples=%llu changes=%u marks=%u frozen=%d (cN=status/config/inform[0x80=bit16]/stage 0 kernel 1 cal_off 2 firmware 3 cal_on 4 pm_exit; INTR_GEN bytes: LITTLE phyN = bit 4+N, BIG phyN = bit N-4)\n",
+		phase, tl->cluster, tl->cpu, tl->samples, n, tl->nm, tl->frozen);
+	nm = tl->nm;
+	for (i = nm > E9810_TL_MARKS ? nm - E9810_TL_MARKS : 0; i < nm; i++) {
+		const struct e9810_tl_mark *m = &tl->m[i % E9810_TL_MARKS];
+
+		pr_info("cpuidle selftest: tl-mark#%u +%lluus %s %d\n", i,
+			div_u64(m->t - tl->t0, NSEC_PER_USEC), m->what, m->arg);
+	}
 	for (i = 0; i < min_t(unsigned int, n, E9810_TL_FIRST); i++)
-		e9810_tl_print("tl-first", i, &tl->first[i], tl->t0);
+		e9810_tl_print("tl-first", i, &tl->first[i], tl->t0, c0);
 	for (i = max(first, (unsigned int)E9810_TL_FIRST); i < n; i++)
-		e9810_tl_print("tl", i, &tl->e[i % E9810_TL_ENTRIES], tl->t0);
+		e9810_tl_print("tl", i, &tl->e[i % E9810_TL_ENTRIES], tl->t0, c0);
 }
 
 static void e9810_read_regs(unsigned int cpu, struct e9810_regs *r)
@@ -1433,8 +1474,14 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 	exynos9810_mct_bc_get_stats(&bc0);
 
 	WRITE_ONCE(e9810_little_limit, ph->little_limit);
-	if (!cpumask_test_cpu(E9810_TL_CPU, &ph->cpus))
-		e9810_tl_start();
+	{
+		/* Sample the phase's cluster from the other cluster. */
+		unsigned int cl = e9810_cluster_of[cpumask_first(&ph->cpus)];
+		unsigned int on = cl ? 1 : 7;
+
+		if (!cpumask_test_cpu(on, &ph->cpus))
+			e9810_tl_start(cl, on);
+	}
 	e9810_tl_mark("arm", ph->little_limit);
 	why = e9810_arm(&ph->cpus);
 	if (why) {
@@ -1444,13 +1491,14 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		WRITE_ONCE(e9810_little_limit, e9810_little_limit_cfg);
 		goto stop_sleepers;
 	}
-	pr_info("cpuidle selftest: phase %s: armed %*pbl for %d ms little_limit=%d cpu0=%s timeline=%s%s\n",
-		ph->name, cpumask_pr_args(&ph->cpus), E9810_PHASE_MS,
+	pr_info("cpuidle selftest: phase %s: armed %*pbl for %u ms little_limit=%d cpu0=%s timeline=%s%d%s\n",
+		ph->name, cpumask_pr_args(&ph->cpus), ph->ms,
 		ph->little_limit, ph->busy0 ? "busy" : "idle",
-		e9810_tl && e9810_tl->task ? "cpu7" : "off",
+		e9810_tl && e9810_tl->task ? "cpu" : "off",
+		e9810_tl && e9810_tl->task ? (int)e9810_tl->cpu : -1,
 		ph->bisect ? " (bisect phase)" : "");
 
-	t_end = ktime_get_ns() + (u64)E9810_PHASE_MS * NSEC_PER_MSEC;
+	t_end = ktime_get_ns() + (u64)ph->ms * NSEC_PER_MSEC;
 	while (!why && ktime_get_ns() < t_end) {
 		u64 deadline;
 
@@ -1558,6 +1606,8 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 			e9810_log_regs("FAIL-state", cpu, &r);
 		}
 		e9810_tl_mark("fail", *failed_cpu);
+		/* Keep the moments before the failure in the ring. */
+		e9810_tl_freeze();
 		pr_err("cpuidle selftest: phase %s: FAIL cpu%u: %s; unanswered=%*pbl pmucal_cpu_lock=%s little_in_c2=%d\n",
 		       ph->name, *failed_cpu, why, cpumask_pr_args(&unanswered),
 		       cal_cpu_lock_is_held() ? "HELD" : "free",
@@ -1684,9 +1734,10 @@ stop_sleepers:
 
 static void e9810_add_phase(struct e9810_phase *ph, const char *name,
 			    u32 cpus, int little_limit, bool busy0,
-			    bool bisect)
+			    bool bisect, unsigned int ms)
 {
 	ph->name = name;
+	ph->ms = ms ? ms : E9810_PHASE_MS;
 	cpumask_clear(&ph->cpus);
 	bitmap_from_arr32(cpumask_bits(&ph->cpus), &cpus, 32);
 	ph->little_limit = little_limit;
@@ -1762,26 +1813,33 @@ static void e9810_selftest(struct work_struct *work)
 	}
 
 	/*
-	 * q40: little-1, big-1, little-2 passed; little-3 lost cpu3 on its
-	 * first C2 entry. Order: the phases expected to pass with the
-	 * cluster-0 limit (the q43 fix) first, then bisect phases that may
-	 * lose a CPU, the q40 reproducer last. CPU0 owns every SPI and the MCT
-	 * broadcast interrupt; it is never armed here.
+	 * q44: BIG-only C2. LITTLE C2 lost a core in q22b, q40 and q43 and is
+	 * refused at arm time unless DT enables it; that refusal is checked
+	 * first. Then a ramp over the BIG cluster and a 10 s soak with all four
+	 * BIG cores. Overlaps the cpufreq (100 s) and devfreq/TMU (105 s)
+	 * self-tests on purpose: BIG frequency changes while BIG cores power
+	 * down are part of normal operation. CPU0 is never armed.
 	 */
+	{
+		struct cpumask m;
+		const char *w;
+
+		cpumask_clear(&m);
+		cpumask_set_cpu(1, &m);
+		w = e9810_arm(&m);
+		if (w) {
+			pr_info("cpuidle selftest: LITTLE arm check: refused (%s)\n", w);
+		} else {
+			pr_err("cpuidle selftest: LITTLE arm check: cpu1 was ARMED; disarming\n");
+			e9810_disarm_all();
+		}
+	}
 	nphases = 0;
-	e9810_add_phase(&phases[nphases++], "little-1", 0x02, lim, false, false);
-	e9810_add_phase(&phases[nphases++], "big-1", 0x10, lim, false, false);
-	e9810_add_phase(&phases[nphases++], "little-2", 0x06, lim, false, false);
-	e9810_add_phase(&phases[nphases++], "little-3-lim", 0x0e, lim, false, false);
-	e9810_add_phase(&phases[nphases++], "big-4", 0xf0, lim, false, false);
-	e9810_add_phase(&phases[nphases++], "secondaries-lim", 0xfe, lim, false, false);
-	/* Bisect: is it cpu3, any pair with cpu3, or three at once? */
-	e9810_add_phase(&phases[nphases++], "cpu3-solo", 0x08, 0, false, true);
-	e9810_add_phase(&phases[nphases++], "little-13", 0x0a, 0, false, true);
-	e9810_add_phase(&phases[nphases++], "little-23", 0x0c, 0, false, true);
-	/* Three at once with CPU0 kept out of WFI, then the q40 reproducer. */
-	e9810_add_phase(&phases[nphases++], "little-3-busy0", 0x0e, 0, true, true);
-	e9810_add_phase(&phases[nphases++], "little-3-raw", 0x0e, 0, false, true);
+	e9810_add_phase(&phases[nphases++], "big-1", 0x10, lim, false, false, 1000);
+	e9810_add_phase(&phases[nphases++], "big-2", 0x30, lim, false, false, 1000);
+	e9810_add_phase(&phases[nphases++], "big-3", 0x70, lim, false, false, 1000);
+	e9810_add_phase(&phases[nphases++], "big-4", 0xf0, lim, false, false, 2000);
+	e9810_add_phase(&phases[nphases++], "big-4-soak", 0xf0, lim, false, false, 10000);
 
 	for (i = 0; i < nphases; i++) {
 		bool entered_all;
@@ -1881,7 +1939,10 @@ static int e9810_cpuidle_probe(struct platform_device *pdev)
 		e9810_little_limit_cfg = lim;
 		WRITE_ONCE(e9810_little_limit, lim);
 	}
-	pr_info("cluster-0 C2 limit %d%s\n", e9810_little_limit_cfg,
+	e9810_little_c2 = of_property_read_bool(np, "samsung,c2-little-enable");
+	pr_info("LITTLE C2 %s, cluster-0 C2 limit %d%s\n",
+		e9810_little_c2 ? "enabled" : "disabled (WFI only)",
+		e9810_little_limit_cfg,
 		e9810_little_limit_cfg ? "" : " (none)");
 	e9810_setup_why = e9810_setup(pdev);
 	if (e9810_setup_why)
