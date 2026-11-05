@@ -767,7 +767,7 @@ static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
 static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
-	int i;
+	int i, ret;
 
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		if (!c->acq[i])
@@ -779,10 +779,26 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		c->acq[i] = NULL;
 	}
 
-	dpu_bisect(d, c);
-	c->result = dpu_bounce(d, c);
-	if (!c->result)
-		c->result = dpu_apply(d, c);
+	/*
+	 * A bounce copy may only go into a slot nobody scans. After a latch
+	 * timeout (-ETIMEDOUT below) bounce_next already points at the slot of
+	 * the frame before the pending one, which DECON may still read. So
+	 * resolve a pending shadow update before copying or (re)allocating
+	 * any slot, and drop this frame while one is still pending (nothing
+	 * copied, nothing programmed).
+	 */
+	mutex_lock(&d->hw_lock);
+	ret = dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US);
+	mutex_unlock(&d->hw_lock);
+	if (ret) {
+		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");
+		c->result = -EBUSY;
+	} else {
+		dpu_bisect(d, c);
+		c->result = dpu_bounce(d, c);
+		if (!c->result)
+			c->result = dpu_apply(d, c);
+	}
 	d->nr_commits++;
 	if (!c->result && !c->internal)
 		dpu_diag(d, c);		/* before bounce_next moves on */
