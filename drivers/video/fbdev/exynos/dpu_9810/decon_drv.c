@@ -236,6 +236,7 @@ static int dpu_bounce_copy_vmap(struct dpu_buf *b, void *dst)
  * target takes 2 x 17.3 MB, bars a few hundred KiB each; a window whose slot
  * cannot be allocated fails the frame with a log line.
  */
+enum { DPU_BIS_A, DPU_BIS_B, DPU_BIS_C, DPU_BIS_N };	/* hwc-bisect variants */
 static void dpu_bisect_pattern(const struct decon_win_config *w, void *dst);
 
 static bool dpu_commit_uses_slot(const struct dpu_commit *c, int w, int s)
@@ -311,6 +312,14 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 			}
 			dev_info(d->dev, "win%d bounce buffer %d: %zu bytes at %pad\n",
 				 i, d->bounce_next[i], t->size, &t->dma);
+		}
+		if ((c->pattern_win & BIT(i)) &&
+		    (c->dpp_fmt[i] != DECON_PIXEL_FORMAT_XBGR_8888 ||
+		     (u64)c->cfg[i].src.f_w * c->cfg[i].src.f_h * 4 > t->size)) {
+			/* never draw past the slot: copy HWC's buffer instead */
+			c->pattern_win &= ~BIT(i);
+			c->bisect_altered = false;
+			c->bisect_var = DPU_BIS_A;
 		}
 		if (c->pattern_win & BIT(i)) {
 			/* hwc-bisect variant B: linear pattern instead of the AFBC data */
@@ -593,7 +602,6 @@ static unsigned int hwc_bisect_ms = 20000;
 module_param(hwc_bisect_ms, uint, 0644);
 MODULE_PARM_DESC(hwc_bisect_ms, "cycle the HWC client target through AFBC/VGF0, test pattern, AFBC/VGF1 for this long (0 = off)");
 
-enum { DPU_BIS_A, DPU_BIS_B, DPU_BIS_C, DPU_BIS_N };
 static const char * const dpu_bisect_name[DPU_BIS_N] = {
 	"A (HWC AFBC on VGF0, as sent)",
 	"B (kernel linear test pattern on VGF0: white/red/green/blue)",
@@ -638,6 +646,9 @@ static void dpu_bisect(struct dpu_dev *d, struct dpu_commit *c)
 	v = (ms / 2000) % DPU_BIS_N;
 	if (v == DPU_BIS_C && test_bit(DECON_IDMA_VGF1, &used))
 		v = DPU_BIS_A;		/* VGF1 busy with another layer */
+	/* the pattern is drawn as linear XBGR8888, 4 bytes per pixel */
+	if (v == DPU_BIS_B && c->dpp_fmt[tw] != DECON_PIXEL_FORMAT_XBGR_8888)
+		v = DPU_BIS_A;
 	if (v != DPU_BIS_A) {
 		/* what dpu_bisect_restore() puts back */
 		c->bisect_win = tw;
