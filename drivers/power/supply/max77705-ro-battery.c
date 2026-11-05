@@ -132,6 +132,11 @@ static int mx_chg_wdt_kick_write(struct i2c_adapter *adap, u8 cnfg06)
 #define  DTLS00_WCIN(x)		(((x) >> 3) & 0x3)
 #define  DTLS00_CHGIN(x)	(((x) >> 5) & 0x3)
 #define  DTLS00_AUTOIBUS	BIT(7)
+/* CHGIN_DTLS / WCIN_DTLS (4.9 max77705_get_vbus_state()) */
+#define  IN_DTLS_UVLO		0x0	/* below UVLO: no input */
+#define  IN_DTLS_UV		0x1	/* above UVLO, below MBAT + headroom */
+#define  IN_DTLS_OV		0x2	/* above OVLO */
+#define  IN_DTLS_VALID		0x3
 #define CHG_REG_DTLS_01		0xb4
 #define  DTLS01_CHG(x)		((x) & 0xf)
 #define  DTLS01_BAT(x)		(((x) >> 4) & 0x7)
@@ -236,17 +241,24 @@ static const struct {
  *    less than 20 s ago, checked again right before the kick write;
  *  - battery present per FG (STATUS.BST = 0) and charger (4.9
  *    max77705_check_battery(): INT_OK.BATP_OK or !DTLS_00.BATP_DTLS);
- *    health GOOD (so no input under/overvoltage, 4.9
- *    sec_bat_ovp_uvlo_result() stops charging on both); a known charger
- *    state (CHG_DTLS) that agrees with the input (no charging state
- *    without CHGIN/WCIN);
- *  - battery NTC (ch4) in its table range and 0.0 <= T < 41.0 C (resume
- *    below 39.0 C / from 2.0 C). 41 C is 4.9's swelling threshold, above
- *    which 4.9 drops CV to 4.15 V; a kick cannot, so it stops instead;
+ *    health GOOD; a known charger state (CHG_DTLS) that agrees with the
+ *    input (no charging state without CHGIN/WCIN);
+ *  - a valid input from the raw DETAILS_00 fields, independent of the
+ *    cable classification (4.9 max77705_get_vbus_state() and
+ *    max77705_get_charging_health()): CHGIN_DTLS and WCIN_DTLS both not
+ *    01 (undervoltage) or 10 (overvoltage), and CHGIN_OK with CHGIN_DTLS
+ *    11 or WCIN_OK with WCIN_DTLS 11. 4.9 sec_bat_ovp_uvlo_result() stops
+ *    charging on input UV/OV;
+ *  - battery NTC (ch4) in its table range and 10.0 <= T < 41.0 C (resume
+ *    below 39.0 C; cold side: stop below 10.0 C, resume at 10.0 C). 4.9
+ *    swelling drops CV to 4.15 V above 41 C and, below 10 C after its
+ *    5 C block, only allows a restricted 4.15 V recharge; a kick cannot
+ *    lower CV, so it stops instead;
  *  - charger NTC (ch3) in its table range and T < 44.0 C (resume < 42.0 C);
  *  - 3000 mV <= VCELL, AvgVCELL <= 4400 mV (CV 4350 mV + 50 mV);
  *  - CNFG_00 has WDTEN and CNFG_00/02/04 equal their probe values, with
- *    CV <= 4350 mV and CC <= 1500 mA;
+ *    CV <= 4350 mV and CC <= 1500 mA (<= 950 mA below 20.0 C, 4.9's 1st
+ *    cold-swelling tier with its recovery);
  *  - CNFG_06 bits 7:2 equal their probe value, before and after the kick,
  *    and CHGPROT (bits 3:2) reads 11 = unlocked, as 4.9 init leaves it
  *    (max77705_charger.c:1008-1012). Locked: no kick, no unlock write.
@@ -255,8 +267,8 @@ static const struct {
  */
 #define KICK_PERIOD_MS		10000	/* 4.9 battery,polling_time while charging */
 #define KICK_MAX_AGE_MS		20000
-#define KICK_BATT_MIN_DC	0
-#define KICK_BATT_COLD_RESUME_DC 20
+#define KICK_BATT_MIN_DC	100	/* 4.9 swelling_low_temp_recov_2nd */
+#define KICK_BATT_COLD_RESUME_DC 100	/* no restricted-recharge band */
 #define KICK_BATT_MAX_DC	410	/* 4.9 swelling_high_temp_block */
 #define KICK_BATT_HOT_RESUME_DC	390	/* 4.9 swelling_high_temp_recov */
 #define KICK_CHG_MAX_DC		440
@@ -265,6 +277,8 @@ static const struct {
 #define KICK_VCELL_MAX_MV	4400
 #define KICK_CV_MAX_MV		4350
 #define KICK_CC_MAX_MA		1500
+#define KICK_COOL_DC		200	/* 4.9 swelling_low_temp_recov_1st */
+#define KICK_COOL_CC_MAX_MA	950	/* 4.9 swelling_low_temp_current */
 #define KICK_LOG_MAX		16	/* stop/start messages per boot */
 #define KICK_CHGPROT_MASK	0x0c	/* CNFG_06 bits 3:2, 11 = unlocked */
 
@@ -300,6 +314,7 @@ struct mx_snap {
 	u16 fg_status, config;
 	u8 int_ok, dtls0, dtls1, dtls2, cnfg00, cnfg02, cnfg04, cnfg09, cnfg10;
 	u64 t_ms;		/* boottime before the sample's first read */
+	const char *in_fault;	/* raw input check, NULL = valid input */
 	int bc;			/* USBC BC_STATUS or -errno */
 	/* converted, 4.9 units */
 	int vcell_mv, avgvcell_mv, vfocv_mv, vbyp_mv;
@@ -919,6 +934,20 @@ static int mx_sample(struct mx_ro *m, struct mx_snap *s)
 		s->cable = CABLE_NONE;
 		s->input_ma = 0;
 	}
+	/*
+	 * Raw input state, independent of the cable classification above
+	 * (that one only looks at INT_OK and would call a UV/OV input "none").
+	 */
+	if (DTLS00_CHGIN(s->dtls0) == IN_DTLS_OV || DTLS00_WCIN(s->dtls0) == IN_DTLS_OV)
+		s->in_fault = "input overvoltage (CHGIN/WCIN_DTLS 10)";
+	else if (DTLS00_CHGIN(s->dtls0) == IN_DTLS_UV || DTLS00_WCIN(s->dtls0) == IN_DTLS_UV)
+		s->in_fault = "input undervoltage (CHGIN/WCIN_DTLS 01)";
+	else if (!((s->int_ok & INT_OK_CHGIN) && DTLS00_CHGIN(s->dtls0) == IN_DTLS_VALID) &&
+		 !((s->int_ok & INT_OK_WCIN) && DTLS00_WCIN(s->dtls0) == IN_DTLS_VALID))
+		s->in_fault = "no valid input (CHGIN/WCIN_OK with DTLS 11)";
+	else
+		s->in_fault = NULL;
+
 	s->vmax_uv = s->cable == CABLE_NONE ? 0 :
 		     (s->vbyp_mv > 7500 ? 9000000 : 5000000);
 
@@ -1060,6 +1089,8 @@ static const char *mx_kick_check(struct mx_ro *m, const struct mx_snap *s,
 		return "unknown charger state";
 	if (s->cable == CABLE_NONE && DTLS01_CHG(s->dtls1) <= 0x3)
 		return "charging state without input";
+	if (s->in_fault)
+		return s->in_fault;
 
 	if (!(s->cnfg00 & CNFG00_WDTEN))
 		return "CNFG_00 WDTEN clear (nothing to kick)";
@@ -1071,6 +1102,10 @@ static const char *mx_kick_check(struct mx_ro *m, const struct mx_snap *s,
 		return "CV above 4350 mV";
 	if (conv_chg_cc_ma(s->cnfg02) > KICK_CC_MAX_MA)
 		return "CC above 1500 mA";
+	/* 4.9 1st cold-swelling tier: 950 mA below 15 C until 20 C */
+	if (s->therm_dc[THERM_BATT] < KICK_COOL_DC &&
+	    conv_chg_cc_ma(s->cnfg02) > KICK_COOL_CC_MAX_MA)
+		return "CC above 950 mA below 20.0 C";
 	return NULL;
 }
 
