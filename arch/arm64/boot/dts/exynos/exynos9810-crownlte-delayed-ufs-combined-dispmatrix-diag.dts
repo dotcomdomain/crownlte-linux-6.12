@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * COMBINED DIAGNOSTIC + DISPLAY MATRIX (trial q48): the integration-2
+ * combined diagnostic (brightness 44700 at 1 s, all self-tests) plus the
+ * kernel-buffer display matrix of the DECON driver (dpu_mx_thread): from
+ * 60 s, every 4 s, one window/channel/format combination drawn from
+ * decon-pool buffers, fb0 as SBoot left it restored at 80 s. It ends before
+ * the other self-tests (86 s and later). No HWC, no DSIM/panel/PMIC access.
+ *
+ *   60 s  1 baseline, fb0 as is (SBoot window win5 / G0)
+ *   64 s  2 win5 / G0, linear, SBoot format: white top half, red bottom half
+ *   68 s  3 win5 / G0, linear XBGR8888: the same picture
+ *   72 s  4 win0 / VGF0, linear XBGR8888: green, white cross, win5 off
+ *   76 s  6 win0 / G1, linear XBGR8888: magenta, white border, win5 off
+ *   80 s  7 fb0 restored (win5 / G0, SBoot format and buffer)
+ * (5, AFBC on VGF0 from a kernel-made buffer, is not implemented.)
+ */
+#include "exynos9810-crownlte-delayed-ufs-combined-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic, integration-2 combined + display matrix";
+};
+
+&decon_f {
+	samsung,decon-matrix;
+	samsung,decon-matrix-at-ms = <60000>;
+};

@@ -37,3 +37,6 @@ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-touch-diag.dtb
 # integration-2 combined diagnostic (q45): all verified features at once
 DTC_FLAGS_exynos9810-crownlte-delayed-ufs-combined-diag := -Wno-unit_address_format
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-combined-diag.dtb
+# combined + kernel-buffer display matrix at 60-80 s (q48)
+DTC_FLAGS_exynos9810-crownlte-delayed-ufs-combined-dispmatrix-diag := -Wno-unit_address_format
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-combined-dispmatrix-diag.dtb
