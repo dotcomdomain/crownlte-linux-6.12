@@ -72,3 +72,17 @@
 &sysmmu_dpu1 { status = "disabled"; };
 &sysmmu_dpu2 { status = "disabled"; };
 &decon_handover { status = "disabled"; };
+
+/*
+ * decon-pool 48 -> 192 MiB of reusable CMA (movable pages still use it when
+ * DECON does not). The DECON driver copies every scattered layer into a
+ * pair of contiguous slots per window; with a linear client target HWC
+ * sends up to four full-screen-sized layers (ROM-in-RAM v14 keyguard: 17.3,
+ * 17.0, 0.7, 0.7 MB), and the frame on screen keeps its slots while the
+ * next is copied, so 48 MiB failed every keyguard frame. The pool stays in
+ * alloc-ranges below 4 GiB (32-bit IDMA base); in the v14 map the largest
+ * free spans there are 0xcd400000-0xe18fffff and 0xe3700000-0xefffffff.
+ */
+&decon_pool {
+	size = <0x0c000000>;
+};
