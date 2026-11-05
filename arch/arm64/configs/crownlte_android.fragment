@@ -323,6 +323,10 @@ CONFIG_HID=y
 CONFIG_HID_GENERIC=y
 CONFIG_HIDRAW=y
 CONFIG_UHID=y
+# sec_ts Y771 touchscreen, stage 1: no firmware update, no power control;
+# probes only with the DT node enabled (delayed-UFS diag).
+CONFIG_INPUT_TOUCHSCREEN=y
+CONFIG_TOUCHSCREEN_SEC_TS_Y771=y
 CONFIG_RTC_CLASS=y
 
 # --- Display core (inert until a DT node exists) ----------------------------

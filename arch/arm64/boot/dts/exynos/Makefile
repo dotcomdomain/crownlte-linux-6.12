@@ -32,3 +32,5 @@ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-g3dpd-diag.dtb
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-g3dpd-runtime-diag.dtb
 # Trustonic TEE start (q29). Never combine with ROM-in-RAM or userspace TEE clients.
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-tee-diag.dtb
+# sec_ts Y771 touchscreen (q32; IC unpowered until LDO35/LDO43 are enabled)
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-touch-diag.dtb
