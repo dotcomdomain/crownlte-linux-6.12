@@ -2579,6 +2579,7 @@ static int dpu_probe(struct platform_device *pdev)
 	d->te_irq = -1;
 	mutex_init(&d->lock);
 	mutex_init(&d->hw_lock);
+	mutex_init(&d->panel_lock);
 	spin_lock_init(&d->queue_lock);
 	spin_lock_init(&d->fence_lock);
 	spin_lock_init(&d->ioc_lock);
@@ -2593,6 +2594,7 @@ static int dpu_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&d->pb_work, dpu_panel_bright_work);
 	INIT_DELAYED_WORK(&d->pb_status_work, dpu_panel_status_work);
 	INIT_DELAYED_WORK(&d->pb_alpm_work, dpu_panel_alpm_work);
+	INIT_DELAYED_WORK(&d->pr_work, dpu_panel_recovery_work);
 	INIT_DELAYED_WORK(&d->fb_snap_work, dpu_fb_snap_work);
 	d->fence_ctx = dma_fence_context_alloc(1);
 	platform_set_drvdata(pdev, d);
@@ -2744,6 +2746,19 @@ static int dpu_probe(struct platform_device *pdev)
 					   msecs_to_jiffies(d->pb_alpm_at_ms > now ?
 							    d->pb_alpm_at_ms - now : 0));
 		}
+		/* opt-in: one 4.9 screen off / on panel cycle (panel_recovery.c) */
+		ret = dpu_panel_recovery_init(d);
+		if (!ret) {
+			pr_info("panel-recovery: scheduled at %u ms uptime: level %u (%s)%s\n",
+				d->pr_at_ms, d->pr_level,
+				d->pr_level == 1 ? "DCS sleep cycle" : "reset pulse + DCS cycle",
+				d->pr_only_elvdd ? ", only on an ELVDD error" : "");
+			queue_delayed_work(system_long_wq, &d->pr_work,
+					   msecs_to_jiffies(d->pr_at_ms > now ?
+							    d->pr_at_ms - now : 0));
+		} else if (ret != -ENODEV) {
+			dev_warn(dev, "panel-recovery disabled: %d\n", ret);
+		}
 	} else if (ret != -ENODEV) {
 		dev_warn(dev, "panel-bright disabled: %d\n", ret);
 	}
@@ -2781,6 +2796,8 @@ static void dpu_stop(struct dpu_dev *d)
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->pb_status_work);	/* re-queues itself; cancel waits */
 	cancel_delayed_work_sync(&d->pb_alpm_work);	/* exit + brightness even when stopping */
+	/* not started: cancelled; started: runs to its display on, then returns */
+	cancel_delayed_work_sync(&d->pr_work);
 	cancel_delayed_work_sync(&d->st_work);
 	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {

@@ -222,8 +222,14 @@ struct dpu_dev {
 	struct delayed_work pb_alpm_work;
 	u32 pb_alpm_at_ms;			/* 0 = off */
 	bool pb_alpm_active;			/* alpm packet shapes allowed */
-	/* panel recovery (panel_recovery.c) running its 4.9 tables */
+	/* one 4.9 screen off / on panel cycle (panel_recovery.c), opt-in via DT */
+	struct delayed_work pr_work;
+	u32 pr_level, pr_at_ms;			/* level 0 = off */
+	bool pr_only_elvdd;			/* DT: only when keyed EE shows ELVDD */
+	bool pr_done;
 	bool pr_active;				/* sleep/display DCS, DSC/PPS allowed */
+	/* one panel command sequence at a time: bright, status, alpm, recovery */
+	struct mutex panel_lock;
 };
 
 /* decon_hw.c: register layer (ported from 4.9 decon_reg.c / dpp_reg.c) */
@@ -278,5 +284,9 @@ void dpu_panel_status_work(struct work_struct *work);
 void dpu_panel_status_schedule(struct dpu_dev *d);
 void dpu_panel_alpm_work(struct work_struct *work);
 u32 dpu9810_panel_brightness(void);	/* also used by panel_ro.c */
+
+/* panel_recovery.c: one 4.9 screen off / on cycle (levels 1 and 2) */
+int dpu_panel_recovery_init(struct dpu_dev *d);
+void dpu_panel_recovery_work(struct work_struct *work);
 
 #endif /* __DPU9810_H__ */
