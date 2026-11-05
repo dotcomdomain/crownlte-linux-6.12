@@ -242,9 +242,11 @@ static bool dpu_commit_uses_slot(const struct dpu_commit *c, int w, int s)
 
 /*
  * Free every bounce slot that no commit references: not the frame being
- * scanned (d->active), not frames retained after a latch timeout (d->stale),
- * not the slots @cur filled so far. Runs in the update worker, which alone
- * changes those lists, after dpu_process() resolved any pending update.
+ * scanned (d->active), not frames retained after a latch timeout (d->stale,
+ * already emptied by dpu_process() once the pending update latched; checked
+ * anyway), not the slots @cur filled so far. Runs in the update worker,
+ * which alone changes those lists, after dpu_process() resolved any pending
+ * update.
  * Returns the number of bytes freed. Sol review S4: slots used to be kept
  * forever, so the client target moving to another window could not get its
  * 2 x 17.3 MB from the 48 MiB pool.
@@ -722,6 +724,20 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");
 		c->result = -EBUSY;
 	} else {
+		struct dpu_commit *p, *n;
+
+		/*
+		 * No update pending: the last requested frame (d->active), even
+		 * one that timed out, has latched, so frames kept on d->stale
+		 * after a latch timeout are no longer scanned. Release them and
+		 * their bounce slot references before any copy, allocation or
+		 * reclaim (Sol review S4: otherwise two 17.3 MB slots could stay
+		 * pinned until another commit succeeded).
+		 */
+		list_for_each_entry_safe(p, n, &d->stale, node) {
+			list_del(&p->node);
+			dpu_commit_free(p);
+		}
 		c->result = dpu_bounce(d, c);
 		if (!c->result)
 			c->result = dpu_apply(d, c);
