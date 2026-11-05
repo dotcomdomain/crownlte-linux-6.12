@@ -98,7 +98,8 @@ struct dpu_commit {
 	struct dma_fence *fence;	/* retire = release fence, may be NULL */
 	unsigned int nr_win;
 	bool internal;			/* kernel-owned buffers (fb, self-test) */
-	unsigned long bounced;		/* window i scans d->bounce[i][d->bounce_next[i]] */
+	unsigned long bounced;		/* window i scans d->bounce[i][slot[i]] */
+	u8 slot[DECON_MAX_WIN];		/* bounce slot used by window i */
 	unsigned long pattern_win;	/* hwc-bisect B: draw the test pattern here */
 	int bisect_var;			/* hwc-bisect variant of this frame */
 	bool bisect_log;		/* first frame of a new variant */

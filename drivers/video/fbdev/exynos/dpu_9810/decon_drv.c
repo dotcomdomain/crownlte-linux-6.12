@@ -238,6 +238,47 @@ static int dpu_bounce_copy_vmap(struct dpu_buf *b, void *dst)
  */
 static void dpu_bisect_pattern(const struct decon_win_config *w, void *dst);
 
+static bool dpu_commit_uses_slot(const struct dpu_commit *c, int w, int s)
+{
+	return c && (c->bounced & BIT(w)) && c->slot[w] == s;
+}
+
+/*
+ * Free every bounce slot that no commit references: not the frame being
+ * scanned (d->active), not frames retained after a latch timeout (d->stale),
+ * not the slots @cur filled so far. Runs in the update worker, which alone
+ * changes those lists, after dpu_process() resolved any pending update.
+ * Returns the number of bytes freed. Sol review S4: slots used to be kept
+ * forever, so the client target moving to another window could not get its
+ * 2 x 17.3 MB from the 48 MiB pool.
+ */
+static size_t dpu_bounce_reclaim(struct dpu_dev *d, const struct dpu_commit *cur)
+{
+	const struct dpu_commit *p;
+	size_t freed = 0;
+	int w, s;
+
+	for (w = 0; w < DECON_MAX_WIN; w++) {
+		for (s = 0; s < 2; s++) {
+			struct dpu_bounce *t = &d->bounce[w][s];
+			bool used = dpu_commit_uses_slot(cur, w, s) ||
+				    dpu_commit_uses_slot(d->active, w, s);
+
+			list_for_each_entry(p, &d->stale, node)
+				used |= dpu_commit_uses_slot(p, w, s);
+			if (!t->vaddr || used)
+				continue;
+			dma_free_wc(d->dev, t->size, t->vaddr, t->dma);
+			freed += t->size;
+			t->vaddr = NULL;
+			t->size = 0;
+		}
+	}
+	if (freed)
+		dev_info(d->dev, "bounce: reclaimed %zu bytes of unreferenced slots\n", freed);
+	return freed;
+}
+
 static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 {
 	int i, ret;
@@ -254,8 +295,11 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 		if (t->size < b->len) {
 			if (t->vaddr)
 				dma_free_wc(d->dev, t->size, t->vaddr, t->dma);
+			t->vaddr = NULL;
 			t->size = PAGE_ALIGN(b->len);
 			t->vaddr = dma_alloc_wc(d->dev, t->size, &t->dma, GFP_KERNEL);
+			if (!t->vaddr && dpu_bounce_reclaim(d, c))
+				t->vaddr = dma_alloc_wc(d->dev, t->size, &t->dma, GFP_KERNEL);
 			if (!t->vaddr || upper_32_bits(t->dma + t->size - 1)) {
 				dev_err_ratelimited(d->dev, "win%d bounce buffer %d: cannot allocate %zu bytes below 4 GiB from decon-pool\n",
 						    i, d->bounce_next[i], t->size);
@@ -288,6 +332,7 @@ static int dpu_bounce(struct dpu_dev *d, struct dpu_commit *c)
 		}
 		wmb();
 		b->addr = t->dma;
+		c->slot[i] = d->bounce_next[i];
 		c->bounced |= BIT(i);	/* dpu_process() flips bounce_next[i] once latched */
 		us = ktime_us_delta(ktime_get(), t0);
 		d->bounce_max_us = max(d->bounce_max_us, us);
