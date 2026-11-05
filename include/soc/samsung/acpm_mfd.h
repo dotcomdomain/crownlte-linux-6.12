@@ -64,17 +64,38 @@ enum mfd_func {
 #define ACPM_MFD_TYPE_RTC		0x2
 
 /*
+ * G3D rail request (4.9 cal-if.c cal_pd_control(), pd index 8): FUNC_UPDATE
+ * of "type 3, reg 0x2a" with mask 0xc0. Type 3 is no SPEEDY slave. The APM
+ * firmware MFD update handler (sboot copy, APM address 0x5064) intercepts
+ * address 0x32a with mask 0xc0 before its generic SPEEDY read-modify-write
+ * and calls its G3D rail routine (APM 0x4e4c) with the value:
+ *   0xc0: PMU 0x14064678 = 1, wait 0x1406467c bit 0 set (<= 1999 polls),
+ *         then S2MPS18 PMIC B6CTRL (0x12a) bits 3:2 = 0b10;
+ *   0x00: B6CTRL bits 3:2 = 0b00, PMU 0x14064678 = 0, wait bit 0 clear;
+ *   other: nothing.
+ * A poll timeout is only logged ("g3d_cnt"): the reply still says success.
+ */
+#define ACPM_MFD_TYPE_G3D_RAIL		0x3
+#define ACPM_MFD_G3D_RAIL_REG		0x2a
+#define ACPM_MFD_G3D_RAIL_MASK		0xc0
+#define ACPM_MFD_G3D_RAIL_ON		0xc0
+#define ACPM_MFD_G3D_RAIL_OFF		0x00
+
+/*
  * Write policy of the ACPM PMIC transport. Until a policy is sealed every
  * write/bulk-write/update request is refused with -EPERM. A sealed policy
  * can only open registers 0..31 of the RTC slave (type 2); writes to TOP,
  * PMIC (regulators, IRQ masks, power control) and any other type are always
- * refused, as is FUNC_UPDATE. A write to @update_reg must not set any bit in
- * @update_forbidden. The policy can be sealed once per boot.
+ * refused. A write to @update_reg must not set any bit in @update_forbidden.
+ * FUNC_UPDATE is refused, except, if @g3d_rail is set, the two exact G3D
+ * rail requests above (type 3, reg 0x2a, mask 0xc0, value 0xc0 or 0x00).
+ * The policy can be sealed once per boot.
  */
 struct acpm_mfd_write_policy {
 	u32 rtc_reg_mask;
 	u8 update_reg;
 	u8 update_forbidden;
+	bool g3d_rail;
 };
 
 #ifdef CONFIG_EXYNOS_ACPM

@@ -118,7 +118,8 @@
 	 * power_allocator cannot drive cpufreq cooling here, so BIG uses the
 	 * default step_wise governor on the same trip and cooling range.
 	 * 4.9's LITTLE maps were all <0 0> (never throttle) and are omitted;
-	 * G3D has no devfreq cooling device yet.
+	 * G3D throttles the Mali levels through the kbase platform cooling
+	 * device "thermal-gpufreq-0" (step_wise, 4.9 gpu_temp_throttling).
 	 * 4.9 LITTLE/ISP/G3D relied on TMU interrupts; here everything polls.
 	 */
 	thermal-zones {
@@ -172,7 +173,7 @@
 			thermal-sensors = <&tmu_g3d>;
 
 			trips {
-				gpu-control-temp {
+				gpu_control_temp: gpu-control-temp {
 					temperature = <88000>;
 					hysteresis = <5000>;
 					type = "passive";
@@ -181,6 +182,13 @@
 					temperature = <110000>;
 					hysteresis = <0>;
 					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&gpu_control_temp>;
+					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
 				};
 			};
 		};
@@ -208,7 +216,9 @@
  * max-freq 2314000 with policy-max 1794000; samsung,max-freq-cap (not in
  * 4.9) holds the table at 1794000 until thermal throttling is verified.
  * The mif-perf tables only drive a samsung,mif-devfreq supplier (none yet).
- * The cpufreq core registers each policy CPU node as a cooling device.
+ * The cpufreq driver registers each policy CPU node as a cooling device with
+ * the 4.9 type names the vendor thermal HAL expects: cpu0 (domain@0) =
+ * "thermal-cpufreq-0", cpu4 (domain@1) = "thermal-cpufreq-1".
  */
 &cpu0 { #cooling-cells = <2>; };
 &cpu1 { #cooling-cells = <2>; };
@@ -311,4 +321,18 @@
 &decon_handover {
 	samsung,decon-trigger = "hw-te";
 	samsung,display-selftest;
+};
+
+/*
+ * Mali-G72 kbase r38p1-01bet0 (/dev/mali0). Probe only if SBoot left the
+ * G3D domain on (stage 1 never switches it). GPU levels raise a MIF floor
+ * through the MIF devfreq. Self-test at ~109 s ("mali selftest:"): kbase
+ * power-up, GPU_ID/core masks, cache clean, MMU AS status, G3D 455/338 MHz
+ * with CMU readback, kbase power-down.
+ */
+&gpu {
+	samsung,mif-devfreq = <&legacy_devfreq_mif>;
+	samsung,mali-selftest;
+	samsung,selftest-khz = <455000 338000>;
+	status = "okay";
 };

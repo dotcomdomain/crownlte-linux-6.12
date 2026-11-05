@@ -39,6 +39,15 @@ void cpufreq_cooling_unregister(struct thermal_cooling_device *cdev);
 struct thermal_cooling_device *
 of_cpufreq_cooling_register(struct cpufreq_policy *policy);
 
+/**
+ * of_cpufreq_cooling_register_named - as above, with a fixed device type.
+ * @policy: cpufreq policy.
+ * @type: cooling device type string.
+ */
+struct thermal_cooling_device *
+of_cpufreq_cooling_register_named(struct cpufreq_policy *policy,
+				  const char *type);
+
 #else /* !CONFIG_CPU_FREQ_THERMAL */
 static inline struct thermal_cooling_device *
 cpufreq_cooling_register(struct cpufreq_policy *policy)
@@ -54,6 +63,13 @@ void cpufreq_cooling_unregister(struct thermal_cooling_device *cdev)
 
 static inline struct thermal_cooling_device *
 of_cpufreq_cooling_register(struct cpufreq_policy *policy)
+{
+	return NULL;
+}
+
+static inline struct thermal_cooling_device *
+of_cpufreq_cooling_register_named(struct cpufreq_policy *policy,
+				  const char *type)
 {
 	return NULL;
 }

@@ -69,9 +69,9 @@ int exynos_acpm_mfd_seal_write_policy(const struct acpm_mfd_write_policy *policy
 	if (ret)
 		pr_err(ACPM_MFD_PREFIX "write policy already sealed\n");
 	else
-		pr_info(ACPM_MFD_PREFIX "write policy sealed: rtc_reg_mask=%#010x update_reg=%#04x forbidden=%#04x (TOP/PMIC/other writes always refused)\n",
+		pr_info(ACPM_MFD_PREFIX "write policy sealed: rtc_reg_mask=%#010x update_reg=%#04x forbidden=%#04x g3d_rail=%d (TOP/PMIC/other writes always refused)\n",
 			policy->rtc_reg_mask, policy->update_reg,
-			policy->update_forbidden);
+			policy->update_forbidden, policy->g3d_rail);
 	return ret;
 }
 
@@ -319,15 +319,67 @@ int exynos_acpm_bulk_write(u16 type, u8 reg, int count, u8 *buf)
 	return ret;
 }
 
+/* Exactly the two 4.9 cal_pd_control() G3D rail requests, see acpm_mfd.h. */
+static bool acpm_mfd_g3d_rail_allowed(u16 type, u8 reg, u8 value, u8 mask)
+{
+	unsigned long flags;
+	bool allowed;
+
+	if (type != ACPM_MFD_TYPE_G3D_RAIL || reg != ACPM_MFD_G3D_RAIL_REG ||
+	    mask != ACPM_MFD_G3D_RAIL_MASK ||
+	    (value != ACPM_MFD_G3D_RAIL_ON && value != ACPM_MFD_G3D_RAIL_OFF))
+		return false;
+	spin_lock_irqsave(&acpm_mfd_policy_lock, flags);
+	allowed = acpm_mfd_policy_sealed && acpm_mfd_policy.g3d_rail;
+	spin_unlock_irqrestore(&acpm_mfd_policy_lock, flags);
+	return allowed;
+}
+
 int exynos_acpm_update_reg(u16 type, u8 reg, u8 value, u8 mask)
 {
+	unsigned int channel_num = 0, size = 0;
+	struct ipc_config config;
+	unsigned int command[4] = {0,};
+	int ret;
+
 	/*
-	 * Firmware-side read-modify-write (FUNC_UPDATE: cmd[1] = 2 | value << 8 |
-	 * mask << 16) is never sent: the firmware would write bits the policy
-	 * cannot see. Its only in-tree caller is cal_pd_control() (type 3,
-	 * reg 0x2a), which has no callers in this tree.
+	 * A generic firmware-side read-modify-write (FUNC_UPDATE: cmd[1] = 2 |
+	 * value << 8 | mask << 16) is never sent: the firmware would write bits
+	 * the policy cannot see. The only exception is the G3D rail request of
+	 * cal_pd_control(), which the APM firmware never forwards as a SPEEDY
+	 * RMW, and only if the sealed policy enables it.
 	 */
-	pr_warn_ratelimited(ACPM_MFD_PREFIX "refused update type=%#x reg=%#04x val=%#04x mask=%#04x from %pS\n",
-			    type, reg, value, mask, __builtin_return_address(0));
-	return -EPERM;
+	if (!acpm_mfd_g3d_rail_allowed(type, reg, value, mask)) {
+		pr_warn_ratelimited(ACPM_MFD_PREFIX "refused update type=%#x reg=%#04x val=%#04x mask=%#04x from %pS\n",
+				    type, reg, value, mask, __builtin_return_address(0));
+		return -EPERM;
+	}
+
+	ret = acpm_mfd_request_channel(&channel_num, &size);
+	if (ret) {
+		pr_err(ACPM_MFD_PREFIX "%s ipc request_channel fail: %d\n", __func__, ret);
+		return -EBUSY;
+	}
+	config.cmd = command;
+	config.cmd[0] = set_protocol(type, TYPE) | set_protocol(reg, REG);
+	config.cmd[1] = set_protocol(FUNC_UPDATE, FUNC)
+			| set_protocol(value, UPDATE_VAL)
+			| set_protocol(mask, UPDATE_MASK);
+	config.response = true;
+	config.indirection = false;
+
+	ret = acpm_ipc_send_data(channel_num, &config);
+	acpm_ipc_release_channel(acpm_mfd_node, channel_num);
+	if (ret) {
+		pr_err(ACPM_MFD_PREFIX "%s - acpm_ipc_send_data fail: %d\n", __func__, ret);
+		return ret;
+	}
+	ret = read_protocol(config.cmd[1], RETURN);
+	if (ret) {
+		pr_err(ACPM_MFD_PREFIX "G3D rail %s: firmware status %#x\n",
+		       value ? "on" : "off", ret);
+		return -EREMOTEIO;
+	}
+	/* Success only means "request handled": callers verify PMU state. */
+	return 0;
 }

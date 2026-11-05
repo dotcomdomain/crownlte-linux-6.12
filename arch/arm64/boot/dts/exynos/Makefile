@@ -27,3 +27,6 @@ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-display-s2-bright-d
 # Deliberately resets the phone at ~115 s (watchdog expiry selftest)
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-wdt-selftest-diag.dtb
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-rtc-latch-diag.dtb
+# G3D power-domain trials: PMIC G3D rail request allowed (see the .dts)
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-g3dpd-diag.dtb
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-g3dpd-runtime-diag.dtb
