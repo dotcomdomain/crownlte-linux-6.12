@@ -9,6 +9,7 @@
 
 #include <linux/bits.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/init.h>
 #include <linux/platform_device.h>
@@ -69,9 +70,22 @@ int exynos_acpm_mfd_seal_write_policy(const struct acpm_mfd_write_policy *policy
 	if (ret)
 		pr_err(ACPM_MFD_PREFIX "write policy already sealed\n");
 	else
-		pr_info(ACPM_MFD_PREFIX "write policy sealed: rtc_reg_mask=%#010x update_reg=%#04x forbidden=%#04x g3d_rail=%d (TOP/PMIC/other writes always refused)\n",
+		pr_info(ACPM_MFD_PREFIX "write policy sealed: rtc_reg_mask=%#010x update_reg=%#04x forbidden=%#04x g3d_rail=%d touch_rails=%d (TOP/PMIC/other writes always refused)\n",
 			policy->rtc_reg_mask, policy->update_reg,
-			policy->update_forbidden, policy->g3d_rail);
+			policy->update_forbidden, policy->g3d_rail,
+			policy->touch_rails);
+	return ret;
+}
+
+/* -EAGAIN until a policy is sealed, then 1 if touch rail updates are allowed. */
+int exynos_acpm_mfd_touch_rails_policy(void)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&acpm_mfd_policy_lock, flags);
+	ret = !acpm_mfd_policy_sealed ? -EAGAIN : acpm_mfd_policy.touch_rails;
+	spin_unlock_irqrestore(&acpm_mfd_policy_lock, flags);
 	return ret;
 }
 
@@ -335,25 +349,93 @@ static bool acpm_mfd_g3d_rail_allowed(u16 type, u8 reg, u8 value, u8 mask)
 	return allowed;
 }
 
-int exynos_acpm_update_reg(u16 type, u8 reg, u8 value, u8 mask)
+/*
+ * The four touch rail requests, see acpm_mfd.h. Exact match on all of
+ * type, reg, value and mask.
+ */
+static bool acpm_mfd_touch_rail_request(u16 type, u8 reg, u8 value, u8 mask)
+{
+	if (type != ACPM_MFD_TYPE_PMIC || mask != ACPM_MFD_TOUCH_RAIL_MASK)
+		return false;
+	if (reg == ACPM_MFD_TOUCH_L35_REG)
+		return value == ACPM_MFD_TOUCH_L35_ON ||
+		       value == ACPM_MFD_TOUCH_RAIL_OFF;
+	if (reg == ACPM_MFD_TOUCH_L43_REG)
+		return value == ACPM_MFD_TOUCH_L43_ON ||
+		       value == ACPM_MFD_TOUCH_RAIL_OFF;
+	return false;
+}
+
+static DEFINE_MUTEX(acpm_mfd_touch_lock);	/* read-check-update, on counts */
+static unsigned int acpm_mfd_touch_l35_on, acpm_mfd_touch_l43_on;
+
+static bool acpm_mfd_touch_mode_ok(u8 v, u8 vsel, u8 on)
+{
+	u8 mode = v & ACPM_MFD_TOUCH_RAIL_MASK;
+
+	return (v & ACPM_MFD_TOUCH_VSEL_MASK) == vsel &&
+	       (mode == ACPM_MFD_TOUCH_RAIL_OFF || mode == on);
+}
+
+/* Caller holds acpm_mfd_touch_lock. Reads 0x6c and 0x74 before every update. */
+static int acpm_mfd_touch_rail_check(u8 reg, u8 value)
+{
+	const char *why;
+	u8 l35 = 0, l43 = 0;
+	int ret;
+
+	ret = exynos_acpm_read_reg(ACPM_MFD_TYPE_PMIC, ACPM_MFD_TOUCH_L35_REG, &l35);
+	if (!ret)
+		ret = exynos_acpm_read_reg(ACPM_MFD_TYPE_PMIC,
+					   ACPM_MFD_TOUCH_L43_REG, &l43);
+	if (ret) {
+		pr_err(ACPM_MFD_PREFIX "touch rail reg %#04x val %#04x refused: precheck read failed %d\n",
+		       reg, value, ret);
+		return ret;
+	}
+
+	if (reg == ACPM_MFD_TOUCH_L35_REG && value == ACPM_MFD_TOUCH_L35_ON) {
+		why = "LDO35 not vsel 0x2c with mode 00/10";
+		if (!acpm_mfd_touch_mode_ok(l35, ACPM_MFD_TOUCH_L35_VSEL,
+					    ACPM_MFD_TOUCH_L35_ON))
+			goto deny;
+		why = "LDO35 on-request limit reached";
+		if (acpm_mfd_touch_l35_on >= ACPM_MFD_TOUCH_MAX_ON)
+			goto deny;
+		acpm_mfd_touch_l35_on++;
+	} else if (reg == ACPM_MFD_TOUCH_L43_REG &&
+		   value == ACPM_MFD_TOUCH_L43_ON) {
+		why = "LDO35 not on (0x6c != 0xac)";
+		if (l35 != (ACPM_MFD_TOUCH_L35_VSEL | ACPM_MFD_TOUCH_L35_ON))
+			goto deny;
+		why = "LDO43 not vsel 0x30 with mode 00/11";
+		if (!acpm_mfd_touch_mode_ok(l43, ACPM_MFD_TOUCH_L43_VSEL,
+					    ACPM_MFD_TOUCH_L43_ON))
+			goto deny;
+		why = "LDO43 on-request limit reached";
+		if (acpm_mfd_touch_l43_on >= ACPM_MFD_TOUCH_MAX_ON)
+			goto deny;
+		acpm_mfd_touch_l43_on++;
+	} else if (reg == ACPM_MFD_TOUCH_L35_REG) {
+		why = "LDO43 still on (off order is LDO43, then LDO35)";
+		if (l43 & ACPM_MFD_TOUCH_RAIL_MASK)
+			goto deny;
+	}
+	/* LDO43 off needs no precondition: AVDD may always go first. */
+	return 0;
+
+deny:
+	pr_err(ACPM_MFD_PREFIX "touch rail reg %#04x val %#04x refused: %s (0x6c=%#04x 0x74=%#04x)\n",
+	       reg, value, why, l35, l43);
+	return -EPERM;
+}
+
+static int acpm_mfd_send_update(u16 type, u8 reg, u8 value, u8 mask)
 {
 	unsigned int channel_num = 0, size = 0;
 	struct ipc_config config;
 	unsigned int command[4] = {0,};
 	int ret;
-
-	/*
-	 * A generic firmware-side read-modify-write (FUNC_UPDATE: cmd[1] = 2 |
-	 * value << 8 | mask << 16) is never sent: the firmware would write bits
-	 * the policy cannot see. The only exception is the G3D rail request of
-	 * cal_pd_control(), which the APM firmware never forwards as a SPEEDY
-	 * RMW, and only if the sealed policy enables it.
-	 */
-	if (!acpm_mfd_g3d_rail_allowed(type, reg, value, mask)) {
-		pr_warn_ratelimited(ACPM_MFD_PREFIX "refused update type=%#x reg=%#04x val=%#04x mask=%#04x from %pS\n",
-				    type, reg, value, mask, __builtin_return_address(0));
-		return -EPERM;
-	}
 
 	ret = acpm_mfd_request_channel(&channel_num, &size);
 	if (ret) {
@@ -376,10 +458,49 @@ int exynos_acpm_update_reg(u16 type, u8 reg, u8 value, u8 mask)
 	}
 	ret = read_protocol(config.cmd[1], RETURN);
 	if (ret) {
-		pr_err(ACPM_MFD_PREFIX "G3D rail %s: firmware status %#x\n",
-		       value ? "on" : "off", ret);
+		pr_err(ACPM_MFD_PREFIX "update type=%#x reg=%#04x val=%#04x: firmware status %#x\n",
+		       type, reg, value, ret);
 		return -EREMOTEIO;
 	}
-	/* Success only means "request handled": callers verify PMU state. */
+	/* Success only means "request handled": callers verify the result. */
 	return 0;
+}
+
+int exynos_acpm_update_reg(u16 type, u8 reg, u8 value, u8 mask)
+{
+	int ret;
+
+	/*
+	 * A generic firmware-side read-modify-write (FUNC_UPDATE: cmd[1] = 2 |
+	 * value << 8 | mask << 16) is never sent: the firmware would write bits
+	 * the policy cannot see. The exceptions, each only if the sealed policy
+	 * enables it: the G3D rail request of cal_pd_control(), which the APM
+	 * firmware never forwards as a SPEEDY RMW, and the four touch rail
+	 * requests, whose mask 0xc0 limits the firmware RMW to the LDO35/LDO43
+	 * enable field and which are checked against the PMIC state first.
+	 */
+	if (acpm_mfd_touch_rail_request(type, reg, value, mask) &&
+	    exynos_acpm_mfd_touch_rails_policy() == 1) {
+		might_sleep();
+		mutex_lock(&acpm_mfd_touch_lock);
+		ret = acpm_mfd_touch_rail_check(reg, value);
+		if (!ret)
+			ret = acpm_mfd_send_update(type, reg, value, mask);
+		mutex_unlock(&acpm_mfd_touch_lock);
+		pr_info(ACPM_MFD_PREFIX "touch rail update reg=%#04x val=%#04x mask=%#04x from %pS: %d\n",
+			reg, value, mask, __builtin_return_address(0), ret);
+		return ret;
+	}
+
+	if (!acpm_mfd_g3d_rail_allowed(type, reg, value, mask)) {
+		pr_warn_ratelimited(ACPM_MFD_PREFIX "refused update type=%#x reg=%#04x val=%#04x mask=%#04x from %pS\n",
+				    type, reg, value, mask, __builtin_return_address(0));
+		return -EPERM;
+	}
+
+	ret = acpm_mfd_send_update(type, reg, value, mask);
+	if (ret == -EREMOTEIO)
+		pr_err(ACPM_MFD_PREFIX "G3D rail %s: firmware refused the request\n",
+		       value ? "on" : "off");
+	return ret;
 }

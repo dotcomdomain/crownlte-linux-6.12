@@ -27,6 +27,12 @@
  * handled inside the APM firmware (PMU PWR_EMBEDDED_G3D + B6CTRL bits 3:2),
  * not by this driver, and are only issued by the Mali platform code when its
  * own samsung,g3d-power-control property is set.
+ *
+ * samsung,touch-rail-update (default off) lets the transport pass the four
+ * exact touch rail requests (FUNC_UPDATE type 1, mask 0xc0: LDO35 0x6c
+ * 0x80/0x00, LDO43 0x74 0xc0/0x00; see acpm_mfd.h). Only the sec_ts_y771
+ * touchscreen driver issues them, and only with its own
+ * samsung,acpm-touch-power property.
  */
 
 #include <linux/delay.h>
@@ -424,6 +430,7 @@ static int s2mps18_acpm_probe(struct platform_device *pdev)
 		policy.update_forbidden = S2MPS18_RTC_UPDATE_FREEZE;
 	}
 	policy.g3d_rail = of_property_read_bool(np, "samsung,g3d-rail-update");
+	policy.touch_rails = of_property_read_bool(np, "samsung,touch-rail-update");
 	ret = exynos_acpm_mfd_seal_write_policy(&policy);
 	if (ret)
 		return dev_err_probe(dev, st_fail("write policy seal", ret),
@@ -449,10 +456,11 @@ static int s2mps18_acpm_probe(struct platform_device *pdev)
 				      S2MPS18_RTC_UPDATE_FREEZE |
 				      S2MPS18_RTC_UPDATE_AUDR);
 
-	dev_info(dev, "S2MPS18 chip id %#04x via ACPM ch%u; RTC CTRL=%#04x UPDATE=%#04x; RTC latch %s, RTC write %s, G3D rail requests %s; TOP/PMIC writes refused, no regulators registered\n",
+	dev_info(dev, "S2MPS18 chip id %#04x via ACPM ch%u; RTC CTRL=%#04x UPDATE=%#04x; RTC latch %s, RTC write %s, G3D rail requests %s, touch rail requests %s; TOP/PMIC writes refused, no regulators registered\n",
 		 pmic->chip_id, ch, pmic->rtc_ctrl, v,
 		 pmic->rtc_latch ? "on" : "off", pmic->rtc_write ? "on" : "off",
-		 policy.g3d_rail ? "allowed" : "refused");
+		 policy.g3d_rail ? "allowed" : "refused",
+		 policy.touch_rails ? "allowed" : "refused");
 
 	platform_set_drvdata(pdev, pmic);
 
