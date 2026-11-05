@@ -397,6 +397,15 @@ CONFIG_WATCHDOG_OPEN_TIMEOUT=0
 CONFIG_WATCHDOG_SYSFS=y
 # CONFIG_WATCHDOG_NOWAYOUT is not set
 CONFIG_S3C2410_WATCHDOG=y
+# S2MPS18 PMIC/RTC over ACPM: read-only unless the DT seals an RTC-latch
+# or G3D-rail write policy (q23/q24).
+CONFIG_MFD_S2MPS18_ACPM=y
+CONFIG_RTC_DRV_S2MPS18_ACPM=y
+# Exynos9810 C2 cpuidle + MCT tick broadcast (q21b/q44). C2 stays disarmed
+# unless the DT arms it; LITTLE C2 is refused (cores lost in EL3).
+CONFIG_CPU_IDLE=y
+CONFIG_ARM_EXYNOS9810_CPUIDLE=y
+CONFIG_EXYNOS9810_MCT_BROADCAST=y
 # MAX77705 read-only battery monitor: battery/ac/usb/wireless power supplies
 # for the health HAL from I2C reads only (never writes charger/fuel gauge).
 CONFIG_BATTERY_MAX77705_RO=y
@@ -414,8 +423,6 @@ CONFIG_EXYNOS_ADC=y
 # CONFIG_VMAP_STACK is not set
 # CONFIG_CFI_CLANG is not set
 # CONFIG_RANDOMIZE_BASE is not set
-# The cpuidle work lives on crownlte-cpuidle (not yet hardware-verified):
-# CONFIG_CPU_IDLE is not set
 # Not needed, and would change the hardware-verified UFS/USB paths:
 # CONFIG_SCSI_SCAN_ASYNC is not set
 # CONFIG_PCI is not set
