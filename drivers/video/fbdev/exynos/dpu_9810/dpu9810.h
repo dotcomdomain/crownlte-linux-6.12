@@ -222,6 +222,8 @@ struct dpu_dev {
 	struct delayed_work pb_alpm_work;
 	u32 pb_alpm_at_ms;			/* 0 = off */
 	bool pb_alpm_active;			/* alpm packet shapes allowed */
+	/* panel recovery (panel_recovery.c) running its 4.9 tables */
+	bool pr_active;				/* sleep/display DCS, DSC/PPS allowed */
 };
 
 /* decon_hw.c: register layer (ported from 4.9 decon_reg.c / dpp_reg.c) */

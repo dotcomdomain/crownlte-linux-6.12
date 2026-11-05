@@ -19,7 +19,13 @@
  *    dpu_cmd_window_begin), i.e. DECON adopted, hw_lock held, TE trigger
  *    masked and no frame in flight;
  *  - DCS power, sleep, display on/off, reset, tearing, address and memory
- *    write commands and the DSC/PPS/peripheral packet types are refused.
+ *    write commands and the DSC/PPS/peripheral packet types are refused,
+ *    except while the panel recovery (panel_recovery.c) runs its 4.9
+ *    tables (d->pr_active): then sleep in/out (10/11), display off/on
+ *    (28/29), column/page address (2A/2B), tearing on (35), the DSC
+ *    compression mode packet (type 0x07) and a 128-byte PPS (type 0x0A)
+ *    may go out. Soft reset, partial/normal/idle mode, memory writes and
+ *    tearing off stay refused.
  *
  * Nothing here programs DSIM configuration, clocks, timing or the PHY.
  * The only registers written are PKTHDR/PAYLOAD (the packet FIFOs) and
@@ -36,6 +42,7 @@
 #define DSIM_RD_TIMEOUT_US	100000	/* 4.9 MIPI_RD_TIMEOUT */
 #define DSIM_RX_FIFO_MAX_DEPTH	64	/* 4.9 dsim.h */
 #define DSIM_MAX_LONG		64
+#define DSIM_PPS_LEN		128	/* DSC 1.1 picture parameter set */
 #define DSIM_MAX_READ		40	/* 4.9 panel.c MAX_READ_BYTES */
 
 /*
@@ -71,9 +78,28 @@ static void dsim_wr(struct dpu_dev *d, u32 off, u32 val)
 	writel(val, d->dsim + off);
 }
 
-/* DCS commands this path never sends, whatever the caller asks */
-static bool dsim_dcs_forbidden(u8 cmd)
+/* the 4.9 screen off / on commands, only inside the panel recovery */
+static bool dsim_dcs_recovery_only(u8 cmd)
 {
+	switch (cmd) {
+	case MIPI_DCS_ENTER_SLEEP_MODE:		/* 10 */
+	case MIPI_DCS_EXIT_SLEEP_MODE:		/* 11 */
+	case MIPI_DCS_SET_DISPLAY_OFF:		/* 28 */
+	case MIPI_DCS_SET_DISPLAY_ON:		/* 29 */
+	case MIPI_DCS_SET_COLUMN_ADDRESS:	/* 2A */
+	case MIPI_DCS_SET_PAGE_ADDRESS:		/* 2B */
+	case MIPI_DCS_SET_TEAR_ON:		/* 35 */
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* DCS commands this path never sends, whatever the caller asks */
+static bool dsim_dcs_forbidden(struct dpu_dev *d, u8 cmd)
+{
+	if (d->pr_active && dsim_dcs_recovery_only(cmd))
+		return false;
 	switch (cmd) {
 	case MIPI_DCS_SOFT_RESET:
 	case MIPI_DCS_ENTER_SLEEP_MODE:
@@ -217,6 +243,10 @@ static int dsim_check_errors(struct dpu_dev *d, const char *what, u32 nr)
  * Send one packet: DCS/generic short or long write, or
  * SET_MAXIMUM_RETURN_PACKET_SIZE. @buf holds the command byte (DCS) or the
  * parameters (generic); short packets put buf[0]/buf[1] in DATA0/DATA1.
+ * Inside the panel recovery also the 4.9 DSC packets (dsim_write_data()):
+ * compression mode MIPI_DSI_DSC_PRA 0x07 as a short packet with DATA0 =
+ * buf[0], DATA1 = 0, and the PPS MIPI_DSI_DSC_PPS 0x0A as a long packet
+ * of exactly 128 bytes (common_mipi_lcd.c mipi_write()).
  */
 int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 {
@@ -263,10 +293,26 @@ int dpu_dsim_tx(struct dpu_dev *d, u8 type, const u8 *buf, size_t len)
 		d0 = len & 0xff;
 		d1 = (len >> 8) & 0xff;
 		break;
+	case MIPI_DSI_COMPRESSION_MODE:
+		if (!d->pr_active)
+			return -EPERM;
+		if (len != 1)
+			return -EINVAL;
+		d0 = buf[0];
+		break;
+	case MIPI_DSI_PICTURE_PARAMETER_SET:
+		if (!d->pr_active)
+			return -EPERM;
+		if (len != DSIM_PPS_LEN)
+			return -EINVAL;
+		is_long = true;
+		d0 = len & 0xff;
+		d1 = (len >> 8) & 0xff;
+		break;
 	default:
-		return -EINVAL;		/* DSC PRA/PPS, peripheral on/off, ... */
+		return -EINVAL;		/* peripheral on/off, color mode, ... */
 	}
-	if (dcs && dsim_dcs_forbidden(buf[0])) {
+	if (dcs && dsim_dcs_forbidden(d, buf[0])) {
 		pr_err(DPU_PB_PFX "refusing DCS command %#04x\n", buf[0]);
 		return -EPERM;
 	}
