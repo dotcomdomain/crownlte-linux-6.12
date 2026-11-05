@@ -26,6 +26,7 @@
 #include "regs-dpp.h"
 
 #define DPU_PFX			"decon: "
+#define DPU_IOMMU_PFX		"decon iommu: "
 #define DPU_ST_PFX		"decon selftest: "
 #define DPU_MX_PFX		"decon matrix: "
 #define DPU_PB_PFX		"panel-bright: "
@@ -46,9 +47,13 @@
 #define DPU_PMU_DPU_STATUS	0x4024
 #define DPU_PMU_DPU_ON		0xf
 
-/* DPU SysMMU non-secure SFRs (4.9 exynos-iommu.h) */
+/* DPU SysMMU non-secure SFRs (4.9 exynos-iommu.h), read only here */
 #define DPU_SYSMMU_CTRL		0x000
+#define DPU_SYSMMU_CFG		0x004
+#define DPU_SYSMMU_STATUS	0x008
+#define DPU_SYSMMU_PT_BASE	0x00c
 #define DPU_SYSMMU_VERSION	0x034
+#define DPU_SYSMMU_INT_STATUS	0x060
 
 /* DPP-level pixel formats (after dpu_translate_fmt_to_dpp()) */
 #define DPU_FMT_IS_RGB32(f)	((f) <= DECON_PIXEL_FORMAT_BGRX_8888)
@@ -72,14 +77,33 @@
 /* 4.9 enum decon_psr_mode */
 #define DPU_PSR_MIPI_COMMAND	2
 
+struct dpu_dev;
+
+/*
+ * A dma-buf mapped through the DPU SysMMU, kept for later frames
+ * (decon_drv.c dpu_iova_get()). Only with the SysMMU (d->iommu).
+ */
+struct dpu_iova {
+	struct list_head node;		/* d->iova_lru, most recent first */
+	struct dpu_dev *d;
+	struct dma_buf *dmabuf;		/* the cache's own reference */
+	struct dma_buf_attachment *att;
+	struct sg_table *sgt;
+	dma_addr_t addr;		/* one IOVA run */
+	size_t len;
+	u32 nsegs;			/* physical chunks behind it */
+	unsigned int users;		/* commits that hold it (d->iova_lock) */
+};
+
 struct dpu_buf {
 	struct dma_buf *dmabuf;
 	struct dma_buf_attachment *att;
 	struct sg_table *sgt;
-	dma_addr_t addr;		/* 0 = no buffer */
+	dma_addr_t addr;		/* 0 = no buffer; an IOVA with the SysMMU */
 	size_t len;
 	bool bounce;			/* scattered: copied into a decon-pool buffer */
 	u32 nsegs;
+	struct dpu_iova *iova;		/* cached SysMMU mapping (att/sgt unused) */
 };
 
 /* contiguous copy target for scattered buffers until the DPU SysMMU is in */
@@ -120,9 +144,24 @@ struct dpu_dev {
 	void __iomem *dma_regs;			/* DPP IDMA G0..VGF1, 0x1000 apart */
 	void __iomem *dpp_regs;			/* DPP blocks G0..VGF1, 0x1000 apart */
 	void __iomem *dma_com;			/* DPU DMA common */
-	void __iomem *sysmmu[DPU_NR_SYSMMU];
+	void __iomem *sysmmu[DPU_NR_SYSMMU];	/* read-only views */
 	struct regmap *pmu;
 	struct dpu_lcd lcd;
+
+	/*
+	 * DPU SysMMUs through the IOMMU API, opt-in by "iommus" on decon_f.
+	 * NULL: no translation, physically contiguous buffers below 4 GiB
+	 * and bounce copies (the default).
+	 */
+	struct iommu_domain *iommu;
+	bool rpm_held;				/* pm_runtime ref keeps SysMMUs on */
+	spinlock_t trig_lock;			/* HW_SW_TRIG_CONTROL RMW */
+	atomic_t iommu_faults;
+	unsigned long last_fault_iova;
+	u32 fault_trigger_stops;
+	struct mutex iova_lock;			/* the IOVA cache */
+	struct list_head iova_lru;
+	u32 iova_nr, iova_maps, iova_hits, iova_unmaps;
 
 	/* adopted SBoot state */
 	int boot_win, boot_dpp;
@@ -248,6 +287,8 @@ int dpu_hw_channel_to_dpp(u32 ch);
 u32 dpu_hw_dpp_to_channel(u32 dpp);
 u32 dpu_hw_dma_rd(struct dpu_dev *d, int dpp, u32 off);
 void dpu_hw_trigger(struct dpu_dev *d, bool enable);
+void dpu_hw_trigger_restore(struct dpu_dev *d, u32 trig);
+bool dpu_hw_trigger_stop_atomic(struct dpu_dev *d);
 int dpu_hw_wait_shadow(struct dpu_dev *d, unsigned int timeout_us);
 void dpu_hw_update_req(struct dpu_dev *d);
 u32 dpu_hw_dma_active_rd(struct dpu_dev *d, int dpp, u32 off);

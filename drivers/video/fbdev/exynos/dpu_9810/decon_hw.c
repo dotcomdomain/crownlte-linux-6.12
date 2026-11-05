@@ -89,9 +89,40 @@ int dpu_hw_channel_to_dpp(u32 ch)
  */
 void dpu_hw_trigger(struct dpu_dev *d, bool enable)
 {
-	decon_wr_mask(d, HW_SW_TRIG_CONTROL,
-		      enable ? HW_TRIG_EN : HW_TRIG_MASK_DECON,
-		      HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	dpu_hw_trigger_restore(d, enable ? HW_TRIG_EN : HW_TRIG_MASK_DECON);
+}
+
+/*
+ * Write the HW_TRIG_EN / HW_TRIG_MASK_DECON bits of @trig. The read-modify-
+ * write is under trig_lock because the DPU SysMMU fault handler (hard IRQ,
+ * only with the SysMMU) masks the trigger too.
+ */
+void dpu_hw_trigger_restore(struct dpu_dev *d, u32 trig)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&d->trig_lock, flags);
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	spin_unlock_irqrestore(&d->trig_lock, flags);
+}
+
+/*
+ * From the DPU SysMMU fault IRQ: stop TE-triggered frames so that no new
+ * frame fetches a faulting buffer; the frame in progress completes. Returns
+ * true if the trigger was running.
+ */
+bool dpu_hw_trigger_stop_atomic(struct dpu_dev *d)
+{
+	bool was;
+	u32 v;
+
+	spin_lock(&d->trig_lock);
+	v = decon_rd(d, HW_SW_TRIG_CONTROL);
+	was = (v & (HW_TRIG_EN | HW_TRIG_MASK_DECON)) == HW_TRIG_EN;
+	if (was)
+		decon_wr(d, HW_SW_TRIG_CONTROL, (v & ~HW_TRIG_EN) | HW_TRIG_MASK_DECON);
+	spin_unlock(&d->trig_lock);
+	return was;
 }
 
 /* 4.9 decon_reg_wait_for_update_timeout(): 0 once the shadow update latched */
