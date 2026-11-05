@@ -9,6 +9,7 @@ config FB_EXYNOS9810_DPU
 	select DMA_SHARED_BUFFER
 	select SYNC_FILE
 	select FONT_SUPPORT
+	select CRC32
 	help
 	  Port of the Samsung 4.9 dpu_9810 DECON-F fbdev driver for the
 	  Exynos9810 (Galaxy S9/Note9). It adopts the display state left by
