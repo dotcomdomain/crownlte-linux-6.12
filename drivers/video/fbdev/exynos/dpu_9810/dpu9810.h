@@ -156,6 +156,7 @@ struct dpu_dev {
 	struct dpu_bounce bounce[2];
 	int bounce_next;
 	u32 nr_bounces, bounce_max_us, nr_afbc;
+	bool diag_latched;			/* first user commit logged */
 	u32 hwc_ver;
 
 	/* vsync (TE EINT, as 4.9 decon_ext_irq_handler) */

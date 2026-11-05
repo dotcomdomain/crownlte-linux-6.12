@@ -27,6 +27,7 @@
  */
 #include <linux/aperture.h>
 #include <linux/console.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-direct.h>
@@ -45,6 +46,7 @@
 #include <linux/slab.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
+#include <linux/unaligned.h>
 
 #include "dpu9810.h"
 
@@ -518,6 +520,134 @@ out:
 	return ret;
 }
 
+/* ---- content / register diagnostics ----------------------------------- */
+
+/* latched copy of a DECON SFR (4.9 decon_dump(): regs + SHADOW_OFFSET) */
+static u32 decon_rd_shd(struct dpu_dev *d, u32 off)
+{
+	return readl(d->regs + SHADOW_OFFSET + off);
+}
+
+/*
+ * What the DPU is fed: CRC32 of the first 64 KiB of the bounce buffer and,
+ * for AFBC, the 16-byte superblock headers (one per 16x16 block, at the
+ * start of the buffer). AFBC 1.x: the first 32 bits are the payload offset;
+ * offset 0 marks a solid-colour superblock whose colour sits in bytes
+ * 8..15 (all-zero header = solid 0, black/transparent). Reads the
+ * write-combined bounce buffer, so only on sampled frames.
+ */
+static void dpu_diag_content(struct dpu_dev *d, struct dpu_commit *c, int win)
+{
+	const struct decon_win_config *w = &c->cfg[win];
+	const u8 *p = d->bounce[d->bounce_next].vaddr;
+	size_t len = c->buf[win].len, n64 = min_t(size_t, len, SZ_64K), i;
+	u32 crc = crc32_le(~0U, p, n64);
+
+	if (w->compression) {
+		u32 nsb = DIV_ROUND_UP(w->src.f_w, 16) * DIV_ROUND_UP(w->src.f_h, 16);
+		u32 zero = 0, solid = 0, payload = 0, beyond = 0;
+		u64 sum[4] = { };
+		u8 h[16], h0[16] = { }, hm[16] = { };
+
+		nsb = min_t(size_t, nsb, len / 16);
+		for (i = 0; i < nsb; i++) {
+			u32 ofs;
+
+			memcpy(h, p + i * 16, 16);
+			if (!i)
+				memcpy(h0, h, 16);
+			if (i == nsb / 2)
+				memcpy(hm, h, 16);
+			ofs = get_unaligned_le32(h);
+			if (!memchr_inv(h, 0, 16)) {
+				zero++;
+			} else if (!ofs) {
+				solid++;
+				sum[0] += h[8];
+				sum[1] += h[9];
+				sum[2] += h[10];
+				sum[3] += h[11];
+			} else {
+				payload++;
+				if (ofs >= len)
+					beyond++;
+			}
+		}
+		dev_info(d->dev, "diag bounce #%u win%d: AFBC %ux%u, %u headers: %u all-zero, %u solid (mean bytes8-11 %llu %llu %llu %llu), %u payload (%u offsets beyond the buffer); hdr[0] %16ph hdr[mid] %16ph; crc32(first %zu) %08x\n",
+			 d->nr_bounces, win, w->src.f_w, w->src.f_h, nsb, zero, solid,
+			 solid ? sum[0] / solid : 0, solid ? sum[1] / solid : 0,
+			 solid ? sum[2] / solid : 0, solid ? sum[3] / solid : 0,
+			 payload, beyond, h0, hm, n64, crc);
+	} else {
+		size_t nz = 0;
+
+		for (i = 0; i < n64; i++)
+			nz += !!p[i];
+		dev_info(d->dev, "diag bounce #%u win%d: linear, first %zu bytes: %zu non-zero, first 16 %16ph, crc32 %08x\n",
+			 d->nr_bounces, win, n64, nz, p, crc);
+	}
+}
+
+/* window and channel state as programmed (SFR) and as latched (active) */
+static void dpu_diag_regs(struct dpu_dev *d, struct dpu_commit *c, int win, const char *tag)
+{
+	const struct decon_win_config *w = &c->cfg[win];
+	int dpp = w->idma_type < DPU_NR_DPP ? w->idma_type : 0;
+	u32 in = dpu_hw_dma_rd(d, dpp, IDMA_IN_CON);
+	u32 ain = dpu_hw_dma_active_rd(d, dpp, IDMA_IN_CON);
+
+	dev_info(d->dev, "diag %s win%d: state %u pa %d blend %u comp %u fmt %u->dpp %u | DECON SFR/active: DP0 %#x/%#x DP1 %#x/%#x WIN_CTL0 %#x/%#x WIN_CTL1 %#x/%#x START %#x/%#x END %#x/%#x CMAP %#x,%#x/%#x,%#x BG_SIZE %#x/%#x BG_COL %#x,%#x/%#x,%#x\n",
+		 tag, win, w->state, w->plane_alpha, w->blending, w->compression, w->format,
+		 c->dpp_fmt[win],
+		 decon_rd(d, DATA_PATH_CONTROL_0), decon_rd_shd(d, DATA_PATH_CONTROL_0),
+		 decon_rd(d, DATA_PATH_CONTROL_1), decon_rd_shd(d, DATA_PATH_CONTROL_1),
+		 decon_rd(d, WIN_CONTROL_0(win)), decon_rd_shd(d, WIN_CONTROL_0(win)),
+		 decon_rd(d, WIN_CONTROL_1(win)), decon_rd_shd(d, WIN_CONTROL_1(win)),
+		 decon_rd(d, WIN_START_POSITION(win)), decon_rd_shd(d, WIN_START_POSITION(win)),
+		 decon_rd(d, WIN_END_POSITION(win)), decon_rd_shd(d, WIN_END_POSITION(win)),
+		 decon_rd(d, WIN_COLORMAP_0(win)), decon_rd(d, WIN_COLORMAP_1(win)),
+		 decon_rd_shd(d, WIN_COLORMAP_0(win)), decon_rd_shd(d, WIN_COLORMAP_1(win)),
+		 decon_rd(d, BLENDER_BG_IMAGE_SIZE_0), decon_rd_shd(d, BLENDER_BG_IMAGE_SIZE_0),
+		 decon_rd(d, BLENDER_BG_IMAGE_COLOR_0), decon_rd(d, BLENDER_BG_IMAGE_COLOR_1),
+		 decon_rd_shd(d, BLENDER_BG_IMAGE_COLOR_0),
+		 decon_rd_shd(d, BLENDER_BG_IMAGE_COLOR_1));
+	if (w->state != DECON_WIN_STATE_BUFFER)
+		return;
+	dev_info(d->dev, "diag %s win%d: IDMA%d SFR/active IN_CON %#x/%#x (afbc %d/%d, fmt %u/%u) BASE %#x/%#x (want %pad) SRC %#x/%#x IMG %#x/%#x RECOVERY %#x | DPP IN_CON %#x IMG %#x\n",
+		 tag, win, dpp, in, ain, !!(in & IDMA_AFBC_EN), !!(ain & IDMA_AFBC_EN),
+		 (in >> 11) & 0x1f, (ain >> 11) & 0x1f,
+		 dpu_hw_dma_rd(d, dpp, IDMA_IN_BASE_ADDR_Y),
+		 dpu_hw_dma_active_rd(d, dpp, IDMA_IN_BASE_ADDR_Y), &c->buf[win].addr,
+		 dpu_hw_dma_rd(d, dpp, IDMA_SRC_SIZE), dpu_hw_dma_active_rd(d, dpp, IDMA_SRC_SIZE),
+		 dpu_hw_dma_rd(d, dpp, IDMA_IMG_SIZE), dpu_hw_dma_active_rd(d, dpp, IDMA_IMG_SIZE),
+		 dpu_hw_dma_rd(d, dpp, IDMA_RECOVERY_CTRL),
+		 readl(d->dpp_regs + dpp * 0x1000 + DPP_IN_CON),
+		 readl(d->dpp_regs + dpp * 0x1000 + DPP_IMG_SIZE));
+}
+
+/*
+ * Tell "HWC frames are dark" from "the DPU shows black": registers at the
+ * first latched user commit, content + registers for the first 3 bounces
+ * and every 100th after.
+ */
+static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
+{
+	bool first = !d->diag_latched;
+	bool sample = c->bounced && (d->nr_bounces <= 3 || !(d->nr_bounces % 100));
+	int i;
+
+	if (!first && !sample)
+		return;
+	d->diag_latched = true;
+	for (i = 0; i < DECON_MAX_WIN; i++) {
+		if (c->cfg[i].state == DECON_WIN_STATE_DISABLED)
+			continue;
+		dpu_diag_regs(d, c, i, first ? "first HWC latch" : "sample");
+		if (sample && c->buf[i].bounce)
+			dpu_diag_content(d, c, i);
+	}
+}
+
 static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
@@ -537,6 +667,8 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	if (!c->result)
 		c->result = dpu_apply(d, c);
 	d->nr_commits++;
+	if (!c->result && !c->internal)
+		dpu_diag(d, c);		/* before bounce_next moves on */
 	/* the bounce buffer just written is now (or may be) scanned */
 	if (c->bounced && (c->result == 0 || c->result == -ETIMEDOUT))
 		d->bounce_next ^= 1;
