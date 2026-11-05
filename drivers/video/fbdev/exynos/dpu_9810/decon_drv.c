@@ -2733,6 +2733,8 @@ static int dpu_probe(struct platform_device *pdev)
 			d->pb_has_gamma ? "on" : "off");
 		queue_delayed_work(system_long_wq, &d->pb_work,
 				   msecs_to_jiffies(d->pb_at_ms > now ? d->pb_at_ms - now : 0));
+		/* read-only panel status at 5.5 s and 25 s, whenever the brightness runs */
+		dpu_panel_status_schedule(d);
 	} else if (ret != -ENODEV) {
 		dev_warn(dev, "panel-bright disabled: %d\n", ret);
 	}
@@ -2768,7 +2770,7 @@ static void dpu_stop(struct dpu_dev *d)
 {
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
-	cancel_delayed_work_sync(&d->pb_status_work);	/* after pb_work, which queues it */
+	cancel_delayed_work_sync(&d->pb_status_work);	/* re-queues itself; cancel waits */
 	cancel_delayed_work_sync(&d->st_work);
 	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {

@@ -348,22 +348,23 @@ static void pb_status_log(const char *when, const struct pb_status *s)
 	char ee[32], eek[32];
 	u8 pm = s->pm[0];
 
-	if (s->ret) {
+	/* Sol review S1: the keyed EE/EA below are logged whatever this says */
+	if (s->ret)
 		pr_info(DPU_PB_PFX "status %s: %s (%d)\n", when,
 			s->ret == -ENODATA ? "not read" : "read failed", s->ret);
-		return;
-	}
-	pr_info(DPU_PB_PFX "status %s: 0A %*ph (%s: booster %s, idle %s, partial %s, sleep %s, normal %s, display %s) 0E %*ph (TE %s) 05 %#04x (DSI errors) 0F %#04x (OTP load %s) EE %#04x (%s) EA %*ph (flags %#06x CRC %u ECC1 %u ECC2 %u)\n",
-		when, 3, s->pm, pm == 0x9c ? "GOOD" : "not 9c", pm & 0x80 ? "on" : "OFF",
-		pm & 0x40 ? "ON" : "off", pm & 0x20 ? "on" : "off", pm & 0x10 ? "out" : "IN",
-		pm & 0x08 ? "on" : "OFF", pm & 0x04 ? "on" : "OFF", 3, s->sm,
-		s->sm[0] & 0x80 ? "on" : "OFF", s->dsie, s->diag,
-		s->diag & 0x80 ? "ok" : "ERROR", s->ee, pb_ee_str(s->ee, ee, sizeof(ee)),
-		5, s->ea, (s->ea[0] << 8) | s->ea[1], s->ea[2], s->ea[3], s->ea[4]);
+	else
+		pr_info(DPU_PB_PFX "status %s: 0A %*ph (%s: booster %s, idle %s, partial %s, sleep %s, normal %s, display %s) 0E %*ph (TE %s) 05 %#04x (DSI errors) 0F %#04x (OTP load %s) EE %#04x (%s) EA %*ph (flags %#06x CRC %u ECC1 %u ECC2 %u)\n",
+			when, 3, s->pm, pm == 0x9c ? "GOOD" : "not 9c", pm & 0x80 ? "on" : "OFF",
+			pm & 0x40 ? "ON" : "off", pm & 0x20 ? "on" : "off",
+			pm & 0x10 ? "out" : "IN", pm & 0x08 ? "on" : "OFF",
+			pm & 0x04 ? "on" : "OFF", 3, s->sm, s->sm[0] & 0x80 ? "on" : "OFF",
+			s->dsie, s->diag, s->diag & 0x80 ? "ok" : "ERROR", s->ee,
+			pb_ee_str(s->ee, ee, sizeof(ee)), 5, s->ea, (s->ea[0] << 8) | s->ea[1],
+			s->ea[2], s->ea[3], s->ea[4]);
 	if (!s->keyed)
 		return;
 	if (s->ret_k)
-		pr_info(DPU_PB_PFX "status %s, level 2 key: read failed (%d)\n", when, s->ret_k);
+		pr_info(DPU_PB_PFX "status %s, level 2 key: failed (%d)\n", when, s->ret_k);
 	else
 		pr_info(DPU_PB_PFX "status %s, level 2 key: EE %#04x (%s) EA %*ph (flags %#06x CRC %u ECC1 %u ECC2 %u)\n",
 			when, s->ee_k, pb_ee_str(s->ee_k, eek, sizeof(eek)), 5, s->ea_k,
@@ -373,7 +374,7 @@ static void pb_status_log(const char *when, const struct pb_status *s)
 /* later status samples, each in its own short command window */
 static const u32 pb_status_at_ms[] = { 5500, 25000 };
 
-static void pb_status_schedule(struct dpu_dev *d)
+void dpu_panel_status_schedule(struct dpu_dev *d)
 {
 	u64 ms = ktime_to_ms(ktime_get_boottime());
 	u32 at;
@@ -395,10 +396,9 @@ void dpu_panel_status_work(struct work_struct *work)
 	struct dpu_dev *d = container_of(to_delayed_work(work), struct dpu_dev, pb_status_work);
 	u64 ms = ktime_to_ms(ktime_get_boottime());
 	struct pb_status s;
-	bool key_left_on = false;
+	int ret, key_off = 0;
 	char when[24];
 	u32 trig = 0;
-	int ret;
 
 	if (READ_ONCE(d->stopping))
 		return;
@@ -415,18 +415,29 @@ void dpu_panel_status_work(struct work_struct *work)
 	} else {
 		dpu_dsim_clear_status(d);
 		pb_status_read(d, &s);
-		if (d->pb_status_key2 && !pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on))) {
-			pb_status_read_keyed(d, &s);
-			key_left_on = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
+		if (d->pb_status_key2) {
+			/*
+			 * Sol review S2: a failed key on may still have reached
+			 * the panel, so key off follows every key-on attempt.
+			 */
+			ret = pb_write(d, 0, pb_key2_on, sizeof(pb_key2_on));
+			if (ret) {
+				s.keyed = true;
+				s.ret_k = ret;
+			} else {
+				pb_status_read_keyed(d, &s);
+			}
+			key_off = pb_write(d, 0, pb_key2_off, sizeof(pb_key2_off));
 		}
 	}
 	dpu_cmd_window_end(d, trig);
 	pb_status_log(when, &s);
-	if (key_left_on)
-		pr_err(DPU_PB_PFX "status %s: could not send level 2 key off\n", when);
+	if (key_off)
+		pr_err(DPU_PB_PFX "status %s: could not send level 2 key off (%d)\n",
+		       when, key_off);
 next:
 	d->pb_nstatus++;
-	pb_status_schedule(d);
+	dpu_panel_status_schedule(d);
 }
 
 static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status *sa)
@@ -616,7 +627,6 @@ void dpu_panel_bright_work(struct work_struct *work)
 	ret = dpu_cmd_window_begin(d, &trig);
 	if (ret) {
 		pr_err(DPU_PB_PFX "RESULT FAIL: no command window (%d), nothing sent\n", ret);
-		pb_status_schedule(d);
 		return;
 	}
 	t0 = ktime_get();
@@ -628,9 +638,8 @@ void dpu_panel_bright_work(struct work_struct *work)
 	}
 	us = ktime_us_delta(ktime_get(), t0);
 	dpu_cmd_window_end(d, trig);
-	pb_status_log("at 1 s before brightness", &sb);
-	pb_status_log("at 1 s after brightness", &sa);
-	pb_status_schedule(d);		/* read-only samples at 5.5 s and 25 s */
+	pb_status_log("before brightness", &sb);
+	pb_status_log("after brightness", &sa);
 
 	if (!ret)
 		pb_publish(d->pb_target);

@@ -269,6 +269,7 @@ int dpu_dsim_dcs_read(struct dpu_dev *d, u8 cmd, u8 *buf, size_t len);
 int dpu_panel_bright_init(struct dpu_dev *d);
 void dpu_panel_bright_work(struct work_struct *work);
 void dpu_panel_status_work(struct work_struct *work);
+void dpu_panel_status_schedule(struct dpu_dev *d);
 u32 dpu9810_panel_brightness(void);	/* also used by panel_ro.c */
 
 #endif /* __DPU9810_H__ */
