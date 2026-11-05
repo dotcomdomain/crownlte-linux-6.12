@@ -332,6 +332,12 @@ CONFIG_RTC_CLASS=y
 # --- Display core (inert until a DT node exists) ----------------------------
 CONFIG_FB=y
 CONFIG_FB_SIMPLE=y
+# No VT and therefore no fbcon, as in the 4.9 kernel. printk to fbcon runs
+# with IRQs off and a scroll of the 1440x2960 fb0 cost 20-130 ms per line at
+# boot, which stalled the panel command window (trial q46). Kernel messages
+# still go to the serial console, /dev/kmsg and pstore. fb0 is owned by the
+# DPU adopt driver and keeps the SBoot splash untouched.
+# CONFIG_VT is not set
 
 # --- USB gadget functions used by the Android USB HAL / UsbDeviceManager ---
 CONFIG_ANDROID_USB_CONFIGFS_UEVENT=y
