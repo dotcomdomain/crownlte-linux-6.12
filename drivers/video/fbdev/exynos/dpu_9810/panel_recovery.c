@@ -576,6 +576,10 @@ static int pr_window_off_on(struct dpu_dev *d, struct pb_status *sb, struct pb_c
 		*why = "DECON DSC configuration";
 		return ret;
 	}
+	if (!d->pb_has_id || !d->pb_has_gamma) {	/* dpu_panel_recovery_init() requires both */
+		*why = "no DT panel id / HBM gamma cross-check";
+		return -EINVAL;
+	}
 	ret = pb_prepare(d, sb, c);	/* RDDPM, panel id, calibration, keyed EE */
 	if (ret) {
 		*why = "panel state / id / calibration";
@@ -748,8 +752,19 @@ int dpu_panel_recovery_init(struct dpu_dev *d)
 			d->pr_level);
 		goto out;
 	}
-	if (!d->pb_has_id) {
-		dev_err(d->dev, "panel-recovery: needs samsung,panel-id\n");
+	/*
+	 * Sol review R1 #4: the set-bl gamma comes from the panel's B3 read;
+	 * pb_prepare() compares it with DT only when the DT value exists, so
+	 * both cross-checks are mandatory here, with their exact lengths.
+	 */
+	if (!d->pb_has_id || of_property_count_u8_elems(np, "samsung,panel-id") != 3) {
+		dev_err(d->dev, "panel-recovery: needs samsung,panel-id (3 bytes)\n");
+		goto out;
+	}
+	if (!d->pb_has_gamma ||
+	    of_property_count_u8_elems(np, "samsung,hbm-gamma-expect") != PB_HBM_GAMMA_LEN) {
+		dev_err(d->dev, "panel-recovery: needs samsung,hbm-gamma-expect (%d bytes)\n",
+			PB_HBM_GAMMA_LEN);
 		goto out;
 	}
 	if (d->pr_level >= 2 && !of_property_present(np, "samsung,panel-reset-gpios")) {
