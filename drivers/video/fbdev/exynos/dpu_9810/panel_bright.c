@@ -848,17 +848,30 @@ void dpu_panel_alpm_work(struct work_struct *work)
 	 * leaves the display running; cancel_delayed_work_sync() waits for it).
 	 * pb_sequence() itself refuses unless RDDPM shows normal display.
 	 */
+	/*
+	 * Sol review R2: the whole exit table again (bounded) until it went out
+	 * without an error and RDDPM confirms normal display (sleep out,
+	 * normal, display on, no idle/partial: the pb_sequence() check). The
+	 * first error is kept for the report.
+	 */
+	ret_exit = 0;
 	for (tries = 0; tries < 5; tries++) {
-		ret_exit = pb_alpm_window(d, pb_alpm_exit, ARRAY_SIZE(pb_alpm_exit), true, NULL,
-					  &pm_out, &n_out);
-		if (n_out)		/* the exit went out (or was tried): done */
+		int r;
+
+		pm_out = 0;
+		r = pb_alpm_window(d, pb_alpm_exit, ARRAY_SIZE(pb_alpm_exit), true, NULL,
+				   &pm_out, &n_out);
+		if (r && !ret_exit)
+			ret_exit = r;
+		if (!r && (pm_out & 0x7c) == 0x1c)
 			break;
-		/* no command window / DSIM not ready: nothing sent, try again */
-		pr_err(DPU_PB_PFX "alpm exit: nothing sent (%d), retry %d\n", ret_exit, tries + 1);
+		pr_err(DPU_PB_PFX "alpm exit try %d: %d, %d/%zu packets attempted, RDDPM %#04x%s\n",
+		       tries + 1, r, n_out, ARRAY_SIZE(pb_alpm_exit), pm_out,
+		       tries < 4 ? ", again" : ", giving up");
 		msleep(20);
 	}
-	pr_info(DPU_PB_PFX "alpm exit: %d, %d/%zu packets attempted, RDDPM %#04x (idle %s)\n",
-		ret_exit, n_out, ARRAY_SIZE(pb_alpm_exit), pm_out, pm_out & 0x40 ? "ON" : "off");
+	pr_info(DPU_PB_PFX "alpm exit: first error %d, %d tries, RDDPM %#04x (idle %s)\n",
+		ret_exit, min(tries + 1, 5), pm_out, pm_out & 0x40 ? "ON" : "off");
 	if (!dpu_cmd_window_begin(d, &trig)) {
 		ret_bl = dpu_dsim_check(d);
 		if (!ret_bl) {
