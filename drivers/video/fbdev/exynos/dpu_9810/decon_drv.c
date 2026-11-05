@@ -726,7 +726,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 				  c->cfg[i].state != DECON_WIN_STATE_DISABLED);
 
 	dpu_hw_update_req(d);
-	dpu_hw_trigger(d, true);
+	dpu_hw_trigger_commit(d);	/* also ends a SysMMU fault inhibit */
 	t0 = ktime_get();
 	ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
 	c->latch_us = ktime_us_delta(ktime_get(), t0);
@@ -1391,6 +1391,20 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	 */
 	mutex_lock(&d->hw_lock);
 	ret = dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US);
+	/*
+	 * SysMMU only: a fault masked the trigger while an update waited for
+	 * it, so it can never latch and every later frame would stop here
+	 * (dpu_apply() and its unmask are never reached). Let that update
+	 * latch with one controlled unmask. Its buffers stay mapped: it is
+	 * d->active (requested, timed out), and the frame before it stays on
+	 * d->stale until the latch is seen below. A new fault after the
+	 * latch masks the trigger again; the commit then replaces the frame.
+	 */
+	if (ret && dpu_hw_trigger_fault_unmask(d)) {
+		ret = dpu_hw_wait_shadow(d, DPU_LATCH_US);
+		dev_warn(d->dev, DPU_IOMMU_PFX "pending shadow update held by a SysMMU fault mask: one unmask, %s (recovery #%u)\n",
+			 ret ? "still pending" : "latched", d->fault_recoveries);
+	}
 	mutex_unlock(&d->hw_lock);
 	if (ret) {
 		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");

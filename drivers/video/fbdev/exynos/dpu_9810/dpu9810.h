@@ -156,9 +156,15 @@ struct dpu_dev {
 	struct iommu_domain *iommu;
 	bool rpm_held;				/* pm_runtime ref keeps SysMMUs on */
 	spinlock_t trig_lock;			/* HW_SW_TRIG_CONTROL RMW */
+	/*
+	 * Set by a SysMMU fault (trig_lock): the TE trigger stays masked
+	 * until a commit unmasks it (dpu_hw_trigger_commit()); command
+	 * window and other restores keep it masked.
+	 */
+	bool trig_fault_inhibit;
 	atomic_t iommu_faults;
 	unsigned long last_fault_iova;
-	u32 fault_trigger_stops;
+	u32 fault_trigger_stops, fault_inhibit_holds, fault_recoveries;
 	struct mutex iova_lock;			/* the IOVA cache */
 	struct list_head iova_lru;
 	u32 iova_nr, iova_maps, iova_hits, iova_unmaps;
@@ -288,6 +294,8 @@ u32 dpu_hw_dpp_to_channel(u32 dpp);
 u32 dpu_hw_dma_rd(struct dpu_dev *d, int dpp, u32 off);
 void dpu_hw_trigger(struct dpu_dev *d, bool enable);
 void dpu_hw_trigger_restore(struct dpu_dev *d, u32 trig);
+void dpu_hw_trigger_commit(struct dpu_dev *d);
+bool dpu_hw_trigger_fault_unmask(struct dpu_dev *d);
 bool dpu_hw_trigger_stop_atomic(struct dpu_dev *d);
 int dpu_hw_wait_shadow(struct dpu_dev *d, unsigned int timeout_us);
 void dpu_hw_update_req(struct dpu_dev *d);
