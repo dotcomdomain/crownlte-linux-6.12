@@ -540,15 +540,17 @@ static int pb_sequence(struct dpu_dev *d, struct pb_status *sb, struct pb_status
 	n = pb_build(pkt, gamma, et1);
 	pb_dbg("sending the 4.9 PANEL_SET_BL_SEQ for %u (%d packets)\n",
 		d->pb_target, n);
+	/* packet 0 is the key on: from its attempt on, key off is owed */
+	key2 = true;
 	for (i = 0; i < n; i++) {
 		pb_dbg("step %d/%d: %s\n", i + 1, n, pkt[i].what);
 		ret = pb_write(d, pkt[i].ofs, pkt[i].data, pkt[i].len);
 		if (ret)
 			break;
-		key2 = (i < n - 1);
 	}
 	if (ret)
 		goto fail;
+	key2 = false;			/* the last packet was the key off */
 
 	/* 5. read back (diagnostic only); key off after every key-on attempt */
 	key2 = true;
