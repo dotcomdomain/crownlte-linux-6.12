@@ -138,15 +138,20 @@
 	/*
 	 * SBoot DECON-F scanout handover helper. Read-only unless
 	 * samsung,decon-trigger is set (see the delayed-UFS diagnostic).
-	 * DECON-F 0x16030000; DPP IDMA G0..VGF1 0x16021000..0x16026fff;
+	 * DECON-F 0x16030000; DPP blocks G0..VGF1 0x16021000..0x16026fff
+	 * (4.9 dpp reg[0]: IN_CON/IMG_SIZE cross-check only); IDMA G0..VGF1
+	 * 0x16071000..0x16076fff (4.9 dpp reg[1]: format, sizes and
+	 * IN_BASE_ADDR_Y, which SBoot sets to 0xcc000000);
 	 * sysmmu_dpu0..2 non-secure SFRs (read only, bypass check).
 	 */
 	decon_handover: display-handover@16030000 {
 		compatible = "samsung,exynos9810-decon-handover";
 		reg = <0x16030000 0x10000>, <0x16021000 0x6000>,
+		      <0x16071000 0x6000>,
 		      <0x160a0000 0x1000>, <0x160b0000 0x1000>,
 		      <0x160c0000 0x1000>;
-		reg-names = "decon", "dpp", "sysmmu0", "sysmmu1", "sysmmu2";
+		reg-names = "decon", "dpp", "dpp-dma",
+			    "sysmmu0", "sysmmu1", "sysmmu2";
 		samsung,pmu-syscon = <&pmu_system_controller>;
 		samsung,simplefb = <&sboot_fb>;
 	};

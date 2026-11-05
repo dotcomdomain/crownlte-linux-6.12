@@ -1,12 +1,31 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 config FB_EXYNOS9810_DPU
-	bool "Exynos9810 DPU (DECON-F/DPP/DSIM) fbdev driver (work in progress)"
-	depends on FB && OF && ARM64
+	bool "Exynos9810 DPU (DECON-F/DPP) fbdev driver, adopt mode"
+	depends on FB && OF && ARM64 && MFD_SYSCON
 	depends on ARCH_EXYNOS || COMPILE_TEST
+	select FB_IOMEM_HELPERS
+	select APERTURE_HELPERS
+	select DMA_SHARED_BUFFER
+	select SYNC_FILE
+	select FONT_SUPPORT
 	help
-	  Port of the Samsung 4.9 dpu_9810 fbdev driver (DECON, DPP, DSIM)
-	  with the ioctl ABI used by the Exynos vendor HWC. The port is in
-	  progress: at present only the ioctl ABI definitions and their
-	  compile-time checks are built. See
-	  Documentation/crownlte/display-port.md.
+	  Port of the Samsung 4.9 dpu_9810 DECON-F fbdev driver for the
+	  Exynos9810 (Galaxy S9/Note9). It adopts the display state left by
+	  the bootloader (DECON, DSIM and panel keep running untouched),
+	  registers /dev/graphics/fb0 with the ioctl ABI of the vendor HWC,
+	  vsync from the panel TE line, and applies window configurations
+	  through the DPP channels for physically contiguous buffers.
+	  It does not control panel power, clocks or timing.
+	  Opt-in by device tree, it can send the one S6E3HA8 brightness
+	  sequence the owner's 4.9 kernel uses (44700) through DSIM0.
+	  See Documentation/crownlte/display-port.md and
+	  Documentation/crownlte/panel-brightness.md.
+
+config FB_EXYNOS9810_PANEL_RO
+	bool "Read-only \"panel\" backlight for the Galaxy Note9"
+	depends on OF && BACKLIGHT_CLASS_DEVICE=y
+	help
+	  Registers the backlight class device "panel" that the vendor
+	  light HAL expects, mirroring the bootloader brightness and refusing
+	  changes until the S6E3HA8 panel driver is ported.

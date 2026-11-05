@@ -256,6 +256,41 @@
 			};
 		};
 
+		/*
+		 * DPU System MMUs (4.9 sysmmu_dpu0..2). The 4.9 driver uses the
+		 * SysMMU v7 non-VM register layout (PT_BASE 0x0c, flush 0x10-0x24,
+		 * fault 0x70/0x78, CAPA0/1 0x870/0x874) that mainline
+		 * exynos-iommu calls sysmmu_v7_variant. Ports: dpu0 VGRF/VGF,
+		 * dpu1 G0/VG0, dpu2 G1/VG1/WB. Interrupt 0 is the non-secure
+		 * fault IRQ (4.9 index 1 = secure, not used here). The secure
+		 * SFR blocks (0x160d0000, 0x160e0000, 0x160f0000) must not be
+		 * touched from the kernel.
+		 * Disabled: see Documentation/crownlte/display-iommu.md.
+		 */
+		sysmmu_dpu0: sysmmu@160a0000 {
+			compatible = "samsung,exynos-sysmmu";
+			reg = <0x160a0000 0x9000>;
+			interrupts = <GIC_SPI 211 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <0>;
+			status = "disabled";
+		};
+
+		sysmmu_dpu1: sysmmu@160b0000 {
+			compatible = "samsung,exynos-sysmmu";
+			reg = <0x160b0000 0x9000>;
+			interrupts = <GIC_SPI 213 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <0>;
+			status = "disabled";
+		};
+
+		sysmmu_dpu2: sysmmu@160c0000 {
+			compatible = "samsung,exynos-sysmmu";
+			reg = <0x160c0000 0x9000>;
+			interrupts = <GIC_SPI 215 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <0>;
+			status = "disabled";
+		};
+
 		pinctrl_aud: pinctrl@17c60000 {
 			compatible = "samsung,exynos9810-pinctrl";
 			reg = <0x17c60000 0x1000>;

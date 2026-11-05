@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Display stage 2 diagnostic: the delayed-UFS diagnostic plus the DECON-F
+ * adopt-mode fbdev driver (fb0 with the vendor HWC ioctls, vsync from the
+ * panel TE line, window configurations through DPP) and its buffer-flip
+ * self-test.
+ *
+ * The stage 1 handover helper is disabled here. The DECON driver performs
+ * the same checks (PMU DPU domain on, SBoot window scanning 0xcc000000,
+ * DPU SysMMUs in bypass, command mode) and the same TE trigger unmask.
+ * It then reprograms SBoot's window and DPP the way 4.9 sets up its fb0
+ * window, and from then on only programs DPP/window registers for
+ * S3CFB_WIN_CONFIG. It never touches power, clocks, DSIM, the PHY, the
+ * panel or timing.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + display stage 2";
+
+	/*
+	 * Root-level node: the vendor HWC opens the literal paths
+	 * /sys/devices/platform/16030000.decon_f/{vsync,psr_info}.
+	 */
+	decon_f: decon_f@16030000 {
+		compatible = "samsung,exynos9810-decon";
+		/*
+		 * 4.9 DT dpp@16021000: reg[0] = DPP block 0x16021000 (dpp_read),
+		 * reg[1] = IDMA 0x16071000 (dma_read), reg[2] = DMA common
+		 * 0x16070000. SBoot writes IN_BASE_ADDR_Y at 0x16071040.
+		 */
+		reg = <0 0x16030000 0x10000>,	/* DECON-F */
+		      <0 0x16071000 0x6000>,	/* IDMA G0..VGF1 (base, fmt, sizes) */
+		      <0 0x16021000 0x6000>,	/* DPP blocks G0..VGF1 (CSC, scaler) */
+		      <0 0x16070000 0x1000>,	/* DPU DMA common */
+		      <0 0x160a0000 0x1000>,	/* sysmmu_dpu0..2, read only */
+		      <0 0x160b0000 0x1000>,
+		      <0 0x160c0000 0x1000>;
+		reg-names = "decon", "dpp-dma", "dpp", "dma-common",
+			    "sysmmu0", "sysmmu1", "sysmmu2";
+		/* 4.9: frame start, frame done, extra (not requested yet), TE gpd0-0 */
+		interrupts-extended = <&gic GIC_SPI 182 IRQ_TYPE_LEVEL_HIGH>,
+				      <&gic GIC_SPI 183 IRQ_TYPE_LEVEL_HIGH>,
+				      <&gic GIC_SPI 188 IRQ_TYPE_LEVEL_HIGH>,
+				      <&gpd0 0 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "frame_start", "frame_done", "extra", "te";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,boot-fb = <&sboot_fb>;
+		memory-region = <&decon_pool>;
+		samsung,decon-trigger = "hw-te";
+		samsung,fb-takeover;
+		/* 4.9 s6e3ha8_ddi: 60 Hz, 69x142 mm, DSC 2 slices of 720x40 */
+		samsung,lcd-fps = <60>;
+		samsung,lcd-width-mm = <69>;
+		samsung,lcd-height-mm = <142>;
+		samsung,dsc-enabled;
+		samsung,dsc-slice-width = <720>;
+		samsung,dsc-slice-height = <40>;
+		/* ~108 s: flip fb0's window between two CMA buffers 20 times */
+		samsung,decon-selftest;
+	};
+
+	/* /sys/devices/platform/panel_drv@001/backlight/panel, read only */
+	panel_drv@001 {
+		compatible = "samsung,exynos9810-panel-readonly";
+		samsung,boot-brightness = <12800>;
+		samsung,max-brightness = <44700>;
+	};
+};
+
+&{/reserved-memory} {
+	/* contiguous buffers for DECON below 4 GiB (IDMA base is 32 bit) */
+	decon_pool: decon-pool {
+		compatible = "shared-dma-pool";
+		reusable;
+		size = <0x3000000>;
+		alloc-ranges = <0 0x80000000 0x7fffffff>;
+	};
+};
+
+&decon_handover {
+	status = "disabled";
+};
