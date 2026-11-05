@@ -702,10 +702,13 @@ static struct dpu_commit *dpu_build_commit(struct dpu_dev *d,
  * controlled unmasks (commits and command windows together), each followed
  * by a wait of up to DPU_LATCH_US. A fault after the latch masks the
  * trigger again; the next commit replaces the frame. If the update still
- * does not latch, DECON is quiesced: the trigger stays masked (logged once)
- * until a commit with a different buffer set replaces the held update
- * (dpu_commit_fresh()). Nothing is freed here: the held frame is
- * d->active and the frame before it stays on d->stale until a latch.
+ * does not latch, DECON is quiesced (logged once): the trigger stays
+ * masked and every commit and command window gets -EBUSY until a latch is
+ * seen here or the driver stops; the command-mode panel keeps its last
+ * GRAM frame. No register is rewritten while that update is pending (4.9
+ * __decon_update_regs() also aborts until shadow requests have cleared).
+ * Nothing is freed here: the held frame is d->active and the frame before
+ * it stays on d->stale, mapped, until a latch.
  */
 static int dpu_pending_resolve(struct dpu_dev *d, const char *who)
 {
@@ -727,7 +730,7 @@ static int dpu_pending_resolve(struct dpu_dev *d, const char *who)
 	if (d->fault_tries >= DPU_FAULT_TRIES) {
 		d->fault_quiesced = true;
 		d->fault_quiesces++;
-		dev_err(d->dev, DPU_IOMMU_PFX "%s: update #%u still held after %u unmasks: quiesced, TE trigger masked until a commit with other buffers\n",
+		dev_err(d->dev, DPU_IOMMU_PFX "%s: update #%u still held after %u unmasks: quiesced, TE trigger masked, commits and command windows refused until it latches\n",
 			who, d->update_seq, DPU_FAULT_TRIES);
 		return -EBUSY;
 	}
@@ -741,37 +744,7 @@ static int dpu_pending_resolve(struct dpu_dev *d, const char *who)
 	return ret ? -EBUSY : 0;
 }
 
-/*
- * Quiesced (hw_lock held): @c may replace the held update if it scans a
- * different buffer set and needs no bounce copy (both slots of a bounced
- * window may still be referenced while an update is held).
- */
-static bool dpu_commit_fresh(struct dpu_dev *d, const struct dpu_commit *c)
-{
-	const struct dpu_commit *h = d->active;
-	bool same = !!h;
-	int i;
-
-	for (i = 0; i < DECON_MAX_WIN; i++) {
-		bool on = c->cfg[i].state == DECON_WIN_STATE_BUFFER;
-
-		if (on && c->buf[i].bounce)
-			return false;
-		if (!h)
-			continue;
-		if (on != (h->cfg[i].state == DECON_WIN_STATE_BUFFER) ||
-		    (on && c->buf[i].addr != h->buf[i].addr))
-			same = false;
-	}
-	return !same;
-}
-
-/*
- * @fresh: quiesced, @c replaces a held update (dpu_commit_fresh()): the
- * trigger is masked, so no frame starts and the shadow registers can be
- * rewritten although the old request is still pending.
- */
-static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c, bool fresh)
+static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 {
 	ktime_t t0;
 	int i, ret;
@@ -782,7 +755,7 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c, bool fresh)
 		goto out;
 	}
 	/* 4.9: the previous shadow update must have latched */
-	if (!fresh && dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
+	if (dpu_hw_wait_shadow(d, DPU_SHADOW_PRE_US)) {
 		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped\n");
 		ret = -EBUSY;		/* nothing programmed */
 		goto out;
@@ -1443,7 +1416,7 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
 	LIST_HEAD(txt);
-	bool fresh;
+	bool quiesced;
 	int i, ret;
 
 	/*
@@ -1476,16 +1449,12 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 	mutex_lock(&d->hw_lock);
 	/* SysMMU: also the bounded recovery of an update a fault mask holds */
 	ret = dpu_pending_resolve(d, "commit");
-	fresh = ret && d->fault_quiesced && dpu_commit_fresh(d, c);
-	if (fresh) {
-		d->fault_fresh++;
-		dev_warn(d->dev, DPU_IOMMU_PFX "quiesced: a commit with other buffers replaces held update #%u\n",
-			 d->update_seq);
-		ret = 0;
-	}
+	quiesced = d->fault_quiesced;
 	mutex_unlock(&d->hw_lock);
 	if (ret) {
-		dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");
+		/* quiesced: logged once by dpu_pending_resolve() */
+		if (!quiesced)
+			dev_warn_ratelimited(d->dev, "previous shadow update still pending, frame skipped before any copy\n");
 		c->result = -EBUSY;
 	} else {
 		struct dpu_commit *p, *n;
@@ -1498,16 +1467,13 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		 * reclaim (Sol review S4: otherwise two 17.3 MB slots could stay
 		 * pinned until another commit succeeded).
 		 */
-		/* (not when replacing a held update: nothing has latched yet) */
-		if (!fresh) {
-			list_for_each_entry_safe(p, n, &d->stale, node) {
-				list_del(&p->node);
-				dpu_commit_free(p);
-			}
+		list_for_each_entry_safe(p, n, &d->stale, node) {
+			list_del(&p->node);
+			dpu_commit_free(p);
 		}
 		c->result = dpu_bounce(d, c);
 		if (!c->result)
-			c->result = dpu_apply(d, c, fresh);
+			c->result = dpu_apply(d, c);
 	}
 	d->nr_commits++;
 	if (!c->result && !c->internal && !READ_ONCE(d->stopping))

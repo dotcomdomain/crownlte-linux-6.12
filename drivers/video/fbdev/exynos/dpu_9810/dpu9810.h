@@ -170,7 +170,7 @@ struct dpu_dev {
 	u32 fault_try_seq;			/* update the tries count for */
 	u8 fault_tries;
 	bool fault_quiesced;			/* tries used up, trigger stays masked */
-	u32 fault_quiesces, fault_fresh;
+	u32 fault_quiesces;
 	u32 trig_boot;				/* trigger before the fault handler */
 	struct mutex iova_lock;			/* the IOVA cache */
 	struct list_head iova_lru;
