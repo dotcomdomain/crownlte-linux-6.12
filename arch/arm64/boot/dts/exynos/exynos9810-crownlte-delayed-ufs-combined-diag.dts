@@ -60,7 +60,7 @@
 
 /* q42 sequence, 3 s later than the bright DTB (after the cpuidle test). */
 &{/panel_drv@001} {
-	samsung,fault-display-brightness-at-ms = <99000>;
+	samsung,fault-display-brightness-at-ms = <1000>;
 };
 
 /* Explicitly off, whatever the included files say. */
