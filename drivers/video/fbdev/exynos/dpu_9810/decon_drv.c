@@ -2626,14 +2626,19 @@ static int dpu_iommu_check_identity(struct dpu_dev *d)
  */
 static int dpu_iommu_enable(struct dpu_dev *d)
 {
-	unsigned int want = dpu_sysmmu_present(d), before, after;
+	unsigned int want = BIT(DPU_NR_SYSMMU) - 1, before, after;
 	bool masked = false;
 	u32 trig, fc0;
 	int ret;
 
+	if (dpu_sysmmu_present(d) != want) {
+		dev_err(d->dev, DPU_IOMMU_PFX "SysMMU views %#x of %#x: cannot verify translation, refusing\n",
+			dpu_sysmmu_present(d), want);
+		return -ENODEV;
+	}
 	before = dpu_sysmmu_enabled(d);
 	trig = decon_rd(d, HW_SW_TRIG_CONTROL);
-	if (want && before == want) {
+	if (before == want) {
 		dev_info(d->dev, DPU_IOMMU_PFX "SysMMUs %#x already translating at probe (enabled by the domain attach, after the identity map)\n",
 			 before);
 	} else if ((trig & (HW_TRIG_EN | HW_TRIG_MASK_DECON)) == HW_TRIG_EN) {
@@ -2654,9 +2659,7 @@ static int dpu_iommu_enable(struct dpu_dev *d)
 
 	after = dpu_sysmmu_enabled(d);
 	dpu_sysmmu_dump(d, "after runtime resume");
-	if (!want) {
-		dev_warn(d->dev, DPU_IOMMU_PFX "no SysMMU views: cannot verify that translation is on\n");
-	} else if (after != want) {
+	if (after != want) {
 		dev_err(d->dev, DPU_IOMMU_PFX "SysMMUs %#x of %#x translating: IOVAs would be fetched as physical addresses, refusing\n",
 			after, want);
 		pm_runtime_put_sync(d->dev);
@@ -2685,6 +2688,54 @@ static void dpu_iommu_release(struct dpu_dev *d)
 	}
 }
 
+/* sysmmu_dpu0..2 non-secure SFR bases (4.9 DT) */
+static const resource_size_t dpu_sysmmu_base[DPU_NR_SYSMMU] = {
+	0x160a0000, 0x160b0000, 0x160c0000,
+};
+
+/*
+ * The DPPs sit behind all three DPU SysMMUs (dpu0 VGRF/VGF, dpu1 G0/VG0,
+ * dpu2 G1/VG1/WB). With IOVAs a channel behind a SysMMU that is not ours
+ * would fetch them as physical addresses, so "iommus" must name exactly
+ * these three, each once, and DECON needs a view of each to verify them.
+ */
+static int dpu_iommu_check_controllers(struct dpu_dev *d)
+{
+	struct device_node *np = d->dev->of_node;
+	unsigned int seen = 0;
+	int n, i, j, ret;
+
+	n = of_count_phandle_with_args(np, "iommus", "#iommu-cells");
+	if (n != DPU_NR_SYSMMU) {
+		dev_err(d->dev, DPU_IOMMU_PFX "\"iommus\" lists %d SysMMUs, the DPU needs sysmmu_dpu0..2: refusing\n",
+			n);
+		return -ENODEV;
+	}
+	for (i = 0; i < n; i++) {
+		struct of_phandle_args args;
+		struct resource res;
+
+		ret = of_parse_phandle_with_args(np, "iommus", "#iommu-cells", i, &args);
+		if (ret)
+			return -ENODEV;
+		ret = of_address_to_resource(args.np, 0, &res);
+		of_node_put(args.np);
+		if (ret)
+			return -ENODEV;
+		for (j = 0; j < DPU_NR_SYSMMU; j++)
+			if (res.start == dpu_sysmmu_base[j])
+				break;
+		if (j == DPU_NR_SYSMMU || (seen & BIT(j)) || !d->sysmmu[i]) {
+			dev_err(d->dev, DPU_IOMMU_PFX "iommus[%d] at %pa: %s, refusing\n", i, &res.start,
+				j == DPU_NR_SYSMMU ? "not a DPU SysMMU" :
+				(seen & BIT(j)) ? "listed twice" : "no read-only view");
+			return -ENODEV;
+		}
+		seen |= BIT(j);
+	}
+	return 0;
+}
+
 /*
  * "iommus" in DT gives decon_f a DMA domain whose page table already holds
  * the boot framebuffer identity map. Anything else (no "iommus", or a
@@ -2703,6 +2754,15 @@ static int dpu_iommu_init(struct dpu_dev *d)
 			 dom->type);
 		return 0;
 	}
+	/*
+	 * Refusing means failing the probe: decon_f's DMA ops are iommu-dma
+	 * now, so even the bounce path hands out IOVAs. The driver core then
+	 * drops the SysMMUs (bypass) and SBoot's scanout of 0xcc000000 goes
+	 * on; the DTB without "iommus" is the fallback.
+	 */
+	ret = dpu_iommu_check_controllers(d);
+	if (ret)
+		return ret;
 	d->iommu = dom;
 	/* one IOVA run per buffer: iommu-dma merges the whole sg_table */
 	dma_set_max_seg_size(d->dev, UINT_MAX);
