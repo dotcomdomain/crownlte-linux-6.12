@@ -98,6 +98,9 @@ stage 1 instead pops one event per interrupt until the backlog fits).
 
 ## Power-on sequence needed later (stage 2)
 
+Implemented, DT opt-in (`samsung,acpm-touch-power` + S2MPS18 `samsung,touch-rail-update`):
+see `power-gates.md`.
+
 4.9 `sec_ts_power()` (`TS/sec_ts.c:1715-1775`): enable `tsp_io` (LDO35, 1.8 V),
 wait 1 ms, enable `tsp_avdd` (LDO43, 3.0 V); off is the reverse with 4 ms between.
 After power-on, 70 ms (`TS/sec_ts.c:3450-3451`) then `sec_ts_wait_for_ready()` for
