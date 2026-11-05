@@ -26,8 +26,11 @@ of that cycle once, with the rails and the DSIM link left on.
 | `samsung,panel-recovery-only-on-elvdd-error` | optional. Runs only when the keyed `EE` read before shows bit 3. By default the recovery runs regardless. |
 | `samsung,panel-reset-gpios = <&gpa3 4 0>` | level 2 only. Must resolve to gpa3-4 of `pinctrl@14050000` |
 
-Requirements: `samsung,fault-display-brightness = <44700>` (the set-bl
-sequence comes from `panel_bright.c`) and `samsung,panel-id`.
+Requirements (Sol review R1 #4): `samsung,fault-display-brightness = <44700>`
+(the set-bl sequence comes from `panel_bright.c`), `samsung,panel-id`
+(exactly 3 bytes) and `samsung,hbm-gamma-expect` (exactly 34 bytes). Without
+them both levels are refused at probe, and the work checks again before
+the first write.
 
 DTBs (gekko `panel-bright-work/dtb/`, built from
 `exynos9810-crownlte-romram-v18.dtb` by decompiling and adding the properties):
@@ -77,8 +80,11 @@ each key goes 0 → 1 → 0, so every key packet is sent. The COPR table uses
 
 ## Packet list (in order; all levels)
 
-Window 1 is one DECON command window (`dpu_cmd_window_begin`: TE trigger
-masked, no frame in flight).
+The recovery takes `hw_lock` once (`dpu_cmd_window_begin`: TE trigger
+masked, no frame in flight) and keeps it until the status read (Sol review
+R1 #2). In between, `dpu_cmd_window_pause()` lets frames run while commits
+stay blocked, and `dpu_cmd_window_resume()` masks the trigger again with a
+bounded wait. The resume does not depend on a shadow update completing.
 
 ### 0. Preconditions (read only; on refusal nothing but the reads below is sent)
 
@@ -96,6 +102,7 @@ masked, no frame in flight).
    5. HBM gamma must match DT `samsung,hbm-gamma-expect`, and F4 must start with EB.
 4. Optional: the keyed `EE` must have bit 3 set.
 5. Level 2: the reset GPIO descriptor must be gpa3 (gpio_chip label) pin 4 of the device at 0x14050000. The read-only `ioremap` of CON 0x14050080 / DAT 0x14050084 must show CON[19:16] = 1 (output) and DAT bit 4 = 1. `gpiod_get_raw_value()` must be 1.
+6. Level 2, LP-11 trial (Sol review R1 #1): `dpu_dsim_enter_lp11()` then `dpu_dsim_leave_lp11()` must both succeed (see section 3). Otherwise level 2 is refused before display off.
 
 ### 1. Display off: `crown_a3_s0_display_off_cmdtbl`, PNL:1359-1363
 
@@ -124,10 +131,22 @@ masked, no frame in flight).
 
 ### 3. Level 2 only: reset pulse (`__set_panel_power`, DRV:119-160)
 
-1. gpa3-4 low: `gpiod_set_raw_value(0)`, which is a DAT read-modify-write of bit 4. Readback: CON unchanged, the other output pins of gpa3 unchanged, bit 4 = 0.
-2. Wait 10 ms (the 10 ms after the rails come on).
-3. gpa3-4 high, with the same readback.
-4. Wait 5 ms.
+4.9 drives reset only after `_dsim_disable()` → `dsim_reg_stop()` has stopped
+the DSIM (first step `dsim_reg_set_hs_clock(0)`, dsim_reg.c:1952-1966 and
+2206-2223). It re-initialises the link to LP-11 in `_dsim_enable()` before
+the init table. Here the link stays configured, so the reset is guarded (Sol
+review R1 #1):
+
+1. **Skip if the exit had errors.** If display off or exit had any transmit error, the pulse is skipped and the level 1 path continues (`reset SKIPPED`).
+2. **Stop the HS clock.** `dpu_dsim_enter_lp11()` clears `CLK_CTRL.TX_REQUEST_HSCLK` (bit 20). It then waits up to 10 ms (4.9 `dsim_reg_wait_hs_clk_disable()`: 1000 × 10 µs) for `DPHY_STATUS` stop state on the clock lane (bit 8) and on every data lane enabled in `CONFIG.LANES_EN` (bits 3:0).
+3. **Re-check right before reset goes low.** The reset pin must still be an output driven high. `dpu_dsim_lp11_check()` must pass: HS clock not requested, clock and data lanes in stop state, no ULPS / forced stop / forced BTA, PLL stable, SFR FIFOs empty. If any of this fails, the pulse is skipped (level 1 path).
+4. **Reset low.** `gpiod_set_raw_value(0)` is a DAT read-modify-write of bit 4. Readback: CON unchanged, the other output pins of gpa3 unchanged, bit 4 = 0.
+5. **Wait 10 ms** (the 10 ms after the rails come on).
+6. **Reset high,** with the same readback.
+7. **Wait 5 ms.** Then the LP-11 state is logged again.
+8. **Restore the HS clock.** `dpu_dsim_leave_lp11()` sets `TX_REQUEST_HSCLK` again. For a continuous clock lane (`CLK_CTRL` bit 25 clear), it waits up to 10 ms for `TX_READY_HS_CLK` (bit 10), as 4.9 `dsim_reg_set_hs_clock(1)` does.
+
+`CLK_CTRL` bit 20 is the only DSIM configuration bit this driver ever writes.
 
 ### 4. Init: `crown_a3_s0_init_cmdtbl`, PNL:1224-1260
 
@@ -159,7 +178,7 @@ masked, no frame in flight).
 | 32 | `B0 03` then `F6 43` | ISC, PNL:827, packet offset 3 at PNL:1125 |
 | 33 | `C2 09 00 D8 D8 F4 F4` | EDGE_DIMMING, PNL:829 |
 | 34 | `F0 A5 A5` | KEY2 off |
-| 35-49 | PANEL_SET_BL_SEQ for 44700 (15 packets) | `panel_bright.c` `pb_build()`. The set-bl table is listed in panel-brightness.md (F0 5A 5A, CA <gamma>, B1 00 0C, B5 19 DC 00, B0 16/B5 <et1>, F4 EB 26, B4 00 55 80 65 26 26, B0 0F/B4 20, 55 02, B0 12/B8 <IRC>, B8 15, B0 06/B1 <POC1>, B0 53/B8 00 00, F7 03, F0 A5 A5) |
+| 35-49 | PANEL_SET_BL_SEQ for 44700 (15 packets) | `panel_bright.c` `pb_build()`, sent with `pb_send_bl(..., all = true)`: after an error every remaining packet is still tried and the key off is re-sent (Sol review R1 #3). The set-bl table is listed in panel-brightness.md (F0 5A 5A, CA <gamma>, B1 00 0C, B5 19 DC 00, B0 16/B5 <et1>, F4 EB 26, B4 00 55 80 65 26 26, B0 0F/B4 20, 55 02, B0 12/B8 <IRC>, B8 15, B0 06/B1 <POC1>, B0 53/B8 00 00, F7 03, F0 A5 A5) |
 | 50 | `F0 5A 5A` | COPR_SET_SEQ, `crown_a3_s0_set_copr_cmdtbl`, panel_copr.h:59-63 |
 | 51 | `E1 07 15 15 00 00 00 00 00 00 FF FF 00 00 00 00 00 00 00 00` | `copy_copr_maptbl()` s6e3ha8.c:1519-1559 of the defaults in panel_copr.h:98-122 (ilc, gamma 2.2, enabled, E 0x100, max 0xFFFF, no ROI). The static array (panel_copr.h:42-47) has 00 01 for the max count, which the maptbl overwrites. |
 | 52 | `F0 A5 A5` | KEY2 off |
@@ -176,11 +195,15 @@ PPS (packet 14), `pps_table[0]` "DSU MODE 1: 1440x2960 (Original), Slice Info: 7
 00 x 32
 ```
 
-End of window 1. Frames run again. The driver waits until DECON
-FRAME_COUNT moves (up to 500 ms), because 4.9 sends display on at the first
-FRAME_DONE.
+End of window 1: `dpu_cmd_window_pause()`. Frames run again and `hw_lock`
+is kept. The driver waits until DECON FRAME_COUNT moves (up to 500 ms),
+because 4.9 sends display on at the first FRAME_DONE.
 
-### 5. Display on: window 2, `crown_a3_s0_display_on_cmdtbl`, PNL:1353-1357
+### 5. Display on: `crown_a3_s0_display_on_cmdtbl`, PNL:1353-1357
+
+First `dpu_cmd_window_resume()`. Then `dpu_dsim_check()` is retried up to
+5 × 10 ms. The table is sent even if frames did not stop or the check still
+fails (a cleanup path; each packet has its own bounded timeout).
 
 | # | bytes |
 |---|---|
@@ -188,7 +211,7 @@ FRAME_DONE.
 | 54 | `29` (DISPLAY_ON, PNL:657) |
 | 55 | `9F 5A 5A` |
 
-### 6. Status: window 3, 100 ms later (read only, plus key 2)
+### 6. Status: pause, 100 ms, resume (read only, plus key 2), then `dpu_cmd_window_end()`
 
 `pb_readback()`: `F0 5A 5A`, then the CA/B1/B5/F4/B8 snapshot and keyed
 `EE`/`EA`, then `F0 A5 A5`, then `0A 0E 05 0F EE EA`.
@@ -206,16 +229,17 @@ The 4.9 byte arrays were cross-checked against the compiled
 ## Error handling
 
 - Before the first write, any failed precondition gives `RESULT REFUSED (<why>)`.
-- From the first write on, every table sends every packet. After an error, the table still sends its outstanding key offs (levels 3, 2, 1). Every later phase still runs, so the panel ends up as far "on" as possible.
+- From the first write on, every table sends every packet, and so does the set-bl sequence. After an error, the table still sends its outstanding key offs (levels 3, 2, 1). Every later phase still runs, so the panel ends up as far "on" as possible.
 - There is no retry. 4.9 power-cycles and retries up to 30 times (DRV:1290-1300).
 - Only the tables above are allowed, matched byte for byte against the static tables. Gate: `d->pr_active`, set only around the tables. `dsim_cmd.c` refuses DCS 10/11/28/29/2A/2B/35 and DSI types 0x07/0x0A whenever `pr_active` is clear.
 - It runs once per boot (`pr_done`).
 - `panel_lock` serialises it with the brightness, status and ALPM works.
 - `dpu_stop()` cancels it if it has not started. If it has started, `dpu_stop()` waits until the display on and status have been sent.
+- Commits (the DECON update worker) wait on `hw_lock` for the whole recovery: about 150 ms of tables, up to 500 ms of frame wait, then 100 ms before the status read.
 
 ## Not matched exactly to 4.9
 
-- **Rails and DSIM:** the S2DOS05 rails stay on (level 3 is not approved) and so does the DSIM link (adopt mode). 4.9 turns the PHY off, resets the DSIM and re-initialises it to LP-11 between the exit and init tables. Here the link stays in command-mode LP-11 with the TE trigger masked.
+- **Rails and DSIM:** the S2DOS05 rails stay on (level 3 is not approved) and so does the DSIM link (adopt mode). 4.9 turns the PHY off, resets the DSIM and re-initialises it to LP-11 between the exit and init tables. Here only the HS clock request is dropped around the reset, so the clock and data lanes sit in LP-11 (section 3). The PHY, PLL and link configuration stay as they are.
 - **Reset timing (level 2):** reset is held low for 10 ms. On 4.9 it stays low for the whole time the screen is off (at least the rail off/on time plus 10 ms).
 - **Retries:** 4.9's disp-det poll after init (20 ms) and the power-cycle retry loop are not reproduced. The 6.12 DT has no disp-det GPIO.
 - **After display on:** `mdnie_enable()` → `mdnie_update()` sends the mDNIe tables, and `copr_enable()` may clear the COPR counters (`SUPPORT_COPR_AVG`). Neither is sent here. After a level 2 reset the mDNIe block is therefore at its power-on default.
