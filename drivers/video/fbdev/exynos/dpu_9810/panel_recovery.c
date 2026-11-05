@@ -29,9 +29,13 @@
  *
  * The DSIM link stays in command mode with the DECON TE trigger masked
  * (dpu_cmd_window_begin()) while panel commands go out. 4.9 sends the
- * display on only after the first frame done; so does this file: window 1
- * (checks, off, reset, init) is closed, frames run until FRAME_COUNT moves,
- * then window 2 sends the display on table.
+ * display on only after the first frame done; so does this file: after
+ * window 1 (checks, off, reset, init) the trigger is restored and frames
+ * run until FRAME_COUNT moves (bounded), then the display on table goes
+ * out, then the status is read. hw_lock is held from window 1 to the end
+ * (dpu_cmd_window_pause() / _resume()), so no commit can queue a shadow
+ * update in between, and the display on and its key offs are sent even if
+ * frames did not stop or the DSIM check fails (Sol review R1 #2).
  *
  * Preconditions, all read only, checked before the first write (a refusal
  * logs why and sends nothing but the level 2 key around the reads):
@@ -614,30 +618,34 @@ static int pr_window_off_on(struct dpu_dev *d, struct pb_status *sb, struct pb_c
 	return 0;
 }
 
-/* window 2: the display on table, once a frame went out (4.9 FRAME_DONE) */
-static int pr_display_on_window(struct dpu_dev *d, struct pr_result *r)
+/*
+ * The display on table (4.9 sends it at the first FRAME_DONE), in the
+ * recovery's own window: hw_lock is held since window 1, so no commit can
+ * have queued a shadow update (Sol review R1 #2). Cleanup path: the table
+ * goes out even when frames did not stop or the DSIM check keeps failing
+ * (each packet has its own bounded timeout), so a panel switched off in
+ * window 1 is always offered its display on and key offs.
+ */
+static int pr_send_display_on(struct dpu_dev *d, struct pr_result *r)
 {
-	u32 trig = 0;
-	int tries, ret = -EBUSY;
+	int tries, ret;
 
-	for (tries = 0; tries < 3; tries++) {
-		ret = dpu_cmd_window_begin(d, &trig);
+	ret = dpu_cmd_window_resume(d);
+	if (ret)
+		pr_err(DPU_PR_PFX "frames did not stop before the display on (%d); sending it anyway\n",
+		       ret);
+	for (tries = 0; tries < 5; tries++) {
+		ret = dpu_dsim_check(d);
 		if (!ret)
 			break;
-		msleep(20);
+		usleep_range(10000, 11000);
 	}
-	if (ret) {
-		pr_err(DPU_PR_PFX "no command window for the display on (%d)\n", ret);
-		return ret;
-	}
-	ret = dpu_dsim_check(d);
-	if (!ret) {
-		dpu_dsim_clear_status(d);
-		d->pr_active = true;
-		pr_run(d, "display on", pr_tbl_display_on, ARRAY_SIZE(pr_tbl_display_on), r);
-		d->pr_active = false;
-	}
-	dpu_cmd_window_end(d, trig);
+	if (ret)
+		pr_err(DPU_PR_PFX "DSIM check before the display on: %d; sending it anyway\n", ret);
+	dpu_dsim_clear_status(d);
+	d->pr_active = true;
+	pr_run(d, "display on", pr_tbl_display_on, ARRAY_SIZE(pr_tbl_display_on), r);
+	d->pr_active = false;
 	return ret;
 }
 
@@ -676,20 +684,20 @@ void dpu_panel_recovery_work(struct work_struct *work)
 		pr_err(DPU_PR_PFX "RESULT REFUSED: no command window (%d), nothing sent\n", ret);
 		goto out;
 	}
+	/* hw_lock from here to dpu_cmd_window_end(): no commit runs in between */
 	t0 = ktime_get();
 	ret = pr_window_off_on(d, &sb, &c, &g, &r, &why);
 	us = ktime_us_delta(ktime_get(), t0);
 	fc = dpu_hw_frame_count(d);
-	dpu_cmd_window_end(d, trig);
-	pb_status_log("before recovery", &sb);
 	if (why) {
+		dpu_cmd_window_end(d, trig);
+		pb_status_log("before recovery", &sb);
 		pr_err(DPU_PR_PFX "RESULT REFUSED (%s): %d, only reads sent\n", why, ret);
 		goto out;
 	}
-	if (r.reset <= 0)
-		pr_info(DPU_PR_PFX "reset pulse: %d\n", r.reset);
 
 	/* frames run again: wait for the first one (4.9 sends display on at FRAME_DONE) */
+	dpu_cmd_window_pause(d, trig);
 	for (i = 0; i < PR_FRAME_WAIT_MS / 2; i++) {
 		if (dpu_hw_frame_count(d) != fc)
 			break;
@@ -697,22 +705,30 @@ void dpu_panel_recovery_work(struct work_struct *work)
 	}
 	r.frames = dpu_hw_frame_count(d) - fc;
 	r.frame_wait_ms = i * 2;
-	if (!r.frames)
-		pr_err(DPU_PR_PFX "no frame within %u ms after the init table; display on anyway\n",
-		       PR_FRAME_WAIT_MS);
-	ret = pr_display_on_window(d, &r);
+	ret = pr_send_display_on(d, &r);
 	pr_note_err(&r, ret);
 
 	/* status after: the read-back of the set-bl registers, then RDDPM/EE/EA */
+	dpu_cmd_window_pause(d, trig);
 	msleep(PR_SETTLE_MS);
 	d->pb_readback = "not run";
-	if (!dpu_cmd_window_begin(d, &trig)) {
-		if (!dpu_dsim_check(d)) {
-			dpu_dsim_clear_status(d);
-			pb_readback(d, &sa, &c);
-		}
-		dpu_cmd_window_end(d, trig);
+	ret = dpu_cmd_window_resume(d);
+	if (!ret)
+		ret = dpu_dsim_check(d);
+	if (!ret) {
+		dpu_dsim_clear_status(d);
+		pb_readback(d, &sa, &c);
 	}
+	dpu_cmd_window_end(d, trig);
+
+	pb_status_log("before recovery", &sb);
+	if (r.reset <= 0)
+		pr_info(DPU_PR_PFX "reset pulse: %d\n", r.reset);
+	if (!r.frames)
+		pr_err(DPU_PR_PFX "no frame within %u ms after the init table; display on sent anyway\n",
+		       PR_FRAME_WAIT_MS);
+	if (ret)
+		pr_err(DPU_PR_PFX "no status window after the display on (%d)\n", ret);
 	pb_status_log("after recovery", &sa);
 	if (!r.ret_bl)
 		pb_publish(d->pb_target);
@@ -728,8 +744,8 @@ void dpu_panel_recovery_work(struct work_struct *work)
 		r.rd_ret[PR_RD_EXIT_DSIE], r.rd[PR_RD_INIT_DIAG], r.rd_ret[PR_RD_INIT_DIAG]);
 	pr_info(DPU_PR_PFX "RESULT %s: level %u, first error %d, %u packets (%u failed), set-bl %d, reset %s, %u frames in %u ms before display on, read-back %s, RDDPM after %#04x, EE (key2) before %s after %s, window 1 %u us, %u DSIM tx, %u DSIM errors\n",
 		!r.err && pm_ok && ee_ok ? "PASS" : "FAIL", d->pr_level, r.err, r.sent, r.failed,
-		r.ret_bl, r.reset > 0 ? "not run" : r.reset ? "FAILED" : "ok", r.frames,
-		r.frame_wait_ms, d->pb_readback, sa.ret ? 0 : sa.pm[0], eeb, eea, us,
+		r.ret_bl, r.reset > 0 ? "not run" : r.reset ? "FAILED" : "ok",
+		r.frames, r.frame_wait_ms, d->pb_readback, sa.ret ? 0 : sa.pm[0], eeb, eea, us,
 		d->dsim_ntx - ntx0, d->dsim_nerr - nerr0);
 out:
 	pr_gpio_put(&g);

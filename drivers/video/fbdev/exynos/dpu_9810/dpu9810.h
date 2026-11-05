@@ -270,6 +270,8 @@ int dpu_fmt_bpp(u32 dpp_fmt);
 /* decon_drv.c: DECON-side guard around panel commands */
 int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig);
 void dpu_cmd_window_end(struct dpu_dev *d, u32 trig);
+void dpu_cmd_window_pause(struct dpu_dev *d, u32 trig);	/* frames run, hw_lock kept */
+int dpu_cmd_window_resume(struct dpu_dev *d);
 
 /* dsim_cmd.c: DSIM0 packets (4.9 dsim_write_data / dsim_read_data) */
 int dpu_dsim_check(struct dpu_dev *d);

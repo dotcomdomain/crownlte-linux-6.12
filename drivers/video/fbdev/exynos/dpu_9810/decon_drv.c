@@ -2478,6 +2478,48 @@ void dpu_cmd_window_end(struct dpu_dev *d, u32 trig)
 	mutex_unlock(&d->hw_lock);
 }
 
+/*
+ * The panel recovery (panel_recovery.c, Sol review R1 #2) owns the DECON
+ * across several command windows. dpu_cmd_window_pause() lets frames run
+ * again (the trigger bits of dpu_cmd_window_begin() restored) but keeps
+ * hw_lock, so no window update can start. dpu_cmd_window_resume() masks
+ * the trigger again and waits, bounded, for FRAME_COUNT to stop. It does
+ * not wait for a shadow update (none can be requested while hw_lock is
+ * held) and it reopens the window even when frames did not stop, returning
+ * -EBUSY, so the caller's cleanup (display on, key offs) can still go out.
+ * dpu_cmd_window_end() closes the window as usual.
+ */
+void dpu_cmd_window_pause(struct dpu_dev *d, u32 trig)
+{
+	lockdep_assert_held(&d->hw_lock);
+	d->cmd_window = false;
+	decon_wr_mask(d, HW_SW_TRIG_CONTROL, trig, HW_TRIG_EN | HW_TRIG_MASK_DECON);
+	pb_dbg("command window paused (hw_lock kept): TRIG=%#x FRAME_COUNT=%u\n",
+	       decon_rd(d, HW_SW_TRIG_CONTROL), dpu_hw_frame_count(d));
+}
+
+int dpu_cmd_window_resume(struct dpu_dev *d)
+{
+	u32 fc0, fc1;
+	int i;
+
+	lockdep_assert_held(&d->hw_lock);
+	dpu_hw_trigger(d, false);
+	fc0 = fc1 = dpu_hw_frame_count(d);
+	for (i = 0; i < DPU_CMD_IDLE_TRIES; i++) {
+		usleep_range(DPU_CMD_IDLE_US, DPU_CMD_IDLE_US + 1000);
+		fc1 = dpu_hw_frame_count(d);
+		if (fc1 == fc0)
+			break;
+		fc0 = fc1;
+	}
+	pb_dbg("command window resumed: TRIG=%#x, FRAME_COUNT %u %s\n",
+	       decon_rd(d, HW_SW_TRIG_CONTROL), fc1,
+	       i < DPU_CMD_IDLE_TRIES ? "stable" : "still advancing");
+	d->cmd_window = true;
+	return i < DPU_CMD_IDLE_TRIES ? 0 : -EBUSY;
+}
+
 /* ---- probe ----------------------------------------------------------- */
 
 static int dpu_parse_dt(struct dpu_dev *d)
