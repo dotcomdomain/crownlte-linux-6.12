@@ -161,6 +161,8 @@ struct dpu_dev {
 	bool diag_latched;			/* first user commit logged */
 	struct kthread_delayed_work idle_work;	/* diag of the frame HWC left up */
 	u32 nr_idle_snaps;
+	struct delayed_work fb_snap_work;	/* fb0 picture at 5 s */
+	bool fb_snap_hwc;			/* fb0 logged before HWC's first commit */
 	u32 hwc_ver;
 	/* ioctl numbers seen, each logged once with its first result */
 	spinlock_t ioc_lock;

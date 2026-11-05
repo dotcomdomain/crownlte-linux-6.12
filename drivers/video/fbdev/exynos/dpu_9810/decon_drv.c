@@ -26,16 +26,19 @@
  * the TE trigger masked and no frame in flight.
  */
 #include <linux/aperture.h>
+#include <linux/cma.h>
 #include <linux/console.h>
 #include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-direct.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/file.h>
 #include <linux/font.h>
 #include <linux/interrupt.h>
 #include <linux/kthread.h>
+#include <linux/memblock.h>
 #include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -718,25 +721,98 @@ static void dpu_diag_hdr(struct dpu_dev *d, const char *tag)
 #define DPU_TH_ROWS	16
 #define DPU_TH_SAMPLES	16	/* per cell and axis */
 
+/* an RGB32 picture to sample: a CPU copy in RAM or fb0 (ioremap_wc) */
+struct dpu_thumb_src {
+	const u8 *mem;
+	const u8 __iomem *io;
+	size_t len;
+	u32 stride;			/* bytes */
+	u32 x, y, w, h;			/* crop, pixels */
+	u32 fmt;			/* DPP-level RGB32 format */
+	bool alpha;			/* mark transparent cells */
+};
+
+static u32 dpu_luma_digit(u64 l1000)
+{
+	return min_t(u32, 9, l1000 * 10 / 256000);
+}
+
+/* sample @i of DPU_TH_SAMPLES, evenly spread over [@a, @b) */
+static u32 dpu_th_pos(u32 a, u32 b, u32 i)
+{
+	return a + (b - a) * (2 * i + 1) / (2 * DPU_TH_SAMPLES);
+}
+
 /*
- * Window geometry and a coarse picture of what the DPU is fed: the
- * window's source crop split into an 8 x 16 grid, one line per grid row,
- * one character per cell: mean luma (0.299 R + 0.587 G + 0.114 B) as 0-9,
- * '.' where the mean alpha is below 16 (transparent), '?' outside the
- * buffer. 16 x 16 samples per cell (every ~11 px on a 1440x2960 window),
- * read from the write-combined CPU copy the DPU scans (@vaddr): ~32k
- * uncached reads, so only on sampled frames.
+ * A coarse picture: the crop split into an 8 x 16 grid, one line per grid
+ * row, one character per cell: mean luma (0.299 R + 0.587 G + 0.114 B) as
+ * 0-9, '.' where the mean alpha is below 16 (transparent, @t->alpha only),
+ * '?' outside the buffer; after '|' the brightest sample of each cell on
+ * the same scale, so small bright details (text, a logo) show up too.
+ * 16 x 16 samples per cell (every ~11 px on 1440x2960): ~32k uncached
+ * reads, so only on sampled frames.
+ */
+static void dpu_thumb(struct dpu_dev *d, const struct dpu_thumb_src *t, const char *what)
+{
+	const u8 *pos = dpu_fmt_pos[t->fmt];
+	char mean[DPU_TH_COLS + 1], peak[DPU_TH_COLS + 1];
+	u32 cx, cy, sx, sy;
+
+	for (cy = 0; cy < DPU_TH_ROWS; cy++) {
+		u32 y0 = t->h * cy / DPU_TH_ROWS, y1 = t->h * (cy + 1) / DPU_TH_ROWS;
+
+		for (cx = 0; cx < DPU_TH_COLS; cx++) {
+			u32 x0 = t->w * cx / DPU_TH_COLS, x1 = t->w * (cx + 1) / DPU_TH_COLS;
+			u64 lsum = 0, asum = 0;
+			u32 n = 0, lmax = 0;
+
+			for (sy = 0; sy < DPU_TH_SAMPLES; sy++) {
+				u32 y = dpu_th_pos(y0, y1, sy);
+
+				for (sx = 0; sx < DPU_TH_SAMPLES; sx++) {
+					u32 x = dpu_th_pos(x0, x1, sx);
+					size_t off = (size_t)(t->y + y) * t->stride +
+						     (size_t)(t->x + x) * 4;
+					u32 px, l;
+					const u8 *b = (const u8 *)&px;
+
+					if (off + 4 > t->len)
+						continue;
+					px = t->io ? readl_relaxed(t->io + off) :
+						     READ_ONCE(*(const u32 *)(t->mem + off));
+					l = 299 * b[pos[0]] + 587 * b[pos[1]] + 114 * b[pos[2]];
+					lsum += l;
+					lmax = max(lmax, l);
+					asum += b[pos[3]];
+					n++;
+				}
+			}
+			if (!n) {
+				mean[cx] = peak[cx] = '?';
+			} else if (t->alpha && div_u64(asum, n) < 16) {
+				mean[cx] = peak[cx] = '.';
+			} else {
+				mean[cx] = '0' + dpu_luma_digit(div_u64(lsum, n));
+				peak[cx] = '0' + dpu_luma_digit(lmax);
+			}
+		}
+		mean[DPU_TH_COLS] = peak[DPU_TH_COLS] = '\0';
+		dev_info(d->dev, "diag %s thumb %02u: %s | %s\n", what, cy, mean, peak);
+	}
+}
+
+/*
+ * Window geometry and a thumbnail of the window's source crop, read from
+ * the write-combined CPU copy the DPU scans (@vaddr).
  */
 static void dpu_diag_thumb(struct dpu_dev *d, const struct dpu_commit *c, int win,
 			   const void *vaddr, const char *tag)
 {
 	const struct decon_win_config *w = &c->cfg[win];
 	const struct decon_frame *s = &w->src, *t = &w->dst;
-	u32 fmt = c->dpp_fmt[win], cx, cy, sx, sy;
-	size_t len = c->buf[win].len;
-	char row[DPU_TH_COLS + 1];
-	const u8 *pos;
-	bool alpha;
+	u32 fmt = c->dpp_fmt[win];
+	struct dpu_thumb_src ts;
+	char what[40];
 
 	if (w->state != DECON_WIN_STATE_BUFFER) {
 		dev_info(d->dev, "diag %s win%d geometry: colour %#x dst %ux%u@%d,%d blend %u plane alpha %d\n",
@@ -756,44 +832,13 @@ static void dpu_diag_thumb(struct dpu_dev *d, const struct dpu_commit *c, int wi
 			 !DPU_FMT_IS_RGB32(fmt) ? "not RGB32" : "too small");
 		return;
 	}
-	pos = dpu_fmt_pos[fmt];
-	alpha = fmt <= DECON_PIXEL_FORMAT_BGRA_8888;
-
-	for (cy = 0; cy < DPU_TH_ROWS; cy++) {
-		u32 y0 = s->h * cy / DPU_TH_ROWS, y1 = s->h * (cy + 1) / DPU_TH_ROWS;
-
-		for (cx = 0; cx < DPU_TH_COLS; cx++) {
-			u32 x0 = s->w * cx / DPU_TH_COLS, x1 = s->w * (cx + 1) / DPU_TH_COLS;
-			u64 lsum = 0, asum = 0;
-			u32 n = 0;
-
-			for (sy = 0; sy < DPU_TH_SAMPLES; sy++) {
-				u32 y = y0 + (y1 - y0) * (2 * sy + 1) / (2 * DPU_TH_SAMPLES);
-
-				for (sx = 0; sx < DPU_TH_SAMPLES; sx++) {
-					u32 x = x0 + (x1 - x0) * (2 * sx + 1) / (2 * DPU_TH_SAMPLES);
-					size_t off = (((size_t)(s->y + y) * s->f_w) + s->x + x) * 4;
-					u32 px;
-					const u8 *b = (const u8 *)&px;
-
-					if (off + 4 > len)
-						continue;
-					px = READ_ONCE(*(const u32 *)((const u8 *)vaddr + off));
-					lsum += 299 * b[pos[0]] + 587 * b[pos[1]] + 114 * b[pos[2]];
-					asum += b[pos[3]];
-					n++;
-				}
-			}
-			if (!n)
-				row[cx] = '?';
-			else if (alpha && div_u64(asum, n) < 16)
-				row[cx] = '.';
-			else
-				row[cx] = '0' + min_t(u32, 9, div_u64(lsum, n) * 10 / 256000);
-		}
-		row[DPU_TH_COLS] = '\0';
-		dev_info(d->dev, "diag %s win%d thumb %02u: %s\n", tag, win, cy, row);
-	}
+	ts = (struct dpu_thumb_src){
+		.mem = vaddr, .len = c->buf[win].len, .stride = s->f_w * 4,
+		.x = s->x, .y = s->y, .w = s->w, .h = s->h, .fmt = fmt,
+		.alpha = fmt <= DECON_PIXEL_FORMAT_BGRA_8888,
+	};
+	snprintf(what, sizeof(what), "%s win%d", tag, win);
+	dpu_thumb(d, &ts, what);
 }
 
 /* window @i of @c scans this CPU copy, NULL if the DPU reads the dma-buf */
@@ -832,6 +877,7 @@ static void dpu_diag(struct dpu_dev *d, struct dpu_commit *c)
 #define DPU_IDLE_SNAP_MS	3000
 #define DPU_IDLE_SNAP_MAX	32
 #define DPU_IDLE_RATE_MS	250
+#define DPU_FB_SNAP_MS		5000
 
 /*
  * HWC stops committing while the screen is static, so the sampled frames
@@ -869,10 +915,139 @@ static void dpu_idle_snap(struct kthread_work *work)
 	}
 }
 
+/*
+ * fb0 (the buffer SBoot left at 0xcc000000, then our fb0): is it black
+ * before HWC starts, and does DECON keep sending it? @rate also counts
+ * frames and TE pulses over DPU_IDLE_RATE_MS (sleeps). fb0 is scanned
+ * with blending off, so its alpha byte does not matter: cells show luma.
+ */
+static void dpu_diag_fb(struct dpu_dev *d, const char *when, bool rate)
+{
+	struct dpu_thumb_src ts = {
+		.io = d->fb ? (const u8 __iomem *)d->fb->screen_base : NULL,
+		.len = d->fb_size, .stride = d->fb_stride,
+		.w = d->lcd.xres, .h = d->lcd.yres, .fmt = d->fb_dpp_fmt,
+	};
+	char what[40];
+
+	snprintf(what, sizeof(what), "fb0 %s", when);
+	if (rate) {
+		u32 fc0 = dpu_hw_frame_count(d), fc1;
+		int te0 = atomic_read(&d->te_count), te1;
+
+		msleep(DPU_IDLE_RATE_MS);
+		fc1 = dpu_hw_frame_count(d);
+		te1 = atomic_read(&d->te_count);
+		dev_info(d->dev, "diag %s: in %u ms FRAME_COUNT %u -> %u (+%u), TE %d -> %d (+%d)\n",
+			 what, DPU_IDLE_RATE_MS, fc0, fc1, fc1 - fc0, te0, te1, te1 - te0);
+	}
+	dpu_diag_hdr(d, what);
+	if (!ts.io || !DPU_FMT_IS_RGB32(ts.fmt) || ts.stride < ts.w * 4 ||
+	    (size_t)ts.stride * ts.h > ts.len) {
+		dev_info(d->dev, "diag %s thumbnail: n/a (fb0 %s)\n", what,
+			 !ts.io ? "not registered" : "layout unexpected");
+		return;
+	}
+	dev_info(d->dev, "diag %s: %pa %ux%u stride %u DPP format %u, window %s, HWC %s; win%d IDMA base %#x active %#x\n",
+		 what, &d->fb_phys, ts.w, ts.h, ts.stride, ts.fmt,
+		 d->fb_taken ? "taken over" : "SBoot's",
+		 d->diag_latched ? "started" : "not started",
+		 d->boot_win, dpu_hw_dma_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y),
+		 dpu_hw_dma_active_rd(d, d->boot_dpp, IDMA_IN_BASE_ADDR_Y));
+	dpu_thumb(d, &ts, what);
+}
+
+static void dpu_fb_snap_work(struct work_struct *work)
+{
+	struct dpu_dev *d = container_of(work, struct dpu_dev, fb_snap_work.work);
+
+	if (!READ_ONCE(d->stopping))
+		dpu_diag_fb(d, "at 5 s", true);
+}
+
+/*
+ * The fb0 buffer must be reserved no-map (SBoot's picture, never handed
+ * to the page allocator) and no CMA area may overlap it: CMA pages are
+ * lent to movable allocations, which would overwrite the picture. Logs
+ * every /reserved-memory node as placed, the default and the device CMA
+ * area, and whether the linear map covers fb0.
+ */
+static void dpu_check_fb_reservation(struct dpu_dev *d)
+{
+	struct device_node *rm = of_find_node_by_path("/reserved-memory"), *np;
+	phys_addr_t fs = d->fb_phys, fe = d->fb_phys + d->fb_size;
+	const char *verdict = "NOT covered by one non-reusable node";
+	bool covered = false, covered_nomap = false, overlap = false;
+	struct cma *areas[2] = { NULL, NULL };
+	int i;
+
+	for_each_available_child_of_node(rm, np) {
+		struct reserved_mem *r = of_reserved_mem_lookup(np);
+		bool nomap = of_property_read_bool(np, "no-map");
+		bool reusable = of_property_read_bool(np, "reusable");
+		bool hit;
+		phys_addr_t b, e;
+		struct resource res;
+
+		if (r && r->size) {
+			b = r->base;
+			e = r->base + r->size;
+		} else if (!of_address_to_resource(np, 0, &res)) {
+			b = res.start;
+			e = res.end + 1;
+		} else {
+			dev_info(d->dev, "reserved-memory: %pOFn not placed\n", np);
+			continue;
+		}
+		hit = b < fe && fs < e;
+		dev_info(d->dev, "reserved-memory: %pa..%pa %s%s %pOFn%s\n", &b, &e,
+			 nomap ? "no-map" : "map", reusable ? " reusable" : "", np,
+			 hit ? " <- overlaps fb0" : "");
+		if (hit && reusable)
+			overlap = true;
+		if (hit && !reusable && b <= fs && e >= fe) {
+			covered = true;
+			covered_nomap |= nomap;
+		}
+	}
+	of_node_put(rm);
+	if (covered_nomap)
+		verdict = "reserved no-map";
+	else if (covered)
+		verdict = "reserved (mapped, not reusable)";
+
+#ifdef CONFIG_DMA_CMA
+	areas[0] = dev_get_cma_area(NULL);
+	areas[1] = d->dev->cma_area;
+#endif
+	for (i = 0; i < ARRAY_SIZE(areas); i++) {
+		phys_addr_t b, e;
+
+		if (!areas[i])
+			continue;
+		b = cma_get_base(areas[i]);
+		e = b + cma_get_size(areas[i]);
+		dev_info(d->dev, "%s CMA area %s: %pa..%pa%s\n", i ? "decon" : "default",
+			 cma_get_name(areas[i]), &b, &e,
+			 b < fe && fs < e ? " <- overlaps fb0" : "");
+		if (b < fe && fs < e)
+			overlap = true;
+	}
+	dev_info(d->dev, "fb0 %pa..%pa: %s, %s, linear map %s\n", &fs, &fe, verdict,
+		 overlap ? "OVERLAPPED BY A CMA/REUSABLE AREA" : "no CMA overlap",
+		 memblock_is_map_memory(fs) ? "covers it" : "excludes it");
+}
+
 static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 {
 	struct dpu_commit *old = NULL;
 	int i, ret;
+
+	/* fb0 as the panel showed it until now, before HWC replaces it */
+	if (!c->internal && !d->fb_snap_hwc) {
+		d->fb_snap_hwc = true;
+		dpu_diag_fb(d, "before the first HWC commit", true);
+	}
 
 	for (i = 0; i < DECON_MAX_WIN; i++) {
 		if (!c->acq[i])
@@ -2275,6 +2450,7 @@ static int dpu_probe(struct platform_device *pdev)
 	init_waitqueue_head(&d->vsync_wait);
 	INIT_DELAYED_WORK(&d->st_work, dpu_st_work);
 	INIT_DELAYED_WORK(&d->pb_work, dpu_panel_bright_work);
+	INIT_DELAYED_WORK(&d->fb_snap_work, dpu_fb_snap_work);
 	d->fence_ctx = dma_fence_context_alloc(1);
 	platform_set_drvdata(pdev, d);
 
@@ -2418,7 +2594,15 @@ static int dpu_probe(struct platform_device *pdev)
 	} else if (ret != -ENODEV) {
 		dev_warn(dev, "panel-bright disabled: %d\n", ret);
 	}
-	dpu_diag_hdr(d, "adopt");	/* baseline for the pending bits */
+	/* fb0: reservation, picture and counters at adopt, again at 5 s */
+	dpu_check_fb_reservation(d);
+	dpu_diag_fb(d, "at adopt", false);	/* also the pending-bit baseline */
+	{
+		u64 now = ktime_to_ms(ktime_get_boottime());
+		u64 left = now < DPU_FB_SNAP_MS ? DPU_FB_SNAP_MS - now : 0;
+
+		schedule_delayed_work(&d->fb_snap_work, msecs_to_jiffies(left));
+	}
 	dev_info(dev, "adopt mode ready: TE irq %d, %s\n", d->te_irq,
 		 d->fb_taken ? "fb0 window owned" : "fb0 window still SBoot's");
 	return 0;
@@ -2441,6 +2625,7 @@ static void dpu_stop(struct dpu_dev *d)
 	WRITE_ONCE(d->stopping, true);
 	cancel_delayed_work_sync(&d->pb_work);
 	cancel_delayed_work_sync(&d->st_work);
+	cancel_delayed_work_sync(&d->fb_snap_work);
 	if (d->mx_thread) {
 		/* the matrix restores fb0 through the worker before it returns */
 		kthread_stop(d->mx_thread);
