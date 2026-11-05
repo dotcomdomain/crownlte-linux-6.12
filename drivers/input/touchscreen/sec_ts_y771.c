@@ -13,8 +13,22 @@
  *    request_firmware(), no FLASH_ERASE/FLASH_WRITE/ENTER_FW_MODE opcodes;
  *  - no calibration, TCLM or NVM access (4.9 sec_ts_read_info_work(),
  *    SEC_TS_CMD_NVM, factory/raw-data tests), no sponge library writes;
- *  - no power control: there is no regulator driver for the S2MPS18 on
- *    6.12, so the IC must have been left powered by the bootloader.
+ *  - no regulator framework use and no PMIC access other than the two
+ *    touch rail registers below.
+ *
+ * Power (stage 2, DT samsung,acpm-touch-power, default off). SBoot leaves
+ * the IC unpowered: S2MPS18 L35CTRL 0x6c = 0x2c and L43CTRL 0x74 = 0x30
+ * (vsel 1.8 V / 3.0 V, enable bits 7:6 clear). With the property set, and
+ * the S2MPS18 node's samsung,touch-rail-update policy, probe does what 4.9
+ * sec_ts_power() + s2m_enable() did through ACPM:
+ *   read 0x6c/0x74; require vsel 0x2c/0x30 and modes 00 or the 4.9 mode;
+ *   LDO35 tsp_io: update 0x6c val 0x80 mask 0xc0, read back 0xac; 1-2 ms;
+ *   LDO43 tsp_avdd (only if 0x6c reads 0xac): update 0x74 val 0xc0 mask
+ *   0xc0, read back 0xf0; 70 ms (4.9 sec_ts_start_device()); then wait for
+ *   the IC's boot-complete event as 4.9 sec_ts_wait_for_ready().
+ * Off (only on a probe failure and at shutdown): LDO43 val 0x00, 4 ms,
+ * LDO35 val 0x00. At most two power-on sequences per boot. The ACPM
+ * transport (acpm_mfd.c) enforces the same values, order and limit.
  *
  * Every I2C transaction goes through sec_ts_read()/sec_ts_write(), which
  * refuse any opcode outside two fixed allowlists. The only opcodes ever
@@ -45,6 +59,7 @@
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <soc/samsung/acpm_mfd.h>
 
 #define SEC_TS_DRV_NAME			"sec_ts"
 /* 4.9 sec_ts.c:2501 input_dev->name, kept so userspace sees the 4.9 name. */
@@ -96,6 +111,8 @@
 #define SEC_TS_IDLE_IRQ_LIMIT		1000	/* consecutive IRQs without events */
 #define SEC_TS_LOG_TOUCHES		32	/* first N press/release logged */
 #define SEC_TS_SELFTEST_MS		109000
+#define SEC_TS_WAIT_RETRY		100	/* 4.9 SEC_TS_WAIT_RETRY_CNT, x 20 ms */
+#define SEC_TS_MAX_POWER_ON		2	/* power-on sequences per boot */
 
 enum sec_ts_state {
 	SEC_TS_ABSENT,		/* no ACK: IC not powered or not there */
@@ -120,6 +137,9 @@ struct sec_ts {
 	struct delayed_work selftest_work;
 	enum sec_ts_state state;
 	bool selftest;
+	bool power_ctl;			/* DT samsung,acpm-touch-power */
+	bool powered;			/* rails on (by this driver) */
+	int power_err;			/* last power-on result */
 
 	u8 device_id[5];
 	u8 img_ver[4], core_ver[4], para_ver[4];
@@ -375,9 +395,9 @@ static void sec_ts_status_event(struct sec_ts *ts, const u8 *ev)
 		dev_warn(dev, "IC event queue full\n");
 		sec_ts_release_all(ts);
 	}
-	/* 4.9 schedules a power-cycle reset on ESD; no power control here. */
+	/* 4.9 schedules a power-cycle reset on ESD; not done here. */
 	if (stype == TYPE_STATUS_EVENT_ERR && ev[1] == SEC_TS_ERR_EVENT_ESD)
-		dev_warn(dev, "IC reported ESD (no power control, not resetting)\n");
+		dev_warn(dev, "IC reported ESD (no runtime power-cycle reset, not resetting)\n");
 }
 
 /* Returns the number of events handled, 0 for an empty queue, or -errno. */
@@ -472,6 +492,234 @@ static void sec_ts_drain_pending(struct sec_ts *ts)
 	}
 }
 
+/*
+ * Touch rails through the ACPM PMIC transport. Built-in only: the
+ * exynos_acpm_* accessors are not exported to modules.
+ */
+#if IS_BUILTIN(CONFIG_TOUCHSCREEN_SEC_TS_Y771) && IS_ENABLED(CONFIG_EXYNOS_ACPM)
+#define SEC_TS_L35_ON_VAL	(ACPM_MFD_TOUCH_L35_VSEL | ACPM_MFD_TOUCH_L35_ON)	/* 0xac */
+#define SEC_TS_L43_ON_VAL	(ACPM_MFD_TOUCH_L43_VSEL | ACPM_MFD_TOUCH_L43_ON)	/* 0xf0 */
+
+static DEFINE_MUTEX(sec_ts_power_lock);
+static unsigned int sec_ts_power_ons;	/* per boot, under sec_ts_power_lock */
+
+static int sec_ts_rail_read(u8 reg, u8 *val)
+{
+	return exynos_acpm_read_reg(ACPM_MFD_TYPE_PMIC, reg, val);
+}
+
+static int sec_ts_rail_update(u8 reg, u8 val)
+{
+	return exynos_acpm_update_reg(ACPM_MFD_TYPE_PMIC, reg, val,
+				      ACPM_MFD_TOUCH_RAIL_MASK);
+}
+
+static int sec_ts_rails_read(u8 *l35, u8 *l43)
+{
+	return sec_ts_rail_read(ACPM_MFD_TOUCH_L35_REG, l35) ?:
+	       sec_ts_rail_read(ACPM_MFD_TOUCH_L43_REG, l43);
+}
+
+static bool sec_ts_rail_ok(u8 v, u8 vsel, u8 on)
+{
+	u8 mode = v & ACPM_MFD_TOUCH_RAIL_MASK;
+
+	return (v & ACPM_MFD_TOUCH_VSEL_MASK) == vsel &&
+	       (mode == ACPM_MFD_TOUCH_RAIL_OFF || mode == on);
+}
+
+/* 4.9 sec_ts_power(off): avdd off, 4 ms, dvdd off. */
+static void sec_ts_power_off(struct sec_ts *ts, const char *why)
+{
+	struct device *dev = &ts->client->dev;
+	u8 l35 = 0, l43 = 0;
+	int r43, r35 = -EPERM, ret;
+
+	if (!ts->power_ctl || !ts->powered)
+		return;
+
+	mutex_lock(&sec_ts_power_lock);
+	r43 = sec_ts_rail_update(ACPM_MFD_TOUCH_L43_REG, ACPM_MFD_TOUCH_RAIL_OFF);
+	usleep_range(4000, 5000);
+	ret = sec_ts_rail_read(ACPM_MFD_TOUCH_L43_REG, &l43);
+	/* LDO35 only after LDO43 reads off (the transport checks it again) */
+	if (!ret && !(l43 & ACPM_MFD_TOUCH_RAIL_MASK))
+		r35 = sec_ts_rail_update(ACPM_MFD_TOUCH_L35_REG,
+					 ACPM_MFD_TOUCH_RAIL_OFF);
+	ret = sec_ts_rails_read(&l35, &l43);
+	ts->powered = ret || ((l35 | l43) & ACPM_MFD_TOUCH_RAIL_MASK);
+	mutex_unlock(&sec_ts_power_lock);
+
+	dev_info(dev, "power off (%s): LDO43 %d, LDO35 %d; now 0x6c=%#04x 0x74=%#04x (read %d)%s\n",
+		 why, r43, r35, l35, l43, ret,
+		 ts->powered ? " - RAIL STILL ON" : "");
+}
+
+/* 4.9 sec_ts_power(on) + 70 ms of sec_ts_start_device(). */
+static int sec_ts_power_on(struct sec_ts *ts)
+{
+	struct device *dev = &ts->client->dev;
+	u8 l35 = 0, l43 = 0, rb = 0;
+	int ret;
+
+	mutex_lock(&sec_ts_power_lock);
+	ret = sec_ts_rails_read(&l35, &l43);
+	if (ret) {
+		dev_err(dev, "power: rail read failed %d, not powering\n", ret);
+		goto unlock;
+	}
+	dev_info(dev, "power: before 0x6c=%#04x 0x74=%#04x, power-ons so far %u\n",
+		 l35, l43, sec_ts_power_ons);
+
+	ret = -EINVAL;
+	if (!sec_ts_rail_ok(l35, ACPM_MFD_TOUCH_L35_VSEL, ACPM_MFD_TOUCH_L35_ON) ||
+	    !sec_ts_rail_ok(l43, ACPM_MFD_TOUCH_L43_VSEL, ACPM_MFD_TOUCH_L43_ON)) {
+		dev_err(dev, "power: unexpected rail state (want vsel 0x2c/0x30, modes 00 or 10/11), not powering\n");
+		goto unlock;
+	}
+	if ((l43 & ACPM_MFD_TOUCH_RAIL_MASK) && l35 != SEC_TS_L35_ON_VAL) {
+		dev_err(dev, "power: LDO43 on while LDO35 off, not touching it\n");
+		goto unlock;
+	}
+	if (l35 == SEC_TS_L35_ON_VAL && l43 == SEC_TS_L43_ON_VAL) {
+		dev_info(dev, "power: both rails already on, nothing written\n");
+		ts->powered = true;
+		ret = 0;
+		goto unlock;
+	}
+	if (sec_ts_power_ons >= SEC_TS_MAX_POWER_ON) {
+		dev_err(dev, "power: %u power-ons this boot, no more\n",
+			sec_ts_power_ons);
+		ret = -EBUSY;
+		goto unlock;
+	}
+	sec_ts_power_ons++;
+	/* from here a failure leaves something to switch off */
+	ts->powered = true;
+
+	if (l35 != SEC_TS_L35_ON_VAL) {
+		ret = sec_ts_rail_update(ACPM_MFD_TOUCH_L35_REG,
+					 ACPM_MFD_TOUCH_L35_ON);
+		usleep_range(1000, 2000);	/* 4.9 sec_ts_delay(1) */
+		if (!ret)
+			ret = sec_ts_rail_read(ACPM_MFD_TOUCH_L35_REG, &rb);
+		if (!ret && rb != SEC_TS_L35_ON_VAL)
+			ret = -EIO;
+		dev_info(dev, "power: LDO35 tsp_io on: %d, 0x6c=%#04x\n", ret, rb);
+		if (ret)
+			goto fail;
+	}
+
+	/* LDO43 only while LDO35 reads on */
+	rb = 0;
+	ret = sec_ts_rail_read(ACPM_MFD_TOUCH_L35_REG, &rb);
+	if (!ret && rb != SEC_TS_L35_ON_VAL)
+		ret = -EIO;
+	if (ret) {
+		dev_err(dev, "power: LDO35 not on before LDO43 (%d, 0x6c=%#04x)\n",
+			ret, rb);
+		goto fail;
+	}
+	rb = 0;
+	ret = sec_ts_rail_update(ACPM_MFD_TOUCH_L43_REG, ACPM_MFD_TOUCH_L43_ON);
+	if (!ret)
+		ret = sec_ts_rail_read(ACPM_MFD_TOUCH_L43_REG, &rb);
+	if (!ret && rb != SEC_TS_L43_ON_VAL)
+		ret = -EIO;
+	dev_info(dev, "power: LDO43 tsp_avdd on: %d, 0x74=%#04x\n", ret, rb);
+	if (ret)
+		goto fail;
+	mutex_unlock(&sec_ts_power_lock);
+
+	msleep(70);		/* 4.9 sec_ts_start_device() */
+	return 0;
+
+fail:
+	mutex_unlock(&sec_ts_power_lock);
+	sec_ts_power_off(ts, "power-on failed");
+	return ret;
+unlock:
+	mutex_unlock(&sec_ts_power_lock);
+	return ret;
+}
+
+static int sec_ts_rails_now(u8 *l35, u8 *l43)
+{
+	return sec_ts_rails_read(l35, l43);
+}
+#else
+static void sec_ts_power_off(struct sec_ts *ts, const char *why)
+{
+}
+
+static int sec_ts_power_on(struct sec_ts *ts)
+{
+	dev_err(&ts->client->dev,
+		"power: samsung,acpm-touch-power needs a built-in driver and CONFIG_EXYNOS_ACPM\n");
+	return -EOPNOTSUPP;
+}
+
+static int sec_ts_rails_now(u8 *l35, u8 *l43)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
+/*
+ * 4.9 sec_ts_wait_for_ready(SEC_TS_ACK_BOOT_COMPLETE): while the IRQ line
+ * is low, pop events until the boot-complete status event, 20 ms apart.
+ * Read-only (READ_ONE_EVENT); a timeout is logged and probe goes on.
+ */
+static void sec_ts_wait_for_ready(struct sec_ts *ts)
+{
+	u8 ev[SEC_TS_EVENT_BUFF_SIZE] = { 0 };
+	unsigned int stype;
+	int retry;
+
+	for (retry = 0; retry <= SEC_TS_WAIT_RETRY; retry++) {
+		if (!gpiod_get_raw_value_cansleep(ts->irq_gpio) &&
+		    !sec_ts_read(ts, SEC_TS_READ_ONE_EVENT, ev, sizeof(ev))) {
+			stype = (ev[0] >> 2) & 0xf;
+			if ((stype == TYPE_STATUS_EVENT_INFO ||
+			     stype == TYPE_STATUS_EVENT_VENDOR_INFO) &&
+			    ev[1] == SEC_TS_ACK_BOOT_COMPLETE) {
+				dev_info(&ts->client->dev,
+					 "boot complete after %d polls: %8ph\n",
+					 retry, ev);
+				return;
+			}
+		}
+		msleep(20);
+	}
+	dev_warn(&ts->client->dev, "no boot-complete event in %d ms (last %8ph)\n",
+		 SEC_TS_WAIT_RETRY * 20, ev);
+}
+
+/*
+ * DT samsung,acpm-touch-power: power the IC before identifying it. Returns
+ * -EPROBE_DEFER until the S2MPS18 driver has sealed the ACPM write policy;
+ * any other failure leaves the IC unpowered and probe reports "absent".
+ */
+static int sec_ts_power_up(struct sec_ts *ts)
+{
+	struct device *dev = &ts->client->dev;
+	int policy = exynos_acpm_mfd_touch_rails_policy();
+
+	if (policy == -EAGAIN)
+		return dev_err_probe(dev, -EPROBE_DEFER,
+				     "waiting for the S2MPS18 ACPM write policy\n");
+	if (policy != 1) {
+		dev_err(dev, "power: ACPM policy refuses touch rails (%d; S2MPS18 node needs samsung,touch-rail-update), not powering\n",
+			policy);
+		return -EPERM;
+	}
+	ts->power_err = sec_ts_power_on(ts);
+	if (ts->power_err)
+		return ts->power_err;
+	sec_ts_wait_for_ready(ts);
+	return 0;
+}
+
 static int sec_ts_identify(struct sec_ts *ts)
 {
 	struct device *dev = &ts->client->dev;
@@ -481,8 +729,10 @@ static int sec_ts_identify(struct sec_ts *ts)
 	ret = sec_ts_read(ts, SEC_TS_READ_DEVICE_ID, ts->device_id, 5);
 	if (ret) {
 		dev_err(dev,
-			"no answer at %#04x (%d): IC not powered? Needs S2MPS18 LDO35 1.8 V (tsp_io) then LDO43 3.0 V (tsp_avdd); stage 1 has no power control, stopping\n",
-			ts->client->addr, ret);
+			"no answer at %#04x (%d): IC not powered? Needs S2MPS18 LDO35 1.8 V (tsp_io) then LDO43 3.0 V (tsp_avdd); power control %s, stopping\n",
+			ts->client->addr, ret,
+			!ts->power_ctl ? "off (no samsung,acpm-touch-power)" :
+			ts->powered ? "on, rails on" : "on, rails NOT on");
 		ts->state = SEC_TS_ABSENT;
 		return -ENODEV;
 	}
@@ -625,7 +875,9 @@ static void sec_ts_selftest_work(struct work_struct *work)
 		jiffies_to_msecs(jiffies - INITIAL_JIFFIES),
 		sec_ts_state_names[ts->state], ts->client->addr);
 
-	if (ts->state != SEC_TS_ABSENT) {
+	if (ts->power_ctl && !ts->powered) {
+		pr_info("touch selftest: IC rails off (power-on refused/failed or probe failure), no IC reads\n");
+	} else if (ts->state != SEC_TS_ABSENT) {
 		ret = sec_ts_read(ts, SEC_TS_READ_DEVICE_ID, id, 5);
 		pr_info("touch selftest: chip id %5ph (probe %5ph) %s\n", id,
 			ts->device_id, ret ? "READ FAILED" :
@@ -641,6 +893,15 @@ static void sec_ts_selftest_work(struct work_struct *work)
 			ts->para_ver, img, boot, status);
 	} else {
 		pr_info("touch selftest: IC did not answer at probe (unpowered?): LDO35 tsp_io 1.8 V + LDO43 tsp_avdd 3.0 V needed, see pmic selftest L35CTRL(0x6c)/L43CTRL(0x74)\n");
+	}
+	if (ts->power_ctl) {
+		u8 l35 = 0, l43 = 0;
+		int r = sec_ts_rails_now(&l35, &l43);
+
+		pr_info("touch selftest: power control on, power-on result %d, rails %s, now 0x6c=%#04x 0x74=%#04x (read %d)\n",
+			ts->power_err, ts->powered ? "on" : "off", l35, l43, r);
+	} else {
+		pr_info("touch selftest: power control off (no samsung,acpm-touch-power)\n");
 	}
 	if (ts->irq_gpio)
 		line = gpiod_get_raw_value_cansleep(ts->irq_gpio);
@@ -692,6 +953,8 @@ static int sec_ts_probe(struct i2c_client *client)
 	mutex_init(&ts->event_lock);
 	INIT_DELAYED_WORK(&ts->selftest_work, sec_ts_selftest_work);
 	ts->selftest = device_property_read_bool(dev, "samsung,touch-selftest");
+	ts->power_ctl = device_property_read_bool(dev, "samsung,acpm-touch-power");
+	ts->power_err = -ENODATA;
 	i2c_set_clientdata(client, ts);
 
 	/* ASIS: requesting it as an input would undo the EINT pin function. */
@@ -700,6 +963,12 @@ static int sec_ts_probe(struct i2c_client *client)
 		return dev_err_probe(dev, PTR_ERR(ts->irq_gpio), "irq gpio\n");
 	if (client->irq <= 0)
 		return dev_err_probe(dev, -EINVAL, "no interrupt\n");
+
+	if (ts->power_ctl) {
+		ret = sec_ts_power_up(ts);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+	}
 
 	if (ts->selftest) {
 		ret = devm_add_action_or_reset(dev, sec_ts_cancel_selftest, ts);
@@ -711,32 +980,63 @@ static int sec_ts_probe(struct i2c_client *client)
 						       SEC_TS_SELFTEST_MS - now : 0));
 	}
 
-	dev_info(dev, "stage 1 (no firmware update, no power control), irq %d, line %d\n",
-		 client->irq, gpiod_get_raw_value_cansleep(ts->irq_gpio));
+	dev_info(dev, "stage 1 (no firmware update), power control %s, irq %d, line %d\n",
+		 ts->power_ctl ? (ts->powered ? "on (rails on)" : "on (rails off)") :
+				 "off", client->irq,
+		 gpiod_get_raw_value_cansleep(ts->irq_gpio));
 
+	ret = sec_ts_identify(ts);
+	/* No answer right after our own power-on: one power cycle (4.9 reset: off, 30 ms, on). */
+	if (ret && ts->state == SEC_TS_ABSENT && ts->powered) {
+		dev_warn(dev, "no answer after power-on, power cycling once\n");
+		sec_ts_power_off(ts, "retry");
+		msleep(30);
+		if (!ts->powered && !sec_ts_power_up(ts))
+			ret = sec_ts_identify(ts);
+	}
 	/* Detection failures keep the device bound so the self-test reports. */
-	if (sec_ts_identify(ts))
+	if (ret) {
+		sec_ts_power_off(ts, "probe failed: identify");
 		return 0;
+	}
 
 	ret = sec_ts_start(ts);
 	if (ret) {
 		ts->state = SEC_TS_FAILED;
+		sec_ts_power_off(ts, "probe failed: start");
 		return 0;
 	}
 
 	ret = sec_ts_input_init(ts);
-	if (ret)
+	if (ret) {
+		sec_ts_power_off(ts, "probe failed: input");
 		return dev_err_probe(dev, ret, "input device\n");
+	}
 
 	/* Trigger (level low, 4.9 sec,irq_type 0x2008) comes from DT. */
 	ret = devm_request_threaded_irq(dev, client->irq, NULL, sec_ts_irq_thread,
 					IRQF_ONESHOT, SEC_TS_DRV_NAME, ts);
-	if (ret)
+	if (ret) {
+		sec_ts_power_off(ts, "probe failed: irq");
 		return dev_err_probe(dev, ret, "irq %d\n", client->irq);
+	}
 
 	ts->state = SEC_TS_RUNNING;
 	dev_info(dev, "running\n");
 	return 0;
+}
+
+/* 4.9 sec_ts_shutdown() -> sec_ts_remove() -> power(off): LDO43 first. */
+static void sec_ts_shutdown(struct i2c_client *client)
+{
+	struct sec_ts *ts = i2c_get_clientdata(client);
+
+	if (!ts || !ts->power_ctl || !ts->powered)
+		return;
+	if (ts->state == SEC_TS_RUNNING)
+		disable_irq(client->irq);
+	cancel_delayed_work_sync(&ts->selftest_work);
+	sec_ts_power_off(ts, "shutdown");
 }
 
 static const struct of_device_id sec_ts_of_match[] = {
@@ -756,11 +1056,14 @@ static struct i2c_driver sec_ts_driver = {
 		.name = SEC_TS_DRV_NAME,
 		.of_match_table = sec_ts_of_match,
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		/* no unbind/rebind power cycles from sysfs */
+		.suppress_bind_attrs = true,
 	},
 	.probe = sec_ts_probe,
+	.shutdown = sec_ts_shutdown,
 	.id_table = sec_ts_id,
 };
 module_i2c_driver(sec_ts_driver);
 
-MODULE_DESCRIPTION("Samsung sec_ts Y771 touchscreen, crownlte stage 1 (no firmware update)");
+MODULE_DESCRIPTION("Samsung sec_ts Y771 touchscreen, crownlte (no firmware update)");
 MODULE_LICENSE("GPL");
