@@ -142,6 +142,9 @@ struct exynos9810_ufs {
 	struct uic_pwr_mode act_pmd;	/* what was negotiated */
 
 	struct ufs_cal_param *cal;
+
+	u32 clkgate_delay_ms;		/* DT samsung,clkgate-delay-ms, 0 = core default */
+	bool clkgate_delay_set;
 };
 
 static inline struct exynos9810_ufs *to_exynos_ufs(struct ufs_hba *hba)
@@ -596,8 +599,19 @@ module_param_named(seg_max, ufs_seg_max, int, 0444);
 static int ufs_bytes_last;
 module_param_named(bytes_last, ufs_bytes_last, int, 0444);
 
+/*
+ * Clock gating with hibern8 (4.9 ufs-exynos.c set_features():
+ * CLK_GATING | HIBERN8_WITH_CLK_GATING, gate delay LINK_H8_DELAY 20 ms).
+ * Off unless clkgate=1 or the host node has samsung,clk-gating.
+ */
 static bool ufs_clk_gating;
 module_param_named(clkgate, ufs_clk_gating, bool, 0444);
+
+/* hibern8 transitions with the CAL hooks, read-only counters */
+static unsigned int ufs_h8_enter, ufs_h8_exit, ufs_h8_cal_err;
+module_param_named(h8_enter, ufs_h8_enter, uint, 0444);
+module_param_named(h8_exit, ufs_h8_exit, uint, 0444);
+module_param_named(h8_cal_err, ufs_h8_cal_err, uint, 0444);
 
 static uint ufs_max_segments;
 module_param_named(max_segments, ufs_max_segments, uint, 0444);
@@ -721,9 +735,15 @@ static int exynos_ufs_init(struct ufs_hba *hba)
 
 	s9p_step(S9P_CYAN);		/* 4: PHY calibration initialised */
 
+	if (of_property_read_bool(ufs->dev->of_node, "samsung,clk-gating"))
+		ufs_clk_gating = true;
+	of_property_read_u32(ufs->dev->of_node, "samsung,clkgate-delay-ms",
+			     &ufs->clkgate_delay_ms);
 	if (ufs_clk_gating)
 		hba->caps |= UFSHCD_CAP_CLK_GATING |
 			     UFSHCD_CAP_HIBERN8_WITH_CLK_GATING;
+	dev_info(ufs->dev, "clock gating %s (hibern8 with gating), delay %u ms (0 = core default)\n",
+		 ufs_clk_gating ? "on" : "off", ufs->clkgate_delay_ms);
 	hba->quirks |= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
 		       UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR |
 		       UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR |
@@ -861,6 +881,14 @@ static int exynos_ufs_pwr_change_notify(struct ufs_hba *hba,
 		dev_info(ufs->dev, "power mode: M(%d) G(%d) L(%d) HS-series(%d)\n",
 			 ufs->act_pmd.mode, ufs->act_pmd.gear,
 			 ufs->act_pmd.lane, ufs->act_pmd.hs_series);
+		/* ufshcd_init_clk_gating() set 150 ms before the link came up */
+		if (ufshcd_is_clkgating_allowed(hba) && ufs->clkgate_delay_ms &&
+		    !ufs->clkgate_delay_set) {
+			ufshcd_clkgate_delay_set(hba->dev, ufs->clkgate_delay_ms);
+			ufs->clkgate_delay_set = true;
+			dev_info(ufs->dev, "clock gating delay %u ms (4.9 LINK_H8_DELAY)\n",
+				 ufs->clkgate_delay_ms);
+		}
 		return exynos_ufs_cal(ufs, ufs_cal_post_pmc, "post-pmc");
 	default:
 		return 0;
@@ -954,10 +982,21 @@ static void exynos_ufs_hibern8_notify(struct ufs_hba *hba, enum uic_cmd_dme cmd,
 {
 	struct exynos9810_ufs *ufs = to_exynos_ufs(hba);
 
-	if (status == PRE_CHANGE && cmd == UIC_CMD_DME_HIBER_EXIT)
-		exynos_ufs_cal(ufs, ufs_cal_pre_h8_exit, "pre-h8-exit");
-	else if (status == POST_CHANGE && cmd == UIC_CMD_DME_HIBER_ENTER)
-		exynos_ufs_cal(ufs, ufs_cal_post_h8_enter, "post-h8-enter");
+	int ret = 0;
+
+	if (status == PRE_CHANGE && cmd == UIC_CMD_DME_HIBER_EXIT) {
+		ret = exynos_ufs_cal(ufs, ufs_cal_pre_h8_exit, "pre-h8-exit");
+		WRITE_ONCE(ufs_h8_exit, ufs_h8_exit + 1);
+	} else if (status == POST_CHANGE && cmd == UIC_CMD_DME_HIBER_ENTER) {
+		ret = exynos_ufs_cal(ufs, ufs_cal_post_h8_enter, "post-h8-enter");
+		WRITE_ONCE(ufs_h8_enter, ufs_h8_enter + 1);
+		/* proof of life for the gating path: the 1st, then every 4096th */
+		if (ufs_h8_enter == 1 || !(ufs_h8_enter & 4095))
+			dev_info(ufs->dev, "hibern8 enter #%u (exit %u, CAL errors %u)\n",
+				 ufs_h8_enter, ufs_h8_exit, ufs_h8_cal_err);
+	}
+	if (ret)
+		WRITE_ONCE(ufs_h8_cal_err, ufs_h8_cal_err + 1);
 }
 
 static int exynos_ufs_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
