@@ -1172,6 +1172,9 @@ wl_cfgp2p_escan(struct bcm_cfg80211 *cfg, struct net_device *dev, u16 active_sca
 	}
 	CFGP2P_DBG(("\n"));
 
+#ifdef DHD_CROWNLTE_612
+	{ extern void wl_cfgscan_crownlte_note_escan_start_ext(void); wl_cfgscan_crownlte_note_escan_start_ext(); }
+#endif
 	ret = wldev_iovar_setbuf_bsscfg(pri_dev, "p2p_scan",
 		memblk, memsize, cfg->ioctl_buf, WLC_IOCTL_MAXLEN, bssidx, &cfg->ioctl_buf_sync);
 	WL_INFORM(("P2P_SEARCH sync ID: %d, bssidx: %d\n", sync_id, bssidx));
