@@ -26,6 +26,7 @@
 #include <linux/exynos-pci-ctrl.h>
 #include <linux/kthread.h>
 #include <linux/netdevice.h>
+#include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/rtnetlink.h>
 #include <linux/sched/clock.h>
@@ -56,6 +57,7 @@ struct crownlte_selftest {
 	struct device *dev;
 	u32 at_ms;
 	bool keep_up;
+	bool no_fw;	/* samsung,wifi-selftest-no-firmware: stop after the chip id */
 };
 
 static struct crownlte_selftest st_cfg;
@@ -77,7 +79,7 @@ static int crownlte_selftest_fn(void *arg)
 	struct net_device *ndev = NULL;
 	dhd_pub_t *dhdp;
 	const char *fail = NULL;
-	bool opened = false, shared = false, scanned = false;
+	bool opened = false, shared = false, scanned = false, nofw = false;
 	u64 t0;
 	u32 chip = 0, rev = 0;
 	int ret, i;
@@ -150,6 +152,11 @@ static int crownlte_selftest_fn(void *arg)
 		fail = "chip-id";
 		goto out;
 	}
+	if (st_cfg.no_fw) {
+		/* kernel-only vehicles: /vendor/firmware is not reachable */
+		nofw = true;
+		goto out;
+	}
 
 	/* 5. wlan0 up: firmware download and dongle init */
 	ndev = dev_get_by_name(&init_net, "wlan0");
@@ -218,6 +225,9 @@ out:
 
 	if (fail)
 		pr_info(WST "RESULT FAIL stage=%s\n", fail);
+	else if (nofw)
+		pr_info(WST "RESULT PASS-NOFW chip=0x%04x rev=%u (power, link, enumeration, chip id; firmware step not requested)\n",
+			chip, rev);
 	else if (shared)
 		pr_info(WST "RESULT PASS-SHARED chip=0x%04x rev=%u (wlan0 owned by userspace, scan skipped)\n",
 			chip, rev);
@@ -238,12 +248,15 @@ void dhd_crownlte_selftest_arm(struct device *dev, u32 delay_ms, bool keep_up)
 	st_cfg.dev = dev;
 	st_cfg.at_ms = delay_ms;
 	st_cfg.keep_up = keep_up;
+	st_cfg.no_fw = of_property_read_bool(dev->of_node,
+		"samsung,wifi-selftest-no-firmware");
 	t = kthread_run(crownlte_selftest_fn, NULL, "wifi_selftest");
 	if (IS_ERR(t)) {
 		pr_err(WST "cannot start kthread: %ld\n", PTR_ERR(t));
 		return;
 	}
 	st_armed = true;
-	pr_info(WST "armed for %u ms after boot%s\n", delay_ms,
-		keep_up ? ", wlan0 kept up" : "");
+	pr_info(WST "armed for %u ms after boot%s%s\n", delay_ms,
+		keep_up ? ", wlan0 kept up" : "",
+		st_cfg.no_fw ? ", no firmware step" : "");
 }

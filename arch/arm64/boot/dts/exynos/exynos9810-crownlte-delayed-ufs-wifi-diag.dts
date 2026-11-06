@@ -5,9 +5,11 @@
  * the Wi-Fi chip; see Documentation/crownlte/wifi-port.md.
  *
  * At boot: WLAN_REG_ON high, 200 ms, PCIe link training, enumeration, DHD
- * attach (chip id read over BAR0). No firmware is loaded until wlan0 is
- * brought up. The self-test does that once at ~150 s, scans passively and
- * takes wlan0 down again. It never associates and writes no file.
+ * attach (chip id read over BAR0), then DHD powers the chip off again.
+ * This kernel-only vehicle cannot reach /vendor/firmware and PID1 restarts
+ * at 120 s, so the self-test runs at 100 s and stops after the chip id
+ * (samsung,wifi-selftest-no-firmware): "wifi selftest: RESULT PASS-NOFW".
+ * The firmware/scan stage runs from the ROM-in-RAM DTB (wifi-s1).
  */
 #include "exynos9810-crownlte-delayed-ufs-diag.dts"
 
@@ -21,6 +23,7 @@
 
 &wlan {
 	samsung,wifi-selftest;
-	samsung,wifi-selftest-ms = <150000>;
+	samsung,wifi-selftest-ms = <100000>;
+	samsung,wifi-selftest-no-firmware;
 	status = "okay";
 };
