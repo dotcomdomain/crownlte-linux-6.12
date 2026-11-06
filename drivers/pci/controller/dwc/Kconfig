@@ -352,6 +352,17 @@ config PCI_EXYNOS
 	  hardware and therefore the driver re-uses the DesignWare core
 	  functions to implement the driver.
 
+config PCIE_EXYNOS9810
+	bool "Samsung Exynos 9810 PCIe RC channel 0 (crownlte Wi-Fi)"
+	depends on ARCH_EXYNOS || COMPILE_TEST
+	depends on OF && PCI_MSI
+	select PCIE_DW_HOST
+	help
+	  Root complex for the BCM4361 Wi-Fi on the Galaxy Note9 (crownlte),
+	  ported from the Samsung 4.9 pci-exynos driver. The link is trained
+	  on request of the Wi-Fi platform code (exynos_pcie_pm_resume()),
+	  not at probe. See Documentation/crownlte/wifi-port.md.
+
 config PCIE_FU740
 	bool "SiFive FU740 PCIe controller"
 	depends on PCI_MSI
