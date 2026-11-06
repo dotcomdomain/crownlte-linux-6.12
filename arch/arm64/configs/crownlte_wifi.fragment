@@ -1,0 +1,34 @@
+# crownlte Wi-Fi stage 1 (Documentation/crownlte/wifi-port.md).
+# Apply on top of the ROM-in-RAM diagnostic .config, then olddefconfig.
+
+# PCIe RC channel 0 (BCM4361); INTx only, no port services, no ASPM
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+# CONFIG_PCIEPORTBUS is not set
+# CONFIG_PCIEASPM is not set
+CONFIG_PCIE_EXYNOS9810=y
+# CONFIG_PCI_EXYNOS is not set
+# CONFIG_USB_PCI is not set
+# CONFIG_VGA_ARB is not set
+
+# cfg80211 (4.9 had CFG80211 + NL80211_TESTMODE)
+CONFIG_CFG80211=y
+CONFIG_NL80211_TESTMODE=y
+
+# 4.9 parity: request_firmware() falls back to the uevent helper, which
+# Android ueventd serves from /vendor/firmware
+CONFIG_FW_LOADER_USER_HELPER=y
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y
+
+# Samsung bcmdhd 101.16 for BCM4361, symbols and values as on 4.9
+CONFIG_BROADCOM_WIFI=y
+CONFIG_BCM4361=y
+CONFIG_BCMDHD_FW_PATH="/etc/wifi/bcmdhd_sta.bin"
+CONFIG_BCMDHD_NVRAM_PATH="/etc/wifi/nvram_net.txt"
+CONFIG_BROADCOM_WIFI_RESERVED_MEM=y
+CONFIG_BCMDHD_PREALLOC_MEMDUMP=y
+CONFIG_BCMDHD_OOB_HOST_WAKE=y
+CONFIG_BCMDHD_GET_OOB_STATE=y
+CONFIG_WLAN_REGION_CODE=100
+CONFIG_WLAIBSS=y
+CONFIG_WL_RELMCAST=y
