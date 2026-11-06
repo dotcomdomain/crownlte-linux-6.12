@@ -6504,6 +6504,15 @@ wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev, unsigned int timeout_
 	DHD_OS_SCAN_WAKE_LOCK_TIMEOUT((dhd_pub_t *)(cfg->pub),
 		timeout_ms + SCAN_WAKE_LOCK_MARGIN_MS);
 	list = wl_escan_get_buf(cfg, FALSE);	/* the buffer wl_do_escan() fills */
+	if (READ_ONCE(wl_crownlte_user_seen)) {
+		/* userspace used the wiphy since wlan0 came up: do not compete with it */
+		cfg->active_scan = saved_active;
+		mutex_unlock(&cfg->scan_sync);
+		DHD_OS_SCAN_WAKE_UNLOCK((dhd_pub_t *)(cfg->pub));
+		rep->preempted = true;
+		rep->ret = -EBUSY;
+		goto out;
+	}
 	wl_crownlte_st_sync = cfg->escan_info.cur_sync_id;	/* wl_escan_set_sync_id() */
 	wl_crownlte_st_status = -1;
 	wl_crownlte_st_active = true;
@@ -6519,33 +6528,43 @@ wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev, unsigned int timeout_
 	wl_set_drv_status(cfg, SCANNING, ndev);
 	mutex_unlock(&cfg->scan_sync);
 
-	/* done only on a terminal event for OUR sync id; any cfg80211 scan = preempted */
+	/*
+	 * Done on a terminal event for OUR sync id, or when a cfg80211 scan replaced
+	 * ours (__wl_cfg80211_scan force-clears SCANNING and owns the engine then).
+	 * Other userspace activity (connect, sched scan) does not end the wait: our
+	 * escan still has to be completed or aborted by us.
+	 */
 	t0 = jiffies;
 	deadline = t0 + msecs_to_jiffies(timeout_ms);
-	while (READ_ONCE(wl_crownlte_st_status) < 0 && !cfg->scan_request &&
-		!READ_ONCE(wl_crownlte_user_seen) && time_before(jiffies, deadline))
+	while (READ_ONCE(wl_crownlte_st_status) < 0 && !READ_ONCE(cfg->scan_request) &&
+		time_before(jiffies, deadline))
 		msleep(100);
 
 	mutex_lock(&cfg->scan_sync);
 	wl_crownlte_st_active = false;
 	rep->status = wl_crownlte_st_status;
 	rep->elapsed_ms = jiffies_to_msecs(jiffies - t0);
-	if (cfg->scan_request || wl_crownlte_user_seen) {
+	if (cfg->scan_request) {
+		/* replaced by a userspace scan: it owns SCANNING now, leave it alone */
 		rep->preempted = true;
 		mutex_unlock(&cfg->scan_sync);
 		rep->ret = -EBUSY;
 		goto out;
 	}
 	if (rep->status < 0) {
+		/* no terminal event: abort only if the engine still runs OUR sync id */
 		rep->timed_out = true;
-		wl_cfgscan_scan_abort(cfg);
+		if (cfg->escan_info.escan_state == WL_ESCAN_STATE_SCANING &&
+			cfg->escan_info.cur_sync_id == wl_crownlte_st_sync)
+			wl_cfgscan_scan_abort(cfg);
 		wl_notify_escan_complete(cfg, ndev, true);
 		mutex_unlock(&cfg->scan_sync);
 		rep->ret = -ETIMEDOUT;
 		goto out;
 	}
 	if (rep->status != WLC_E_STATUS_SUCCESS) {
-		/* aborted / new scan / new assoc / unexpected: not a completed scan */
+		/* ours ended without success (abort / new assoc / unexpected); no cfg80211
+		 * request is attached, so completing it as aborted touches only ours */
 		wl_notify_escan_complete(cfg, ndev, true);
 		mutex_unlock(&cfg->scan_sync);
 		rep->ret = -EIO;

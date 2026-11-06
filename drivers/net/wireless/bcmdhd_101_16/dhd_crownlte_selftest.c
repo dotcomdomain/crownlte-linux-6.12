@@ -44,6 +44,7 @@
 #include <dhd_bus.h>
 #include <dhd_linux.h>
 #include <dhd_linux_priv.h>
+#include <net/cfg80211.h>
 #include <dhd_crownlte.h>
 
 #define WST "wifi selftest: "
@@ -222,10 +223,21 @@ static int crownlte_selftest_fn(void *arg)
 out:
 	/* 7. leave wlan0 as we found it */
 	if (opened) {
-		bool user = wl_cfgscan_crownlte_userspace_seen() || sr.preempted;
+		struct wiphy *wiphy = ndev->ieee80211_ptr ? ndev->ieee80211_ptr->wiphy : NULL;
+		bool user;
 
+		/*
+		 * cfg80211 ops (scan, connect, sched scan) run under the wiphy mutex,
+		 * not RTNL (6.12 nl80211 drops RTNL first): decide with both held, then
+		 * drop only the wiphy mutex for dev_close().
+		 */
 		rtnl_lock();
+		if (wiphy)
+			wiphy_lock(wiphy);
+		user = wl_cfgscan_crownlte_userspace_seen() || sr.preempted;
 		wl_cfgscan_crownlte_watch(false);
+		if (wiphy)
+			wiphy_unlock(wiphy);
 		if (user)
 			pr_info(WST "userspace used wlan0 during the test: left as is (flags 0x%x)\n", ndev->flags);
 		else if (!st_cfg.keep_up && (ndev->flags & IFF_UP)) {
