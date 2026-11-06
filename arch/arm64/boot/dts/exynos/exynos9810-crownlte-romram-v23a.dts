@@ -1459,7 +1459,6 @@
 		clocks = <&{/clock-controller@15a80000} 105
 			  &{/clock-controller@15a80000} 95>;
 		clock-names = "pclk", "ipclk";
-		samsung,clkreq-on;
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges;
@@ -1475,6 +1474,7 @@
 				  &{/clock-controller@15a80000} 105>;
 			clock-names = "hsi2c", "hsi2c_pclk";
 			clock-frequency = <100000>;
+			samsung,no-bus-recovery;
 			pinctrl-names = "default";
 			pinctrl-0 = <&s2dos05_diag_pins>;
 			status = "okay";

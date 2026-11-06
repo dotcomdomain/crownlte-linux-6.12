@@ -204,6 +204,10 @@ struct exynos5_i2c {
 
 	/* Version of HS-I2C Hardware */
 	const struct exynos_hsi2c_variant *variant;
+
+	/* samsung,no-bus-recovery: a stuck bus fails the transfer instead of
+	 * being clocked free (another master may be mid-write). */
+	bool			no_bus_recovery;
 };
 
 /**
@@ -685,7 +689,7 @@ static void exynos5_i2c_bus_check(struct exynos5_i2c *i2c)
 {
 	unsigned long timeout;
 
-	if (i2c->variant->hw == I2C_TYPE_EXYNOS5)
+	if (i2c->variant->hw == I2C_TYPE_EXYNOS5 || i2c->no_bus_recovery)
 		return;
 
 	/*
@@ -812,6 +816,13 @@ static int exynos5_i2c_xfer_msg(struct exynos5_i2c *i2c,
 
 	reinit_completion(&i2c->msg_complete);
 
+	if (i2c->no_bus_recovery && i2c->variant->hw != I2C_TYPE_EXYNOS5 &&
+	    (readl(i2c->regs + HSI2C_TRANS_STATUS) & HSI2C_MASTER_ST_MASK) ==
+	    HSI2C_MASTER_ST_LOSE) {
+		dev_warn(i2c->dev, "bus stuck (LOSE) before transfer; no recovery, failing\n");
+		return -EBUSY;
+	}
+
 	exynos5_i2c_message_start(i2c, stop);
 
 	if (!i2c->atomic)
@@ -931,6 +942,7 @@ static int exynos5_i2c_probe(struct platform_device *pdev)
 
 	if (of_property_read_u32(np, "clock-frequency", &i2c->op_clock))
 		i2c->op_clock = I2C_MAX_STANDARD_MODE_FREQ;
+	i2c->no_bus_recovery = of_property_read_bool(np, "samsung,no-bus-recovery");
 
 	strscpy(i2c->adap.name, "exynos5-i2c", sizeof(i2c->adap.name));
 	i2c->adap.owner   = THIS_MODULE;
