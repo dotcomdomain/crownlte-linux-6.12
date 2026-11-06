@@ -164,3 +164,100 @@ Irreversible steps across the plan: any RPMB write (anti-rollback counters, Sams
 `ufs-srpmb`, which is not ported and must stay so), keymaster key upgrade or wrapped-key
 rewrite in /data, any write to /efs (TEE auth token, `/efs/TEE`), and any SWd secure
 storage (TbStorage) commit. T1 performs none of them.
+
+## 8. crownlte-tee-2: T1 on the display-flipfix base (2026-11-05)
+
+### Branch
+
+`crownlte-tee-2` = `crownlte-display-flipfix` 23b0b1202 + 22e97b5d2 + this
+section.
+
+- **No rebase conflicts.** 71a33b50a, 5df8f557a and 4e81ce065 are already
+  ancestors of 23b0b1202, through the integration-2 merge 6d1b4972a.
+  `git diff 4e81ce065 crownlte-tee-2 -- drivers/gud` is empty.
+- integration-2 moved the TEE enable out of the base delayed-ufs DTS into
+  `exynos9810-crownlte-delayed-ufs-tee-diag.dts`. The base DTBs keep the
+  node disabled.
+- **22e97b5d2 (DT only).** SPI 233 is now IRQ_TYPE_EDGE_RISING. This
+  removes the q29 WARN at irq-gic.c:1114 ("HW irq 265 has invalid type").
+  The driver already requests IRQF_TRIGGER_RISING, so the GIC configuration
+  and the SMC/MCP sequence are unchanged.
+
+### q29 result (31caf697c base, delayed-UFS vehicle): PASS
+
+- SWd "t-base 400C V002";
+- core switch 0 -> 1;
+- /dev/mobicore created;
+- no client;
+- one WARN, fixed above.
+
+### Kernel and DTB
+
+**Kernel.** The ROM-in-RAM config (`build/romram-6.12.93/.config`) already
+has the tee-branch TRUSTONIC options:
+
+- TRUSTONIC_TEE, TRUSTONIC_TEE_LPAE, TRUSTONIC_EXYNOS9810;
+- SECURE_OS_CONTROL, SECURE_OS_BOOSTER_API;
+- DEBUG and TRUSTED_UI off.
+
+`olddefconfig` on crownlte-tee-2 leaves it unchanged.
+
+**DTB `exynos9810-crownlte-romram-tee-t1`** (gekko
+`panel-bright-work/dtb/`, source + `.dts.diff` next to it). It is v19b
+(edaaf1f0) with only:
+
+- the model string;
+- `/tee`: rising edge, `samsung,tee-selftest`, `samsung,tee-selftest-ms =
+  <110000>`, status okay.
+
+The v19b panel-recovery properties (`samsung,panel-recovery-*`,
+`samsung,panel-reset-gpios`) are unknown to the 23b0b1202 kernel and stay
+inert. A black-panel boot stays black. That does not matter for T1, which
+is read from serial.
+
+### How T1 must be run with the ROM-in-RAM ramdisk
+
+The ramdisk (rom-ram src `romram.h`, step 1b) refuses to start Lineage
+when a TEE is present. It checks for any of:
+
+- `/dev/mobicore*`;
+- `/sys/class/misc/mobicore*`;
+- `/sys/bus/platform/drivers/mcd/tee`;
+- DT `/tee` status okay.
+
+The refusal happens inside the ROM container, before any partition wait
+or mount. PID1 then logs the container reap ("no retry") and keeps
+forwarding kmsg to serial until its own deadline restart (600 s in
+build-8). This is by design, and the ramdisk must not be changed.
+
+The trial vehicle is therefore a ROM-in-RAM recovery that is in practice a
+kernel-only boot:
+
+- Pack: Image + the tee-t1 DTB + ramdisk build-8 18279f13 + shim bbea959,
+  with `rom-ram/pack-rom-ram.py` as for v19b.
+- Capture: `romram-capture.ps1 -Seconds 630`.
+  - **Safest:** send only READY. UFS stays held and the ROM stage never
+    starts.
+  - **Also proves the guard:** the normal READY -> PROBE -> START. UFS is
+    probed read-only and the container refuses at stage
+    `tee-must-be-off`.
+
+**Expected log:**
+
+1. `Trustonic TEE: mobicore_init ... 6.3`, then the `tee_start` kthread
+   lines: MEM_TRACE, INIT, N_SIQ, INFO poll, GET_VERSION, SWAP_CPU to
+   CPU1.
+2. No "HW irq 265 has invalid type" WARN.
+3. If START was sent: `romram: ... DT /tee status=okay; refusing
+   ROM-in-RAM` (or `Trustonic TEE present (/dev/mobicore)`), then `ROMRAM
+   container reaped ... code=...`.
+4. ~110 s: `tee selftest: ... PASS`. The fingerprint is in section 5:
+   init=1 mem_trace=1 swap_cpu=1 other=0, mcp total=1, clients/sessions
+   0, active_cpu=1.
+5. 600 s: deadline restart, then the shim bounce, then Lineage. Read
+   pstore pmsg afterwards as usual.
+
+**Never pair a TEE-enabled DTB with a ramdisk that lacks the refusal**
+(older rom-ram builds before src 78bf9c2). Never run T2 by editing the
+ramdisk ad hoc. T2 needs its own reviewed ramdisk (EFS read-only copy,
+tmpfs mcRegistry) per section 7.

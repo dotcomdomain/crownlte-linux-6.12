@@ -113,8 +113,10 @@
 / {
 	/*
 	 * Trustonic Kinibi TEE (4.9 exynos9810-crownlte_eur_open_26.dts:10318
-	 * "tee" node, verbatim): S-SIQ notification interrupt SPI 233, flags 0;
-	 * the driver requests it IRQF_TRIGGER_RISING, as on 4.9. Probing this
+	 * "tee" node): S-SIQ notification interrupt SPI 233. 4.9 has flags 0
+	 * and the driver requests it IRQF_TRIGGER_RISING; 6.12 irq-gic WARNs on
+	 * IRQ_TYPE_NONE (q29, irq-gic.c:1114), so the DT states the rising edge
+	 * that request_irq() programs anyway (same GICD_ICFGR value). Probing this
 	 * node starts the TEE MCI exactly like the 4.9 boot (MEM_TRACE, INIT,
 	 * N_SIQ, INFO/YIELD poll, MCP GET_MOBICORE_VERSION, SWAP_CPU to CPU1).
 	 * No TA is loaded and nothing touches secure storage until a userspace
@@ -123,7 +125,7 @@
 	 */
 	trustonic_tee: tee {
 		compatible = "samsung,exynos-tee";
-		interrupts = <GIC_SPI 233 IRQ_TYPE_NONE>;
+		interrupts = <GIC_SPI 233 IRQ_TYPE_EDGE_RISING>;
 		status = "disabled";
 	};
 };
