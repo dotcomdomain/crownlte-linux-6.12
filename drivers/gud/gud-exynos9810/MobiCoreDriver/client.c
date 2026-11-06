@@ -695,7 +695,7 @@ int client_open_trustlet(struct tee_client *client, u32 *session_id, u32 spid,
 	u32 sid = 0;
 	int err = 0;
 
-	err = mc_session_guard(NULL, false, "open-trustlet");
+	err = mc_blob_guard_precheck(false, "open-trustlet");
 	if (err)
 		return err;
 
@@ -707,6 +707,13 @@ int client_open_trustlet(struct tee_client *client, u32 *session_id, u32 spid,
 		obj = tee_object_read(spid, trustlet, trustlet_len);
 	if (IS_ERR(obj)) {
 		err = PTR_ERR(obj);
+		goto end;
+	}
+
+	/* crownlte T3: pinned blob only; checked on the copy the SWd will map */
+	err = mc_blob_guard(obj, false, "open-trustlet");
+	if (err) {
+		tee_object_free(obj);
 		goto end;
 	}
 

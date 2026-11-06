@@ -4,6 +4,7 @@
 config TRUSTONIC_TEE
     tristate "Trustonic TEE Driver"
     depends on ARM || ARM64
+    select CRYPTO_LIB_SHA256
     default y
     help
       Enable Trustonic TEE support

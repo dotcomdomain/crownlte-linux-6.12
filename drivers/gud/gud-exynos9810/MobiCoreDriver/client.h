@@ -34,6 +34,9 @@ void clients_kill_sessions(void);
 /* MC */
 /* crownlte: main.c, DT samsung,tee-session-guard */
 int mc_session_guard(const struct mc_uuid_t *uuid, bool gp, const char *what);
+/* crownlte T3: DT samsung,tee-trustlet-allow / samsung,tee-driver-allow */
+int mc_blob_guard_precheck(bool driver, const char *what);
+int mc_blob_guard(const struct tee_object *obj, bool driver, const char *what);
 int client_open_session(struct tee_client *client, u32 *session_id,
 			const struct mc_uuid_t *uuid, uintptr_t tci,
 			size_t tci_len, bool is_gp_uuid,

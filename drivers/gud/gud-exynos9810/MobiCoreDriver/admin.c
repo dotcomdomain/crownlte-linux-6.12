@@ -710,6 +710,11 @@ static inline int load_driver(struct tee_client *client,
 	if (IS_ERR(obj))
 		return PTR_ERR(obj);
 
+	/* crownlte T3: pinned driver only; checked on the copy the SWd will map */
+	ret = mc_blob_guard(obj, true, "admin-load-driver");
+	if (ret)
+		goto end;
+
 	thdr = (struct mclf_header_v2 *)&obj->data[obj->header_length];
 	if (!(thdr->flags & MC_SERVICE_HEADER_FLAGS_NO_CONTROL_INTERFACE)) {
 		/*
@@ -948,8 +953,12 @@ static long admin_ioctl(struct file *file, unsigned int cmd,
 		struct tee_client *client = file->private_data;
 		struct mc_admin_load_info info;
 
-		/* crownlte staging: no secure driver loads while the session guard is on */
-		ret = mc_session_guard(NULL, false, "admin-load-driver");
+		/*
+		 * crownlte staging: while the session guard is on, secure driver
+		 * loads are refused unless DT pins them (T3); the pinned check
+		 * itself runs in load_driver() on the kernel copy.
+		 */
+		ret = mc_blob_guard_precheck(true, "admin-load-driver");
 		if (ret)
 			break;
 

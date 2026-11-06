@@ -25,6 +25,7 @@
 #include <linux/fs.h>
 #include <linux/workqueue.h>
 #include <linux/timekeeping.h>
+#include <crypto/sha2.h>		/* sha256(): T3 blob guard */
 
 #include "public/mc_user.h"
 #include "public/mc_admin.h"	/* MC_ADMIN_DEVNODE */
@@ -688,6 +689,44 @@ module_param_named(session_guard, mc_guard_on, bool, 0444);
 static struct mc_uuid_t mc_guard_allow[MC_GUARD_MAX];
 static int mc_guard_n;
 
+/*
+ * T3: blob-pinned trustlet/driver opens. open-trustlet (TA from a client
+ * buffer) and admin LOAD_DRIVER are checked on the kernel's own copy of the
+ * blob: MCLF magic, service type (system trustlet resp. driver), UUID and
+ * SHA-256 over the whole copy must match a pin from
+ * samsung,tee-trustlet-allow resp. samsung,tee-driver-allow. An absent list
+ * keeps the old behaviour (refused before any user data is read); a
+ * malformed list allows nothing. LOAD_CHECK and SP trustlets stay refused.
+ */
+#include "blob_guard.h"
+static struct mc_blob_pin mc_pin_tl[MC_PIN_MAX];
+static struct mc_blob_pin mc_pin_drv[MC_PIN_MAX];
+static int mc_pin_tl_n, mc_pin_drv_n;
+/* Read-only proof for userspace staging, next to session_guard */
+module_param_named(trustlet_pins, mc_pin_tl_n, int, 0444);
+module_param_named(driver_pins, mc_pin_drv_n, int, 0444);
+
+static int mc_pin_init(struct device_node *np, const char *prop,
+		       struct mc_blob_pin *pins)
+{
+	int n = of_property_count_u8_elems(np, prop);
+	int i, count;
+
+	BUILD_BUG_ON(sizeof(struct mc_blob_pin) != MC_PIN_LEN);
+	if (n == -EINVAL)	/* property absent */
+		return 0;
+	count = mc_blob_pins_count(n);
+	if (count < 0 || of_property_read_u8_array(np, prop, (u8 *)pins, n)) {
+		pr_err("tee session-guard: malformed %s (%d bytes): allowing nothing\n",
+		       prop, n);
+		return 0;
+	}
+	for (i = 0; i < count; i++)
+		pr_info("tee session-guard: %s pin uuid=%16phN sha256=%32phN\n",
+			prop, pins[i].uuid, pins[i].sha256);
+	return count;
+}
+
 static void mc_guard_init(struct device_node *np)
 {
 	int n;
@@ -705,6 +744,11 @@ static void mc_guard_init(struct device_node *np)
 	pr_info("tee session-guard: ON, %d allowed UUID(s)\n", mc_guard_n);
 	for (n = 0; n < mc_guard_n; n++)
 		pr_info("tee session-guard: allow %16phN\n", mc_guard_allow[n].value);
+	mc_pin_tl_n = mc_pin_init(np, "samsung,tee-trustlet-allow", mc_pin_tl);
+	mc_pin_drv_n = mc_pin_init(np, "samsung,tee-driver-allow", mc_pin_drv);
+	if (mc_pin_tl_n || mc_pin_drv_n)
+		pr_info("tee session-guard: blob pins trustlet=%d driver=%d\n",
+			mc_pin_tl_n, mc_pin_drv_n);
 }
 
 int mc_session_guard(const struct mc_uuid_t *uuid, bool gp, const char *what)
@@ -723,6 +767,44 @@ int mc_session_guard(const struct mc_uuid_t *uuid, bool gp, const char *what)
 	}
 	pr_warn("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: REFUSED\n",
 		what, uuid ? uuid->value : none, gp, current->comm, task_pid_nr(current));
+	return -EPERM;
+}
+
+/*
+ * Before any user data is copied: with no pin list for this path the
+ * request is refused exactly as before T3 (same log line).
+ */
+int mc_blob_guard_precheck(bool driver, const char *what)
+{
+	if (!mc_guard_on || (driver ? mc_pin_drv_n : mc_pin_tl_n))
+		return 0;
+	return mc_session_guard(NULL, false, what);
+}
+
+/* On the kernel copy that is handed to the SWd; every decision is logged. */
+int mc_blob_guard(const struct tee_object *obj, bool driver, const char *what)
+{
+	static const u8 none[MC_PIN_UUID_LEN];
+	enum mc_blob_verdict v;
+	u8 digest[MC_PIN_SHA_LEN];
+	const u8 *uuid;
+	u32 type;
+
+	if (!mc_guard_on)
+		return 0;
+	v = mc_blob_check(obj->data, obj->length, obj->header_length,
+			  driver ? SERVICE_TYPE_DRIVER : SERVICE_TYPE_SYSTEM_TRUSTLET,
+			  driver ? mc_pin_drv : mc_pin_tl,
+			  driver ? mc_pin_drv_n : mc_pin_tl_n, digest, &uuid, &type);
+	if (v == MC_BLOB_ALLOWED) {
+		pr_info("tee session-guard: %s uuid=%16phN type=%u len=%u sha256=%32phN by %s[%d]: allowed\n",
+			what, uuid, type, obj->length, digest, current->comm,
+			task_pid_nr(current));
+		return 0;
+	}
+	pr_warn("tee session-guard: %s uuid=%16phN type=%u len=%u sha256=%32phN by %s[%d]: REFUSED (%s)\n",
+		what, uuid ? uuid : none, type, obj->length, digest, current->comm,
+		task_pid_nr(current), mc_blob_why[v]);
 	return -EPERM;
 }
 
