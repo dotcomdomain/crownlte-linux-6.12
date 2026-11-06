@@ -50,7 +50,8 @@
  *             integral_cutoff 23, p_control_t 2000 mW, hotplug 96/91 C.
  * Cooling states are positions in the LITTLE table 1950, 1794, 1690, 1456,
  * 1248, 1053, 949, 832, 715, 598, 455 MHz (state 0 = 1950). If 1950 is not
- * available the same state is one level lower (more throttling); the TMU
+ * available the same state is one level lower (more throttling; the 96 C
+ * cap binds as <9 max> so it exists in both tables); the TMU
  * driver logs the resulting frequency of every trip next to the ECT value.
  */
 &{/tmu-big@10070000} {
@@ -67,12 +68,38 @@
 &{/thermal-zones/BIG} {
 	sustainable-power = <2000>;
 
+	/*
+	 * power_allocator (6.12) takes the FIRST passive trip in DT order as
+	 * switch-on and the LAST as control, so the trips are recreated in order
+	 * 60 (switch-on), 83 (control), 110 (critical), values unchanged from the
+	 * base DT, under new names (dtc keeps a re-added node at its old position;
+	 * sysfs trip_point_0/1/2 are now 60/83/110 C)
+	 * base DT; the cooling map is re-pointed at the new control node by path.
+	 */
 	trips {
-		/* power_allocator switch-on: the last active trip before control */
-		big-switch-on {
+		/delete-node/ big-control-temp;
+		/delete-node/ big-critical;
+
+		big-trip0-switch-on {
 			temperature = <60000>;
 			hysteresis = <2000>;
-			type = "active";
+			type = "passive";
+		};
+		big-trip1-control {
+			temperature = <83000>;
+			hysteresis = <5000>;
+			type = "passive";
+		};
+		big-trip2-critical {
+			temperature = <110000>;
+			hysteresis = <0>;
+			type = "critical";
+		};
+	};
+
+	cooling-maps {
+		map0 {
+			trip = <&{/thermal-zones/BIG/trips/big-trip1-control}>;
 		};
 	};
 };
@@ -129,10 +156,16 @@
 			cooling-device = <&{/cpus/cpu@0} 5 5>, <&{/cpus/cpu@1} 5 5>,
 					 <&{/cpus/cpu@2} 5 5>, <&{/cpus/cpu@3} 5 5>;
 		};
-		map96 {	/* 455 MHz */
+		map96 {	/* 455 MHz = the lowest state, in both tables */
 			trip = <&little_96>;
-			cooling-device = <&{/cpus/cpu@0} 10 10>, <&{/cpus/cpu@1} 10 10>,
-					 <&{/cpus/cpu@2} 10 10>, <&{/cpus/cpu@3} 10 10>;
+			/*
+			 * lower 9, upper THERMAL_NO_LIMIT (= the max state): valid with 10
+			 * states (no 1950: 9 = 455 MHz) and with 11 (9 = 598, step_wise
+			 * reaches 10 = 455 MHz one 250 ms poll later). A fixed state 10
+			 * failed to bind without 1950 and lost the cap.
+			 */
+			cooling-device = <&{/cpus/cpu@0} 9 0xffffffff>, <&{/cpus/cpu@1} 9 0xffffffff>,
+					 <&{/cpus/cpu@2} 9 0xffffffff>, <&{/cpus/cpu@3} 9 0xffffffff>;
 		};
 	};
 };

@@ -65,6 +65,7 @@ struct booster {
 	enum booster_phase phase;
 	struct delayed_work head_work;
 	struct delayed_work tail_work;
+	unsigned long tail_deadline;	/* jiffies: release + tail_ms */
 	bool first_logged;
 	bool first_event_logged;
 
@@ -129,6 +130,8 @@ static void booster_event_work(struct work_struct *work)
 				 msecs_to_jiffies(b->head_ms));
 		if (!b->first_logged) {
 			b->first_logged = true;
+			if (!pressed)
+				b->tail_deadline = jiffies + msecs_to_jiffies(b->tail_ms);
 			mutex_unlock(&b->lock);
 			/* the policy update runs from the policy's work: give it time */
 			usleep_range(5000, 6000);
@@ -139,6 +142,9 @@ static void booster_event_work(struct work_struct *work)
 		mod_delayed_work(system_highpri_wq, &b->tail_work,
 				 msecs_to_jiffies(b->tail_ms));
 	}
+	/* a release (also one coalesced with its touch-down) starts the tail clock */
+	if (!pressed)
+		b->tail_deadline = jiffies + msecs_to_jiffies(b->tail_ms);
 	mutex_unlock(&b->lock);
 }
 
@@ -150,9 +156,13 @@ static void booster_head_end(struct work_struct *work)
 	if (b->phase == PHASE_HEAD) {
 		if (b->tail_ms) {
 			booster_set(b, PHASE_TAIL);
-			if (!atomic_read(&b->pressed))
+			if (!atomic_read(&b->pressed)) {
+				/* released during the head: the tail ends tail_ms after the release */
+				long left = (long)(b->tail_deadline - jiffies);
+
 				mod_delayed_work(system_highpri_wq, &b->tail_work,
-						 msecs_to_jiffies(b->tail_ms));
+						 left > 0 ? left : 0);
+			}
 		} else {
 			booster_set(b, PHASE_IDLE);
 		}
@@ -337,10 +347,14 @@ static void booster_selftest(struct work_struct *work)
 	pass += booster_check(b, PHASE_HEAD, "selftest: head");
 	booster_touch(b, false);
 	if (b->tail_ms) {
+		ktime_t rel = ktime_get();
+
 		msleep(b->head_ms + 30);
 		steps++;
 		pass += booster_check(b, PHASE_TAIL, "selftest: tail");
-		msleep(b->tail_ms + 100);
+		/* idle 60 ms after release + tail (the old head-relative tail was still on) */
+		while (ktime_ms_delta(ktime_get(), rel) < b->tail_ms + 60)
+			msleep(10);
 	} else {
 		msleep(b->head_ms + 100);
 	}
