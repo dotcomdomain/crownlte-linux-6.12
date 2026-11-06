@@ -1,0 +1,49 @@
+Crownlte S2DOS05 read-only diagnostic (v23a)
+=========================================
+
+The standalone arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-v23a.dts
+is the external panel-bright-work/dtb/v22a test DT verbatim, followed by the
+diagnostic bus additions. Build with dtc -I dts -O dtb; no preprocessor needed.
+Enable CONFIG_CROWNLTE_S2DOS05_DIAG=y with the integration-3 ROM-in-RAM config.
+
+Reference: /root/crownlte-hid-kernel/ on gekko, drivers/regulator/s2dos05.c,
+include/linux/regulator/s2dos05.h and arch/arm64/boot/dts/exynos/
+exynos9810-crownlte_eur_open_26.dts. No TOPSYS_STAT/STAT bit names are defined
+in that header: these are raw bytes. EN bits 0..4 mean LDO1..4/BUCK1.
+IRQ bits 5..0 mean PWRMT/TSD/SSD/SCP/UVLO/OCD.
+
+The bus is dedicated CMGP I2C02, not the adjacent USI_CMGP02 protocol bus:
+rate clock CMGP_USI_I2C=95, gate GATE_I2C_CMGP02=105, pins gpm12-0/gpm13-0
+function 3, GIC SPI 5 level high. The new wrapper-only compatible
+samsung,exynos9810-i2c-wrapper takes reg, pclk/ipclk clocks and optional
+samsung,clkreq-on, with no samsung,sysreg/mode. It clears local reset at
++0xc4 and sets clock request at +0xc8 as on the other diagnostic buses;
+it does not touch the disabled 4.9 selector at 0x14212024.
+The wrapper and I2C child have disjoint MMIO resources.
+
+samsung,crownlte-s2dos05-diag is an isolated I2C client at 0x60 with no IRQ,
+regulator children, supplies or real-regulator compatible. The driver has
+no PMIC write API. Its one-byte address phase is necessary to select the
+register for a repeated-START read, and sends no register data value.
+It calls the adapter once under its segment lock, bypassing core retries.
+On failure it aborts that dump, logs the errno and waits for the next
+scheduled sample; there is no retry of the failed read.
+
+Samples target 1, 5.5, 9, 25, 60, 120 seconds since boot (boottime clock).
+Actual uptime is logged; late probe/scheduling can delay samples. The 9s
+sample is the requested timed alternative to a panel-recovery completion
+hook, not proof that recovery has completed. Each sample reads 0x00..0x10
+individually; a dump is not an atomic hardware snapshot. Only the 120s
+sample attempts 0x11, exactly once even on error, then stops. IRQ read
+clears latched evidence; a failed transfer may already have consumed it.
+Bind/unbind sysfs attributes are suppressed and the driver is built-in.
+
+Search dmesg for "s2dos05-diag:". The armed line describes the schedule.
+Each sample header reports target_ms, uptime_ms and whether IRQ is read.
+Per-register lines and EN decode follow; the final IRQ line names each bit.
+No hardware testing was performed: do not infer bus/PMIC availability
+from a successful build. The kernel I2C lock cannot serialize any secure
+firmware/bootloader coprocessor access. Controller clock/reset/pinmux
+changes may affect such an owner. Reading power-meter data may have
+device-specific side effects; IRQ definitely clears on read. No write
+changes to PMIC protection, voltage, enable, IRQ mask or ADC configuration.
