@@ -725,6 +725,16 @@ static int ex_register_host(struct exynos9810_pcie *ex)
 	struct pci_dev *rp;
 	int ret;
 
+	/*
+	 * 4.9 programmed the iATU through the viewport at DBI 0x900. An
+	 * unrolled iATU would live outside the 4 KiB DBI mapping, so refuse
+	 * instead of letting dw_pcie_iatu_detect() touch unmapped space.
+	 */
+	if (dw_pcie_readl_dbi(&ex->pci, PCIE_ATU_VIEWPORT) == 0xffffffff) {
+		dev_err(ex->dev, "iATU viewport reads all ones (unrolled iATU?)\n");
+		return -ENODEV;
+	}
+
 	/* PCIe r5.0 6.6.1: 100 ms after link-up before configuration requests */
 	msleep(100);
 
@@ -1064,6 +1074,17 @@ static int exynos9810_pcie_probe(struct platform_device *pdev)
 	ex->irq = platform_get_irq(pdev, 0);
 	if (ex->irq < 0)
 		return ex->irq;
+	/*
+	 * Mask and clear every ELBI source before the shared line is
+	 * requested, so a source left armed by the bootloader cannot storm
+	 * before disable_irq(). ex_phydown_at_probe() re-arms INTx as 4.9.
+	 */
+	ex_elbi_wr(ex, 0, ELBI_IRQ_EN_PULSE);
+	ex_elbi_wr(ex, 0, ELBI_IRQ_EN_LEVEL);
+	ex_elbi_wr(ex, 0, ELBI_IRQ_EN_SPECIAL);
+	ex_elbi_wr(ex, ex_elbi_rd(ex, ELBI_IRQ_PULSE), ELBI_IRQ_PULSE);
+	ex_elbi_wr(ex, ex_elbi_rd(ex, ELBI_IRQ_LEVEL), ELBI_IRQ_LEVEL);
+	ex_elbi_wr(ex, ex_elbi_rd(ex, ELBI_IRQ_SPECIAL), ELBI_IRQ_SPECIAL);
 	/* Shared with the endpoint INTx (interrupt-map -> same SPI). */
 	ret = devm_request_irq(dev, ex->irq, ex_irq, IRQF_SHARED,
 			       "exynos9810-pcie", ex);
