@@ -66,6 +66,7 @@ struct booster {
 	struct delayed_work head_work;
 	struct delayed_work tail_work;
 	unsigned long tail_deadline;	/* jiffies: release + tail_ms */
+	unsigned long head_deadline;	/* jiffies: last touch-down + head_ms (lock) */
 	bool first_logged;
 	bool first_event_logged;
 
@@ -126,6 +127,7 @@ static void booster_event_work(struct work_struct *work)
 		booster_boosts++;
 		cancel_delayed_work(&b->tail_work);
 		booster_set(b, PHASE_HEAD);
+		b->head_deadline = jiffies + msecs_to_jiffies(b->head_ms);
 		mod_delayed_work(system_highpri_wq, &b->head_work,
 				 msecs_to_jiffies(b->head_ms));
 		if (!b->first_logged) {
@@ -149,6 +151,14 @@ static void booster_head_end(struct work_struct *work)
 
 	mutex_lock(&b->lock);
 	if (b->phase == PHASE_HEAD) {
+		long left = (long)(b->head_deadline - jiffies);
+
+		if (left > 0) {
+			/* an older callback raced a new touch-down: keep the new head */
+			mod_delayed_work(system_highpri_wq, &b->head_work, left);
+			mutex_unlock(&b->lock);
+			return;
+		}
 		if (b->tail_ms) {
 			booster_set(b, PHASE_TAIL);
 			if (!atomic_read(&b->pressed)) {
