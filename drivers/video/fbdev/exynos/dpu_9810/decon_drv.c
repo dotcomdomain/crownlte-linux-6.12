@@ -1660,8 +1660,14 @@ static int dpu_win_config(struct dpu_dev *d, struct decon_win_config_data *wd,
 		rel[i] = -1;
 
 	mutex_lock(&d->lock);
-	if (!kbufs)
+	if (!kbufs) {
 		WRITE_ONCE(d->nr_user_calls, d->nr_user_calls + 1);	/* self-test yields */
+		d->user_started = true;
+	} else if (d->st_active && d->user_started) {
+		/* a self-test (or its restore) commit once the HWC owns the screen */
+		ret = -EBUSY;
+		goto out;
+	}
 	c = dpu_build_commit(d, wd, kbufs, &ret);
 	if (!c) {
 		d->nr_rejects++;
@@ -2404,6 +2410,16 @@ static void dpu_st_work(struct work_struct *work)
 	wd = kzalloc(sizeof(*wd), GFP_KERNEL);
 	if (!wd)
 		return;
+	/* never take the screen from the HWC, not even before the first flip */
+	mutex_lock(&d->lock);
+	if (d->user_started) {
+		mutex_unlock(&d->lock);
+		pr_info(DPU_ST_PFX "skipped: HWC already owns the screen\n");
+		kfree(wd);
+		return;
+	}
+	d->st_active = true;
+	mutex_unlock(&d->lock);
 	for (i = 0; i < 2; i++) {
 		buf[i] = dpu_kbuf_create(d, sz, 0, &va[i]);
 		if (IS_ERR(buf[i])) {
@@ -2468,6 +2484,9 @@ out:
 				restored_ok ? "OK" : "WRONG");
 		}
 	}
+	mutex_lock(&d->lock);
+	d->st_active = false;
+	mutex_unlock(&d->lock);
 	for (i = 0; i < 2; i++)
 		if (buf[i])
 			dma_buf_put(buf[i]);
@@ -2698,6 +2717,8 @@ static bool dpu_stc_step(struct dpu_dev *d, struct decon_win_config_data *wd,
 	te1 = atomic_read(&d->te_count);
 	pr_info(DPU_ST_PFX "compose %s: commit %d, fence after %u us, FRAME_COUNT %u -> %u\n",
 		s->name, ret, us, fc0, fc1);
+	if (ret == -EBUSY)
+		*stopped = true;	/* HWC took over between steps */
 	if (ret)
 		return false;
 

@@ -253,6 +253,8 @@ struct dpu_dev {
 	struct delayed_work st_work;
 	u32 st_at_ms, st_flips, st_period_ms;
 	u32 nr_user_calls;			/* S3CFB_WIN_CONFIG calls from userspace */
+	bool user_started;			/* first userspace WIN_CONFIG seen (under lock) */
+	bool st_active;				/* boot self-test owns in-kernel commits (under lock) */
 	bool stopping;
 
 	/* display matrix self-test (decon_drv.c dpu_mx_thread) */

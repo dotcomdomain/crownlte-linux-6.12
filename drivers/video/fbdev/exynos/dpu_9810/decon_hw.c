@@ -322,11 +322,6 @@ static bool fmt_is_yuv(u32 f)
 	return f >= DECON_PIXEL_FORMAT_NV16 && f < DECON_PIXEL_FORMAT_MAX;
 }
 
-static bool fmt_is_yuv420(u32 f)
-{
-	return f >= DECON_PIXEL_FORMAT_NV12 && f <= DECON_PIXEL_FORMAT_YVU420M;
-}
-
 bool dpu_fmt_is_yuv(u32 dpp_fmt)
 {
 	return fmt_is_yuv(dpp_fmt);
@@ -359,7 +354,9 @@ static void dpp_get_params(const struct decon_win_config *c, u32 fmt, struct dpu
 	 */
 	p->block = !c->dpp_parm.rot && !p->scale && fmt < DECON_PIXEL_FORMAT_NV16 &&
 		   !c->compression && b->w >= DPU_BLK_WIDTH_MIN && b->h >= DPU_BLK_HEIGHT_MIN &&
-		   b->x >= 0 && b->y >= 0 && b->x + b->w <= c->src.w && b->y + b->h <= c->src.h;
+		   b->w <= DPU_IMG_MAX && b->h <= DPU_IMG_MAX && b->x >= 0 && b->y >= 0 &&
+		   /* u64: user values must not wrap past the crop check */
+		   (u64)b->x + b->w <= c->src.w && (u64)b->y + b->h <= c->src.h;
 }
 
 /*
@@ -433,8 +430,9 @@ const char *dpu_hw_dpp_check(const struct decon_win_config *c, u32 fmt)
 	/* dpp_check_limitation() combinations (block ones: see dpp_get_params) */
 	if (comp && c->dpp_parm.rot)
 		return "AFBC with rotation/flip";
-	if (comp && fmt_is_yuv420(fmt))
-		return "AFBC with YUV420";
+	/* 4.9 checked is_yuv420() only, which misses NV12N/P010/S10B: any YUV */
+	if (comp && fmt_is_yuv(fmt))
+		return "AFBC with YUV";
 	if (hdr != DPU_HDR_OFF && comp)
 		return "HDR with AFBC";
 	if (hdr != DPU_HDR_OFF && c->dpp_parm.rot)
