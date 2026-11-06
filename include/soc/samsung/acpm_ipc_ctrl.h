@@ -1,6 +1,8 @@
 #ifndef __ACPM_IPC_CTRL_H__
 #define __ACPM_IPC_CTRL_H__
 
+#include <linux/types.h>
+
 typedef void (*ipc_callback)(unsigned int *cmd, unsigned int size);
 
 struct ipc_config {
@@ -22,6 +24,31 @@ struct ipc_config {
 #define ACPM_IPC_PROTOCOL_TEST			(23)
 #define ACPM_IPC_PROTOCOL_STOP			(22)
 #define ACPM_IPC_PROTOCOL_SEQ_NUM		(16)
+
+/*
+ * Read-only copy of the APM firmware log ring (diagnostics). e[] holds every
+ * slot in ring order, starting at front as read when the copy started (the
+ * oldest entry, or a never-written slot) and ending at front - 1 (newest).
+ */
+#define ACPM_LOG_SNAPSHOT_MAX			256
+struct acpm_log_snapshot_entry {
+	u64 time_ns;	/* sched_clock() domain; 0 if the time index is invalid */
+	u32 header;	/* id [31:28], level [27], time index [26:22], count [15:0] */
+	u32 val;
+	u16 slot;
+	bool empty;	/* all 16 bytes zero: never written */
+	char tag[9];
+};
+
+struct acpm_log_snapshot {
+	u64 t_ns;		/* sched_clock() when the copy started */
+	u32 len;		/* ring slots */
+	u32 rear;		/* kernel dequeue index (acpm_log_print) */
+	u32 front;		/* firmware write index when the copy started */
+	u32 front_after;	/* and when it ended */
+	u32 n;			/* slots in e[] (= len) */
+	struct acpm_log_snapshot_entry e[ACPM_LOG_SNAPSHOT_MAX];
+};
 
 #ifdef CONFIG_EXYNOS_ACPM
 int acpm_ipc_request_channel(struct device_node *np, ipc_callback handler,
@@ -60,6 +87,7 @@ int acpm_ipc_prepare_restart(struct device *supplier, struct device_node *framew
 
 void exynos_acpm_reboot(void);
 void acpm_stop_log(void);
+int acpm_ipc_log_snapshot(struct acpm_log_snapshot *s);
 #else
 
 static inline int acpm_ipc_request_channel(struct device_node *np, ipc_callback handler,
@@ -108,6 +136,11 @@ static inline void exynos_acpm_reboot(void)
 static inline void acpm_stop_log(void)
 {
 	return;
+}
+
+static inline int acpm_ipc_log_snapshot(struct acpm_log_snapshot *s)
+{
+	return -ENODEV;
 }
 #endif
 

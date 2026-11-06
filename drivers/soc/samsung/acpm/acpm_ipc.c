@@ -235,6 +235,70 @@ void acpm_stop_log(void)
 	acpm_stop_log_req = true;
 }
 
+/*
+ * Read-only copy of the APM firmware log ring, for diagnostics (crownlte
+ * cpuidle C2 FAIL-state). Neither index is written, so the periodic dequeue
+ * (acpm_log_print) is not disturbed. The firmware (apm.bin 0xec9c) writes at
+ * front and, when the ring is full, moves rear itself: the oldest entry is
+ * overwritten. Entries the kernel already dequeued stay in SRAM until then,
+ * so every slot is copied (never-written ones marked empty), starting at
+ * front (the oldest or a never-written slot) and ending at front - 1 (the
+ * newest). The firmware may write while this runs, and each slot is read as
+ * four separate words: every slot from front up to and including
+ * front_after (the firmware fills the slot at front before it advances
+ * front) may be torn, i.e. a mix of fields of the old entry and of one
+ * written during the copy. A full wrap during the copy is not detectable.
+ */
+int acpm_ipc_log_snapshot(struct acpm_log_snapshot *s)
+{
+	u32 len, size, front, rear, i, n = 0;
+
+	s->n = 0;
+	if (!smp_load_acquire(&acpm_ipc_ready) || !acpm_debug ||
+	    !acpm_debug->log_buff_base || !acpm_debug->log_buff_front ||
+	    !acpm_debug->log_buff_rear)
+		return -ENODEV;
+	len = acpm_debug->log_buff_len;
+	size = acpm_debug->log_buff_size;
+	/* header, 8-byte tag, value */
+	if (size != 16 || !len || len > ACPM_LOG_SNAPSHOT_MAX)
+		return -EINVAL;
+
+	s->t_ns = sched_clock();
+	front = __raw_readl(acpm_debug->log_buff_front);
+	rear = __raw_readl(acpm_debug->log_buff_rear);
+	s->len = len;
+	s->front = front;
+	s->rear = rear;
+	if (front >= len || rear >= len)
+		return -ERANGE;
+
+	for (i = 0; i < len; i++) {
+		u32 slot = (front + i) % len;
+		void __iomem *p = acpm_debug->log_buff_base + size * slot;
+		struct acpm_log_snapshot_entry *e = &s->e[n];
+		u32 w1, w2, index;
+
+		e->header = __raw_readl(p);
+		w1 = __raw_readl(p + 4);
+		w2 = __raw_readl(p + 8);
+		e->val = __raw_readl(p + 12);
+		e->empty = !e->header && !w1 && !w2 && !e->val;
+		memcpy(e->tag, &w1, 4);
+		memcpy(e->tag + 4, &w2, 4);
+		e->tag[8] = '\0';
+		e->slot = slot;
+		index = (e->header >> LOG_TIME_INDEX) & 0x1f;
+		e->time_ns = !e->empty && index < acpm_debug->num_timestamps ?
+			READ_ONCE(acpm_debug->timestamps[index]) +
+			(u64)(e->header & 0xffff) * APM_PERITIMER_NS_PERIOD : 0;
+		n++;
+	}
+	s->front_after = __raw_readl(acpm_debug->log_buff_front);
+	s->n = n;
+	return n;
+}
+
 static void acpm_update_log(struct work_struct *work)
 {
 	acpm_log_print();
