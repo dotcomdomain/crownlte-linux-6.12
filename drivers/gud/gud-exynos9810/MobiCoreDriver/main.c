@@ -672,6 +672,58 @@ static inline void device_admin_exit(void)
 }
 
 #ifndef MC_DELAYED_TEE_START
+/*
+ * crownlte TEE staging (T2/T3): optional session guard. With DT
+ * samsung,tee-session-guard every session/trustlet open from any client (user
+ * ioctl, GP, kernel API, proxy) is logged with its UUID and refused unless the
+ * UUID is listed in samsung,tee-session-allow (16-byte UUIDs, max 8). Trustlet
+ * opens from a buffer are always refused while the guard is on. A malformed
+ * allow list leaves the guard on with an empty list (fail closed). Without the
+ * property the driver behaves exactly as before.
+ */
+#define MC_GUARD_MAX 8
+static bool mc_guard_on;
+static struct mc_uuid_t mc_guard_allow[MC_GUARD_MAX];
+static int mc_guard_n;
+
+static void mc_guard_init(struct device_node *np)
+{
+	int n;
+
+	if (!np || !of_property_read_bool(np, "samsung,tee-session-guard"))
+		return;
+	mc_guard_on = true;
+	n = of_property_count_u8_elems(np, "samsung,tee-session-allow");
+	if (n > 0 && !(n % 16) && n / 16 <= MC_GUARD_MAX &&
+	    !of_property_read_u8_array(np, "samsung,tee-session-allow",
+				       (u8 *)mc_guard_allow, n))
+		mc_guard_n = n / 16;
+	else if (n > 0)
+		pr_err("tee session-guard: malformed allow list (%d bytes): allowing nothing\n", n);
+	pr_info("tee session-guard: ON, %d allowed UUID(s)\n", mc_guard_n);
+	for (n = 0; n < mc_guard_n; n++)
+		pr_info("tee session-guard: allow %16phN\n", mc_guard_allow[n].value);
+}
+
+int mc_session_guard(const struct mc_uuid_t *uuid, bool gp, const char *what)
+{
+	static const u8 none[16];
+	int i;
+
+	if (!mc_guard_on)
+		return 0;
+	for (i = 0; uuid && i < mc_guard_n; i++) {
+		if (!memcmp(uuid->value, mc_guard_allow[i].value, 16)) {
+			pr_info("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: allowed\n",
+				what, uuid->value, gp, current->comm, task_pid_nr(current));
+			return 0;
+		}
+	}
+	pr_warn("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: REFUSED\n",
+		what, uuid ? uuid->value : none, gp, current->comm, task_pid_nr(current));
+	return -EPERM;
+}
+
 /* crownlte: 4.9's tail of mobicore_probe(), run in its own kthread */
 static int mobicore_start_thread(void *unused)
 {
@@ -841,6 +893,7 @@ static int mobicore_probe(struct platform_device *pdev)
 
 	if (pdev)
 		g_ctx.mcd->of_node = pdev->dev.of_node;
+	mc_guard_init(pdev ? pdev->dev.of_node : NULL);
 
 #ifdef MOBICORE_COMPONENT_BUILD_TAG
 	mc_dev_info("MobiCore %s", MOBICORE_COMPONENT_BUILD_TAG);

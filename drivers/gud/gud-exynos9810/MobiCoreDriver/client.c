@@ -646,6 +646,10 @@ int client_open_session(struct tee_client *client, u32 *session_id,
 	u32 sid = 0;
 	struct tee_object *obj;
 
+	err = mc_session_guard(uuid, is_gp_uuid, "open-session");
+	if (err)
+		return err;
+
 	/* Get secure object */
 	obj = tee_object_get(uuid, is_gp_uuid);
 	if (IS_ERR(obj)) {
@@ -690,6 +694,10 @@ int client_open_trustlet(struct tee_client *client, u32 *session_id, u32 spid,
 	};
 	u32 sid = 0;
 	int err = 0;
+
+	err = mc_session_guard(NULL, false, "open-trustlet");
+	if (err)
+		return err;
 
 	if (client_is_kernel(client))
 		/* Create secure object from kernel-space trustlet binary */
@@ -1057,6 +1065,10 @@ int client_gp_open_session(struct tee_client *client, u32 *session_id,
 {
 	struct tee_object *obj;
 	int ret = 0;
+
+	ret = mc_session_guard(uuid, true, "gp-open-session");
+	if (ret)
+		return ret;
 
 	/* Get secure object */
 	obj = tee_object_get(uuid, true);
