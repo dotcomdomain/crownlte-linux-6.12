@@ -1456,7 +1456,8 @@
 	usi@143500c0 {
 		compatible = "samsung,exynos9810-i2c-wrapper";
 		reg = <0x143500c0 0x20>;
-		clocks = <0x0c 105 0x0c 95>;
+		clocks = <&{/clock-controller@15a80000} 105
+			  &{/clock-controller@15a80000} 95>;
 		clock-names = "pclk", "ipclk";
 		samsung,clkreq-on;
 		#address-cells = <1>;
@@ -1470,7 +1471,8 @@
 			interrupts = <0 5 4>;
 			#address-cells = <1>;
 			#size-cells = <0>;
-			clocks = <0x0c 95 0x0c 105>;
+			clocks = <&{/clock-controller@15a80000} 95
+				  &{/clock-controller@15a80000} 105>;
 			clock-names = "hsi2c", "hsi2c_pclk";
 			clock-frequency = <100000>;
 			pinctrl-names = "default";

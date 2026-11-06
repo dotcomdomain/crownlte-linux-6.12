@@ -652,5 +652,7 @@ config CROWNLTE_S2DOS05_DIAG
 	  Opt-in diagnostic for the crownlte-specific DT compatible. Reads
 	  0x00-0x10 at six boot-time targets and clear-on-read IRQ only at
 	  120 seconds. Never writes a PMIC register or requests its IRQ.
+	  Requires the samsung,crownlte-s2dos05-diag compatible on the
+	  dedicated display PMIC bus. Say N unless diagnosing panel power.
 
 endmenu
