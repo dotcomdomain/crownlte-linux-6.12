@@ -3,16 +3,19 @@
  * Exynos9810 DECON-F / DPP register layer.
  *
  * Ported from the Samsung 4.9 kernel (drivers/video/fbdev/exynos/dpu_9810/
- * decon_reg.c, dpp_reg.c, helper.c), restricted to unscaled, unrotated,
- * uncompressed RGB windows. Register sequences and values are unchanged;
- * the per-id accessors now take the device.
+ * decon_reg.c, dpp_reg.c, dpp_drv.c, helper.c): RGB, RGB10 and YUV windows,
+ * scaling and AFBC on VGF0/VGF1, flips everywhere, 90/270 rotation and HDR
+ * on VGF1, block areas. Register sequences and values are unchanged; the
+ * per-id accessors now take the device.
  */
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/math64.h>
 #include <linux/regmap.h>
 
 #include "dpu9810.h"
 #include "dpp_coef.h"
+#include "dpp_hdr_lut.h"
 
 #define DPP_STRIDE	0x1000
 
@@ -266,6 +269,251 @@ void dpu_hw_dpp_init(struct dpu_dev *d, int id)
 	       DPU_DMA_RECOVERY_NUM(630000), d->dma_com + DPU_DMA_RECOVERY_NUM_CTRL);
 }
 
+/*
+ * ---- DPP per-frame parameters and limits (4.9 dpp_drv.c) ---------------
+ *
+ * Channels (4.9 dpp_check_format()): G0/G1 RGB only; VG0/VG1 add YUV;
+ * VGF0/VGF1 add scaling and AFBC; VGF1 (VGRF) adds 90/270 rotation and HDR.
+ * Flips and 180 are accepted on every channel, as on 4.9.
+ */
+
+/* 4.9 decon.h enum dpp_rotate / dpp_hdr_standard / dpp_csc_eq */
+#define DPU_ROT_180		3
+#define DPU_ROT_270		7
+#define DPU_HDR_OFF		0
+#define DPU_HDR_ST2084		1
+#define DPU_HDR_HLG		2
+#define DPU_CSC_BT_601		0
+#define DPU_CSC_BT_2020		2
+#define DPU_CSC_DCI_P3		3
+#define DPU_CSC_STD_UNSPEC	63
+#define DPU_CSC_RANGE_SHIFT	6
+#define DPU_CSC_RANGE_LIMITED	0
+#define DPU_CSC_RANGE_UNSPEC	7
+
+/* 4.9 dpp.h size constraints */
+#define DPU_SRC_WIDTH_MAX	65534
+#define DPU_SRC_HEIGHT_MAX	8190
+#define DPU_IMG_MIN		16
+#define DPU_IMG_MAX		4096
+#define DPU_IMG_ROT_HEIGHT_MAX	2160
+#define DPU_SCALED_MIN		16
+#define DPU_SCALED_MAX		4096
+#define DPU_BLK_WIDTH_MIN	4
+#define DPU_BLK_HEIGHT_MIN	1
+
+/* 4.9 include/uapi/linux/videodev2_exynos_media.h plane layouts */
+#define DPU_ALIGN(x, a)			(((x) + ((a) - 1)) & ~((u64)(a) - 1))
+#define NV12N_Y_SIZE(w, h)		(DPU_ALIGN((w), 16) * DPU_ALIGN((h), 16) + 256)
+#define NV12N_CBCR_SIZE(w, h)		(DPU_ALIGN((DPU_ALIGN((w), 16) * (DPU_ALIGN((h), 16) / 2) + 256), 16))
+#define NV12N_10B_Y_8B_SIZE(w, h)	(DPU_ALIGN((w), 64) * DPU_ALIGN((h), 16) + 256)
+#define NV12N_10B_Y_2B_SIZE(w, h)	((DPU_ALIGN((w) / 4, 16) * DPU_ALIGN((h), 16) + 64))
+#define NV12N_10B_CBCR_8B_SIZE(w, h)	(DPU_ALIGN((DPU_ALIGN((w), 64) * (DPU_ALIGN((h), 16) / 2) + 256), 16))
+#define NV12N_10B_CBCR_2B_SIZE(w, h)	((DPU_ALIGN((w) / 4, 16) * (DPU_ALIGN((h), 16) / 2) + 64))
+#define NV12M_Y_SIZE(w, h)		(DPU_ALIGN((w), 64) * DPU_ALIGN((h), 16) + 256)
+#define NV12M_CBCR_SIZE(w, h)		((DPU_ALIGN((w), 64) * DPU_ALIGN((h), 16) / 2) + 256)
+#define NV12M_Y_2B_SIZE(w, h)		(DPU_ALIGN((w) / 4, 16) * DPU_ALIGN((h), 16) + 256)
+#define NV12M_CBCR_2B_SIZE(w, h)	((DPU_ALIGN((w) / 4, 16) * DPU_ALIGN((h), 16) / 2) + 256)
+#define S10B_2B_STRIDE(w)		(DPU_ALIGN((w) / 4, 16))
+
+/* 4.9 dpp.h is_yuv() / is_yuv420(), on the DPP-level format */
+static bool fmt_is_yuv(u32 f)
+{
+	return f >= DECON_PIXEL_FORMAT_NV16 && f < DECON_PIXEL_FORMAT_MAX;
+}
+
+static bool fmt_is_yuv420(u32 f)
+{
+	return f >= DECON_PIXEL_FORMAT_NV12 && f <= DECON_PIXEL_FORMAT_YVU420M;
+}
+
+bool dpu_fmt_is_yuv(u32 dpp_fmt)
+{
+	return fmt_is_yuv(dpp_fmt);
+}
+
+/* 4.9 struct dpp_params_info, the parts derived from a window config */
+struct dpu_dpp_p {
+	u32 src_w, src_h;	/* crop, after 90/270 rotation */
+	u32 h_ratio, v_ratio;	/* 12.20 fixed point, src / dst */
+	bool scale, block, rot90;
+};
+
+/* 4.9 dpp_get_params() */
+static void dpp_get_params(const struct decon_win_config *c, u32 fmt, struct dpu_dpp_p *p)
+{
+	const struct decon_win_rect *b = &c->block_area;
+
+	p->rot90 = c->dpp_parm.rot > DPU_ROT_180;
+	p->src_w = p->rot90 ? c->src.h : c->src.w;
+	p->src_h = p->rot90 ? c->src.w : c->src.h;
+	/* dst.w/h >= 16: checked before (4.9 decon_check_limitation()) */
+	p->h_ratio = div_u64((u64)p->src_w << 20, max(c->dst.w, 1U));
+	p->v_ratio = div_u64((u64)p->src_h << 20, max(c->dst.h, 1U));
+	p->scale = p->h_ratio != (1 << 20) || p->v_ratio != (1 << 20);
+	/*
+	 * 4.9: block mode unless rotated, scaled, YUV or too small. Two
+	 * deviations, both only drop a fetch optimisation: no block for AFBC
+	 * (4.9 then fails the DPP check and disables the whole window) and no
+	 * block that is not inside the source crop (4.9 programs it as is).
+	 */
+	p->block = !c->dpp_parm.rot && !p->scale && fmt < DECON_PIXEL_FORMAT_NV16 &&
+		   !c->compression && b->w >= DPU_BLK_WIDTH_MIN && b->h >= DPU_BLK_HEIGHT_MIN &&
+		   b->x >= 0 && b->y >= 0 && b->x + b->w <= c->src.w && b->y + b->h <= c->src.h;
+}
+
+/*
+ * 4.9 dpp_check_limitation() with dpp_check_scale_ratio(), dpp_check_format()
+ * and dpp_check_size(), on the DPP-level format @fmt. NULL if the DPP can
+ * scan the window, else why not. On 4.9 a failure here disabled the window
+ * for that frame (decon_set_dpp_config()); the caller does the same. The
+ * window-level checks (4.9 decon_check_limitation()) come first.
+ */
+const char *dpu_hw_dpp_check(const struct decon_win_config *c, u32 fmt)
+{
+	const struct decon_frame *s = &c->src, *t = &c->dst;
+	u32 id = c->idma_type, hdr = c->dpp_parm.hdr_std, al;
+	bool comp = c->compression, vgf = id == DECON_IDMA_VGF0 || id == DECON_IDMA_VGF1;
+	struct dpu_dpp_p p;
+
+	if (id >= DPU_NR_DPP)
+		return "idma_type out of range";
+	if (c->dpp_parm.rot > DPU_ROT_270)
+		return "rotation value out of range";
+	dpp_get_params(c, fmt, &p);
+
+	/* dpp_check_scale_ratio(): 1/2x down to 8x up */
+	if (p.src_w > t->w * 2 || p.src_h > t->h * 2)
+		return "scale-down below 1/2x";
+	if (p.src_w < (t->w + 7) / 8 || p.src_h < (t->h + 7) / 8)
+		return "scale-up above 8x";
+
+	/* dpp_check_format() */
+	if (id != DECON_IDMA_VGF1 && p.rot90)
+		return "90/270 rotation outside VGF1 (VGRF)";
+	if (id != DECON_IDMA_VGF1 && hdr > DPU_HDR_OFF)
+		return "HDR outside VGF1 (VGRF)";
+	if (hdr > DPU_HDR_HLG)
+		return "unknown HDR standard";
+	if ((id == DECON_IDMA_G0 || id == DECON_IDMA_G1) && fmt_is_yuv(fmt))
+		return "YUV on a G channel";
+	if (!vgf && comp)
+		return "AFBC outside VGF0/VGF1";
+	if (!vgf && p.scale)
+		return "scaling outside VGF0/VGF1";
+	switch (fmt) {
+	case DECON_PIXEL_FORMAT_ARGB_8888:
+	case DECON_PIXEL_FORMAT_ABGR_8888:
+	case DECON_PIXEL_FORMAT_RGBA_8888:
+	case DECON_PIXEL_FORMAT_BGRA_8888:
+	case DECON_PIXEL_FORMAT_XRGB_8888:
+	case DECON_PIXEL_FORMAT_XBGR_8888:
+	case DECON_PIXEL_FORMAT_RGBX_8888:
+	case DECON_PIXEL_FORMAT_BGRX_8888:
+	case DECON_PIXEL_FORMAT_RGB_565:
+	case DECON_PIXEL_FORMAT_NV12:
+	case DECON_PIXEL_FORMAT_NV12M:
+	case DECON_PIXEL_FORMAT_NV21:
+	case DECON_PIXEL_FORMAT_NV21M:
+	case DECON_PIXEL_FORMAT_NV12N:
+	case DECON_PIXEL_FORMAT_NV12N_10B:
+	case DECON_PIXEL_FORMAT_ARGB_2101010:
+	case DECON_PIXEL_FORMAT_ABGR_2101010:
+	case DECON_PIXEL_FORMAT_RGBA_1010102:
+	case DECON_PIXEL_FORMAT_BGRA_1010102:
+	case DECON_PIXEL_FORMAT_NV12M_P010:
+	case DECON_PIXEL_FORMAT_NV21M_P010:
+	case DECON_PIXEL_FORMAT_NV12M_S10B:
+	case DECON_PIXEL_FORMAT_NV21M_S10B:
+		break;
+	default:
+		return "pixel format not supported by the DPP";
+	}
+
+	/* dpp_check_limitation() combinations (block ones: see dpp_get_params) */
+	if (comp && c->dpp_parm.rot)
+		return "AFBC with rotation/flip";
+	if (comp && fmt_is_yuv420(fmt))
+		return "AFBC with YUV420";
+	if (hdr != DPU_HDR_OFF && comp)
+		return "HDR with AFBC";
+	if (hdr != DPU_HDR_OFF && c->dpp_parm.rot)
+		return "HDR with rotation/flip";
+
+	/* dpp_check_size() + dpp_constraints_params() */
+	if (s->x < 0 || s->y < 0 || t->x < 0 || t->y < 0)
+		return "negative source or destination position";
+	al = fmt_is_yuv(fmt) ? 2 : 1;
+	if (!IS_ALIGNED(s->x, al) || !IS_ALIGNED(s->y, al) || !IS_ALIGNED(s->f_w, al) ||
+	    !IS_ALIGNED(s->f_h, al) || !IS_ALIGNED(s->w, al) || !IS_ALIGNED(s->h, al))
+		return "YUV source not 2-pixel aligned";
+	if (s->w > DPU_IMG_MAX || s->w < DPU_IMG_MIN * al ||
+	    s->h > (p.rot90 ? DPU_IMG_ROT_HEIGHT_MAX : DPU_IMG_MAX) || s->h < DPU_IMG_MIN * al)
+		return "source crop size out of range";
+	if (t->w > DPU_SCALED_MAX || t->w < DPU_SCALED_MIN ||
+	    t->h > DPU_SCALED_MAX || t->h < DPU_SCALED_MIN)
+		return "scaled (destination) size out of range";
+	/* + IDMA field widths: SRC_OFFSET 13 bits, SRC_SIZE 16/14 bits */
+	if (s->x + s->w > DPU_SRC_WIDTH_MAX || s->y + s->h > DPU_SRC_HEIGHT_MAX || s->x > 0x1fff ||
+	    s->f_w > DPU_SRC_WIDTH_MAX || s->f_h > DPU_SRC_HEIGHT_MAX)
+		return "source boundary out of range";
+	if (s->x + s->w > s->f_w || s->y + s->h > s->f_h)
+		return "source crop outside the buffer";
+	return NULL;
+}
+
+/*
+ * Planes (fds) the DPP reads for the DPP-level format @fmt, 4.9
+ * dpu_get_plane_cnt(fmt, false), and the bytes each must hold for a
+ * @f_w x @f_h buffer, following the 4.9 address derivation in
+ * dpu_hw_dpp_config(). 4.9 only checked plane 0 >= f_w * f_h * Bpp and
+ * relied on the SysMMU for the rest; without it the IDMA would read
+ * physical memory beyond the buffer, so every plane is checked here.
+ * Returns 0 for formats the DPP check refuses.
+ */
+int dpu_fmt_planes(u32 fmt, u32 f_w, u32 f_h, u64 need[2])
+{
+	u64 px = (u64)f_w * f_h;
+
+	need[1] = 0;
+	switch (fmt) {
+	case DECON_PIXEL_FORMAT_ARGB_8888 ... DECON_PIXEL_FORMAT_BGRX_8888:
+	case DECON_PIXEL_FORMAT_ARGB_2101010 ... DECON_PIXEL_FORMAT_BGRA_1010102:
+		need[0] = px * 4;
+		return 1;
+	case DECON_PIXEL_FORMAT_RGB_565:
+		need[0] = px * 2;
+		return 1;
+	case DECON_PIXEL_FORMAT_NV12N:
+		need[0] = NV12N_Y_SIZE(f_w, f_h) + NV12N_CBCR_SIZE(f_w, f_h);
+		return 1;
+	case DECON_PIXEL_FORMAT_NV12N_10B:
+		need[0] = NV12N_10B_Y_8B_SIZE(f_w, f_h) + NV12N_10B_Y_2B_SIZE(f_w, f_h) +
+			  NV12N_10B_CBCR_8B_SIZE(f_w, f_h) + NV12N_10B_CBCR_2B_SIZE(f_w, f_h);
+		return 1;
+	case DECON_PIXEL_FORMAT_NV12:
+	case DECON_PIXEL_FORMAT_NV21:
+	case DECON_PIXEL_FORMAT_NV12M:
+	case DECON_PIXEL_FORMAT_NV21M:
+		need[0] = px;
+		need[1] = px / 2;
+		return 2;
+	case DECON_PIXEL_FORMAT_NV12M_P010:
+	case DECON_PIXEL_FORMAT_NV21M_P010:
+		need[0] = px * 2;
+		need[1] = px;
+		return 2;
+	case DECON_PIXEL_FORMAT_NV12M_S10B:
+	case DECON_PIXEL_FORMAT_NV21M_S10B:
+		need[0] = NV12M_Y_SIZE(f_w, f_h) + NV12M_Y_2B_SIZE(f_w, f_h);
+		need[1] = NV12M_CBCR_SIZE(f_w, f_h) + NV12M_CBCR_2B_SIZE(f_w, f_h);
+		return 2;
+	default:
+		need[0] = 0;
+		return 0;
+	}
+}
+
 static int sc_ratio_sel(u32 ratio)
 {
 	if (ratio <= DPP_SC_RATIO_MAX)
@@ -303,10 +551,15 @@ static void dpp_set_scale_ratio(struct dpu_dev *d, int id, u32 h_ratio, u32 v_ra
 				       (u32)(s32)v_coef_4t[vs][i][j]);
 }
 
-/* 4.9 dpp_reg_set_format(), RGB entries only: IDMA format, DPP alpha sel */
-static int dpp_set_format(struct dpu_dev *d, int id, u32 dpp_fmt)
+/*
+ * 4.9 dpp_reg_set_format(): IDMA format, DPP alpha select and DPP input
+ * type, then (CONFIG_EXYNOS_AFBC=y) AFBC decoding and its error recovery,
+ * which the IDMA only has on VGF0/VGF1 (4.9 dma_reg_set_afbc_en() returns
+ * early elsewhere).
+ */
+static int dpp_set_format(struct dpu_dev *d, int id, u32 dpp_fmt, bool comp)
 {
-	u32 fmt, a_sel = 0;
+	u32 fmt, type = DPP_IMG_FORMAT_ARGB8888, a_sel = 0;
 
 	switch (dpp_fmt) {
 	case DECON_PIXEL_FORMAT_ARGB_8888:
@@ -326,27 +579,187 @@ static int dpp_set_format(struct dpu_dev *d, int id, u32 dpp_fmt)
 	case DECON_PIXEL_FORMAT_BGRX_8888:
 		fmt = IDMA_IMG_FORMAT_BGRX8888; break;
 	case DECON_PIXEL_FORMAT_RGB_565:
-		fmt = IDMA_IMG_FORMAT_RGB565; break;
+		fmt = comp ? IDMA_IMG_FORMAT_BGR565 : IDMA_IMG_FORMAT_RGB565; break;
+	case DECON_PIXEL_FORMAT_ARGB_2101010:
+		fmt = IDMA_IMG_FORMAT_ARGB2101010;
+		type = DPP_IMG_FORMAT_ARGB8101010; a_sel = 1; break;
+	case DECON_PIXEL_FORMAT_ABGR_2101010:
+		fmt = IDMA_IMG_FORMAT_ABGR2101010;
+		type = DPP_IMG_FORMAT_ARGB8101010; a_sel = 1; break;
+	case DECON_PIXEL_FORMAT_RGBA_1010102:
+		fmt = IDMA_IMG_FORMAT_RGBA2101010;
+		type = DPP_IMG_FORMAT_ARGB8101010; a_sel = 1; break;
+	case DECON_PIXEL_FORMAT_BGRA_1010102:
+		fmt = IDMA_IMG_FORMAT_BGRA2101010;
+		type = DPP_IMG_FORMAT_ARGB8101010; a_sel = 1; break;
+	case DECON_PIXEL_FORMAT_NV12:
+	case DECON_PIXEL_FORMAT_NV12M:
+		fmt = IDMA_IMG_FORMAT_YUV420_2P; type = DPP_IMG_FORMAT_YUV420_8P; break;
+	case DECON_PIXEL_FORMAT_NV21:
+	case DECON_PIXEL_FORMAT_NV21M:
+	case DECON_PIXEL_FORMAT_NV12N:
+		fmt = IDMA_IMG_FORMAT_YVU420_2P; type = DPP_IMG_FORMAT_YUV420_8P; break;
+	case DECON_PIXEL_FORMAT_NV12N_10B:
+		fmt = IDMA_IMG_FORMAT_YVU420_8P2; type = DPP_IMG_FORMAT_YUV420_8P2; break;
+	case DECON_PIXEL_FORMAT_NV12M_P010:
+		fmt = IDMA_IMG_FORMAT_YUV420_P010; type = DPP_IMG_FORMAT_YUV420_P010; break;
+	case DECON_PIXEL_FORMAT_NV21M_P010:
+		fmt = IDMA_IMG_FORMAT_YVU420_P010; type = DPP_IMG_FORMAT_YUV420_P010; break;
+	case DECON_PIXEL_FORMAT_NV12M_S10B:
+		fmt = IDMA_IMG_FORMAT_YVU420_8P2; type = DPP_IMG_FORMAT_YUV420_8P2; break;
+	case DECON_PIXEL_FORMAT_NV21M_S10B:
+		fmt = IDMA_IMG_FORMAT_YUV420_8P2; type = DPP_IMG_FORMAT_YUV420_8P2; break;
 	default:
 		return -EINVAL;
 	}
 
 	dma_wr_mask(d, id, IDMA_IN_CON, IDMA_IMG_FORMAT(fmt), IDMA_IMG_FORMAT_MASK);
 	dpp_wr_mask(d, id, DPP_IN_CON, DPP_ALPHA_SEL(a_sel), DPP_ALPHA_SEL_MASK);
-	dpp_wr_mask(d, id, DPP_IN_CON, DPP_IMG_FORMAT(DPP_IMG_FORMAT_ARGB8888),
-		    DPP_IMG_FORMAT_MASK);
+	dpp_wr_mask(d, id, DPP_IN_CON, DPP_IMG_FORMAT(type), DPP_IMG_FORMAT_MASK);
+
+	if (id == DECON_IDMA_VGF0 || id == DECON_IDMA_VGF1) {
+		dma_wr_mask(d, id, IDMA_IN_CON, comp ? ~0U : 0, IDMA_AFBC_EN);
+		dma_wr_mask(d, id, IDMA_RECOVERY_CTRL, comp ? ~0U : 0, IDMA_RECOVERY_EN);
+	} else if (comp) {
+		return -EINVAL;		/* refused by dpu_hw_dpp_check() */
+	}
 	return 0;
 }
 
 /*
- * 4.9 dpp_reg_configure_params() for an unscaled RGB window:
- * scale ratio 1:1, sizes, rotation 0, base address (Y = C), block off,
- * format. The CSC and HDR steps do not apply to RGB input.
+ * 4.9 dpp_reg_set_csc_config(), VG and VGF channels: CSC standard and range
+ * from the window eq_mode, hard-wired coefficients for BT.601/709/2020 and
+ * DCI-P3. 4.9 selects "customised" for any other standard but never writes
+ * coefficients (SUPPORT_USER_COEF is not defined), so neither does this.
+ * The DPP applies the CSC to YUV input only.
+ */
+static void dpp_set_csc(struct dpu_dev *d, int id, u32 eq_mode)
+{
+	u32 std = eq_mode & 0x3f, rng = (eq_mode >> DPU_CSC_RANGE_SHIFT) & 0x7;
+
+	if (id == DECON_IDMA_G0 || id == DECON_IDMA_G1)
+		return;
+	if (std == DPU_CSC_STD_UNSPEC)
+		std = DPU_CSC_BT_601;
+	if (rng == DPU_CSC_RANGE_UNSPEC)
+		rng = DPU_CSC_RANGE_LIMITED;
+	dpp_wr_mask(d, id, DPP_IN_CON,
+		    DPP_CSC_TYPE(std) | DPP_CSC_RANGE(rng) | DPP_CSC_MODE(std > DPU_CSC_DCI_P3),
+		    DPP_CSC_TYPE_MASK | DPP_CSC_RANGE_MASK | DPP_CSC_MODE_MASK);
+}
+
+/* two 14-bit LUT entries per register (4.9 dpp_reg_set_eotf_lut() etc.) */
+static void dpp_set_lut(struct dpu_dev *d, int id, u32 base, const u16 *lut, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		dpp_wr_mask(d, id, base + (i / 2) * 4, ((u32)lut[i] & 0x3fff) << (16 * (i % 2)),
+			    0x3fffU << (16 * (i % 2)));
+}
+
+/*
+ * 4.9 dpp_reg_set_hdr(), VGF1 (VGRF) on every frame: HDR, EOTF and tone
+ * map on for ST2084/HLG windows, the gamut map enabled unless the window
+ * is DCI-P3 (with HDR off it has no effect; 4.9 sets it anyway), and the
+ * LUTs loaded while HDR is on.
+ */
+static void dpp_set_hdr(struct dpu_dev *d, int id, const struct decon_win_config *c)
+{
+	u32 hdr = c->dpp_parm.hdr_std, eq = c->dpp_parm.eq_mode;
+	u32 maxl = c->dpp_parm.max_luminance;
+	bool en = hdr == DPU_HDR_ST2084 || hdr == DPU_HDR_HLG;
+	int i;
+
+	dpp_wr_mask(d, id, DPP_VGRF_HDR_CON, en ? ~0U : 0, DPP_HDR_ON_MASK);
+	dpp_wr_mask(d, id, DPP_VGRF_HDR_CON, en ? ~0U : 0, DPP_EOTF_ON_MASK);
+	dpp_wr_mask(d, id, DPP_VGRF_HDR_CON, eq != DPU_CSC_DCI_P3 ? ~0U : 0, DPP_GM_ON_MASK);
+	dpp_wr_mask(d, id, DPP_VGRF_HDR_CON, en ? ~0U : 0, DPP_TM_ON_MASK);
+	if (!en)
+		return;
+
+	/* dpp_reg_set_eotf_lut() */
+	if (hdr == DPU_HDR_ST2084 && maxl > 1000) {
+		dpp_set_lut(d, id, DPP_HDR_EOTF_X_AXIS_ADDR(0), eotf_x_axis_st2084_4000, DPP_HDR_MAX_EOTF);
+		dpp_set_lut(d, id, DPP_HDR_EOTF_Y_AXIS_ADDR(0), eotf_y_axis_st2084_4000, DPP_HDR_MAX_EOTF);
+	} else if (hdr == DPU_HDR_ST2084) {
+		dpp_set_lut(d, id, DPP_HDR_EOTF_X_AXIS_ADDR(0), eotf_x_axis_st2084_1000, DPP_HDR_MAX_EOTF);
+		dpp_set_lut(d, id, DPP_HDR_EOTF_Y_AXIS_ADDR(0), eotf_y_axis_st2084_1000, DPP_HDR_MAX_EOTF);
+	} else {
+		dpp_set_lut(d, id, DPP_HDR_EOTF_X_AXIS_ADDR(0), eotf_x_axis_hlg, DPP_HDR_MAX_EOTF);
+		dpp_set_lut(d, id, DPP_HDR_EOTF_Y_AXIS_ADDR(0), eotf_y_axis_hlg, DPP_HDR_MAX_EOTF);
+	}
+
+	/* dpp_reg_set_gm_lut(): BT.2020 only; DCI-P3 and others write nothing */
+	if (eq == DPU_CSC_BT_2020)
+		for (i = 0; i < DPP_HDR_MAX_GM; i++)
+			dpp_wr_mask(d, id, DPP_HDR_GM_COEF_ADDR(i), (u32)gm_coef_2020_p3[i],
+				    DPP_HDR_GM_COEF_MASK);
+
+	/* dpp_reg_set_tm_lut(), tunable off */
+	if (maxl > 1000 && maxl < 10000) {
+		dpp_set_lut(d, id, DPP_HDR_TM_X_AXIS_ADDR(0), tm_x_axis_gamma_2P2_4000, DPP_HDR_MAX_TM);
+		dpp_set_lut(d, id, DPP_HDR_TM_Y_AXIS_ADDR(0), tm_y_axis_gamma_2P2_4000, DPP_HDR_MAX_TM);
+	} else {
+		dpp_set_lut(d, id, DPP_HDR_TM_X_AXIS_ADDR(0), tm_x_axis_gamma_2P2_1000, DPP_HDR_MAX_TM);
+		dpp_set_lut(d, id, DPP_HDR_TM_Y_AXIS_ADDR(0), tm_y_axis_gamma_2P2_1000, DPP_HDR_MAX_TM);
+	}
+}
+
+/*
+ * 4.9 dpp_reg_configure_params() for a window dpu_hw_dpp_check() accepted:
+ * CSC, scale ratio and coefficients, sizes, rotation, plane addresses,
+ * block area, format/AFBC and (VGF1) HDR. @y is plane 0 (fd_idma[0]),
+ * @cb plane 1 (fd_idma[1]) of the two-plane YUV formats; the other planes
+ * are derived as 4.9 dpp_get_params() does. The initial scaler phase is
+ * not written, as on 4.9.
  */
 int dpu_hw_dpp_config(struct dpu_dev *d, int id, const struct decon_win_config *c,
-		      u32 dpp_fmt, dma_addr_t addr)
+		      u32 dpp_fmt, dma_addr_t y, dma_addr_t cb)
 {
-	if (id < 0 || id >= DPU_NR_DPP || upper_32_bits(addr))
+	const struct decon_frame *s = &c->src, *t = &c->dst;
+	const struct decon_win_rect *b = &c->block_area;
+	u64 a[4] = { y, y, 0, 0 };
+	bool is_4p = false;
+	struct dpu_dpp_p p;
+	u32 strd2 = 0;
+
+	if (id < 0 || id >= DPU_NR_DPP)
+		return -EINVAL;
+	dpp_get_params(c, dpp_fmt, &p);
+
+	switch (dpp_fmt) {
+	case DECON_PIXEL_FORMAT_NV12:
+	case DECON_PIXEL_FORMAT_NV21:
+	case DECON_PIXEL_FORMAT_NV12M:
+	case DECON_PIXEL_FORMAT_NV21M:
+	case DECON_PIXEL_FORMAT_NV12M_P010:
+	case DECON_PIXEL_FORMAT_NV21M_P010:
+		a[1] = cb;
+		break;
+	case DECON_PIXEL_FORMAT_NV12N:
+		a[1] = y + NV12N_Y_SIZE(s->f_w, s->f_h);
+		break;
+	case DECON_PIXEL_FORMAT_NV12M_S10B:
+	case DECON_PIXEL_FORMAT_NV21M_S10B:
+		a[1] = cb;
+		a[2] = y + NV12M_Y_SIZE(s->f_w, s->f_h);
+		a[3] = cb + NV12M_CBCR_SIZE(s->f_w, s->f_h);
+		is_4p = true;
+		break;
+	case DECON_PIXEL_FORMAT_NV12N_10B:
+		a[1] = y + NV12N_10B_Y_8B_SIZE(s->f_w, s->f_h) + NV12N_10B_Y_2B_SIZE(s->f_w, s->f_h);
+		a[2] = y + NV12N_10B_Y_8B_SIZE(s->f_w, s->f_h);
+		a[3] = a[1] + NV12N_10B_CBCR_8B_SIZE(s->f_w, s->f_h);
+		is_4p = true;
+		break;
+	default:
+		break;	/* one plane: C mirrors Y (4.9 1p address for AFBC) */
+	}
+	if (is_4p)
+		strd2 = S10B_2B_STRIDE(s->f_w);
+	if (upper_32_bits(a[0]) || upper_32_bits(a[1]) || upper_32_bits(a[2]) ||
+	    upper_32_bits(a[3]))
 		return -EINVAL;
 
 	if (!test_bit(id, &d->dpp_inited) && id != d->boot_dpp) {
@@ -354,49 +767,53 @@ int dpu_hw_dpp_config(struct dpu_dev *d, int id, const struct decon_win_config *
 		set_bit(id, &d->dpp_inited);
 	}
 
-	dpp_set_scale_ratio(d, id, 1 << 20, 1 << 20);
+	dpp_set_csc(d, id, c->dpp_parm.eq_mode);
+	dpp_set_scale_ratio(d, id, p.h_ratio, p.v_ratio);
 
 	/* dpp_reg_set_size() */
-	dma_wr(d, id, IDMA_SRC_OFFSET,
-	       IDMA_SRC_OFFSET_Y(c->src.y) | IDMA_SRC_OFFSET_X(c->src.x));
-	dma_wr(d, id, IDMA_SRC_SIZE,
-	       IDMA_SRC_HEIGHT(c->src.f_h) | IDMA_SRC_WIDTH(c->src.f_w));
-	dma_wr(d, id, IDMA_IMG_SIZE,
-	       IDMA_IMG_HEIGHT(c->src.h) | IDMA_IMG_WIDTH(c->src.w));
-	dpp_wr(d, id, DPP_IMG_SIZE,
-	       DPP_IMG_HEIGHT(c->src.h) | DPP_IMG_WIDTH(c->src.w));
+	dma_wr(d, id, IDMA_SRC_OFFSET, IDMA_SRC_OFFSET_Y(s->y) | IDMA_SRC_OFFSET_X(s->x));
+	dma_wr(d, id, IDMA_SRC_SIZE, IDMA_SRC_HEIGHT(s->f_h) | IDMA_SRC_WIDTH(s->f_w));
+	dma_wr(d, id, IDMA_IMG_SIZE, IDMA_IMG_HEIGHT(s->h) | IDMA_IMG_WIDTH(s->w));
+	dpp_wr(d, id, DPP_IMG_SIZE, DPP_IMG_HEIGHT(p.src_h) | DPP_IMG_WIDTH(p.src_w));
 	if (id == DECON_IDMA_VGF0 || id == DECON_IDMA_VGF1)
 		dpp_wr(d, id, DPP_SCALED_IMG_SIZE,
-		       DPP_SCALED_IMG_HEIGHT(c->dst.h) |
-		       DPP_SCALED_IMG_WIDTH(c->dst.w));
+		       DPP_SCALED_IMG_HEIGHT(t->h) | DPP_SCALED_IMG_WIDTH(t->w));
 
-	/* dma_reg_set_rotation(id, DPP_ROT_NORMAL) */
-	dma_wr_mask(d, id, IDMA_IN_CON, IDMA_ROTATION(0), IDMA_ROTATION_MASK);
+	/* dma_reg_set_rotation() */
+	dma_wr_mask(d, id, IDMA_IN_CON, IDMA_ROTATION(c->dpp_parm.rot), IDMA_ROTATION_MASK);
 
-	/* dpp_reg_set_buf_2p_addr(): RGB uses Y; C mirrors Y as on 4.9 */
-	dma_wr(d, id, IDMA_IN_BASE_ADDR_Y, lower_32_bits(addr));
-	dma_wr(d, id, IDMA_IN_BASE_ADDR_C, lower_32_bits(addr));
-
-	/* dpp_reg_set_block_area(): no block */
-	dma_wr_mask(d, id, IDMA_IN_CON, 0, IDMA_BLOCK_EN);
-
-	if (dpp_set_format(d, id, dpp_fmt))
-		return -EINVAL;
-
-	/*
-	 * 4.9 dpp_reg_set_format() tail (CONFIG_EXYNOS_AFBC=y): AFBC decoding
-	 * and its recovery on the VGF channels only, cleared otherwise. An AFBC
-	 * stream uses one plane and BASE_ADDR_C = BASE_ADDR_Y (set above).
-	 */
-	if (id == DECON_IDMA_VGF0 || id == DECON_IDMA_VGF1) {
-		bool afbc = c->compression;
-
-		dma_wr_mask(d, id, IDMA_IN_CON, afbc ? ~0U : 0, IDMA_AFBC_EN);
-		dma_wr_mask(d, id, IDMA_RECOVERY_CTRL, afbc ? ~0U : 0, IDMA_RECOVERY_EN);
-	} else if (c->compression) {
-		return -EINVAL;		/* 4.9: AFBC decoding is VGF only */
+	/* dpp_reg_set_buf_addr(): 4p with the 2-bit strides, else Y and C */
+	dma_wr(d, id, IDMA_IN_BASE_ADDR_Y, lower_32_bits(a[0]));
+	dma_wr(d, id, IDMA_IN_BASE_ADDR_C, lower_32_bits(a[1]));
+	if (is_4p) {
+		dma_wr(d, id, IDMA_IN_BASE_ADDR_Y2, lower_32_bits(a[2]));
+		dma_wr(d, id, IDMA_IN_BASE_ADDR_C2, lower_32_bits(a[3]));
+		dma_wr_mask(d, id, IDMA_2BIT_STRIDE,
+			    IDMA_LUMA_2B_STRIDE(strd2) | IDMA_CHROMA_2B_STRIDE(strd2),
+			    IDMA_LUMA_2B_STRIDE_MASK | IDMA_CHROMA_2B_STRIDE_MASK);
 	}
+
+	/* dpp_reg_set_block_area() */
+	if (p.block) {
+		dma_wr(d, id, IDMA_BLOCK_OFFSET, IDMA_BLK_OFFSET_Y(b->y) | IDMA_BLK_OFFSET_X(b->x));
+		dma_wr(d, id, IDMA_BLOCK_SIZE, IDMA_BLK_HEIGHT(b->h) | IDMA_BLK_WIDTH(b->w));
+	}
+	dma_wr_mask(d, id, IDMA_IN_CON, p.block ? ~0U : 0, IDMA_BLOCK_EN);
+
+	if (dpp_set_format(d, id, dpp_fmt, c->compression))
+		return -EINVAL;
+	if (id == DECON_IDMA_VGF1)
+		dpp_set_hdr(d, id, c);
 	return 0;
+}
+
+/* scaler state as programmed, for logs: H/V ratio and the scaled size */
+void dpu_hw_dpp_scale_rd(struct dpu_dev *d, int id, u32 *h, u32 *v, u32 *scaled)
+{
+	*h = readl(d->dpp_regs + id * DPP_STRIDE + DPP_MAIN_H_RATIO) & DPP_H_RATIO_MASK;
+	*v = readl(d->dpp_regs + id * DPP_STRIDE + DPP_MAIN_V_RATIO) & DPP_V_RATIO_MASK;
+	*scaled = (id == DECON_IDMA_VGF0 || id == DECON_IDMA_VGF1) ?
+		  readl(d->dpp_regs + id * DPP_STRIDE + DPP_SCALED_IMG_SIZE) : 0;
 }
 
 /* ---- DECON windows (4.9 decon_reg_set_window_control) ---------------- */
@@ -491,10 +908,18 @@ void dpu_hw_win_config(struct dpu_dev *d, int win, const struct decon_win_config
 	decon_wr_mask(d, DATA_PATH_CONTROL_1, WIN_CHMAP_F(win, ch), WIN_CHMAP_MASK(win));
 }
 
-/* 4.9 helper.c dpu_translate_fmt_to_dpp(), RGB entries */
+/* 4.9 helper.c dpu_translate_fmt_to_dpp(): its own inverse */
 u32 dpu_translate_fmt_to_dpp(u32 format)
 {
 	switch (format) {
+	case DECON_PIXEL_FORMAT_NV12: return DECON_PIXEL_FORMAT_NV21;
+	case DECON_PIXEL_FORMAT_NV21: return DECON_PIXEL_FORMAT_NV12;
+	case DECON_PIXEL_FORMAT_NV12M: return DECON_PIXEL_FORMAT_NV21M;
+	case DECON_PIXEL_FORMAT_NV21M: return DECON_PIXEL_FORMAT_NV12M;
+	case DECON_PIXEL_FORMAT_YUV420: return DECON_PIXEL_FORMAT_YVU420;
+	case DECON_PIXEL_FORMAT_YVU420: return DECON_PIXEL_FORMAT_YUV420;
+	case DECON_PIXEL_FORMAT_YUV420M: return DECON_PIXEL_FORMAT_YVU420M;
+	case DECON_PIXEL_FORMAT_YVU420M: return DECON_PIXEL_FORMAT_YUV420M;
 	case DECON_PIXEL_FORMAT_ARGB_8888: return DECON_PIXEL_FORMAT_BGRA_8888;
 	case DECON_PIXEL_FORMAT_ABGR_8888: return DECON_PIXEL_FORMAT_RGBA_8888;
 	case DECON_PIXEL_FORMAT_RGBA_8888: return DECON_PIXEL_FORMAT_ABGR_8888;
@@ -505,14 +930,4 @@ u32 dpu_translate_fmt_to_dpp(u32 format)
 	case DECON_PIXEL_FORMAT_BGRX_8888: return DECON_PIXEL_FORMAT_XRGB_8888;
 	default: return format;
 	}
-}
-
-/* bits per pixel of the supported DPP-level formats, 0 = unsupported */
-int dpu_fmt_bpp(u32 dpp_fmt)
-{
-	if (DPU_FMT_IS_RGB32(dpp_fmt))
-		return 32;
-	if (dpp_fmt == DECON_PIXEL_FORMAT_RGB_565)
-		return 16;
-	return 0;
 }

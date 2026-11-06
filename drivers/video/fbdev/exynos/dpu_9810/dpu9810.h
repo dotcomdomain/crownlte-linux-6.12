@@ -118,7 +118,13 @@ struct dpu_commit {
 	struct list_head node;
 	struct decon_win_config cfg[DECON_MAX_WIN];	/* user format */
 	u32 dpp_fmt[DECON_MAX_WIN];			/* translated */
-	struct dpu_buf buf[DECON_MAX_WIN];
+	struct dpu_buf buf[DECON_MAX_WIN];			/* plane 0 (fd_idma[0]) */
+	/*
+	 * Plane 1 of the two-plane YUV formats (fd_idma[1]); with cofs[i] != 0
+	 * it is not a dma-buf but plane 0 + cofs[i] (fd_idma[1] < 0).
+	 */
+	struct dpu_buf cbuf[DECON_MAX_WIN];
+	u64 cofs[DECON_MAX_WIN];
 	struct dma_fence *acq[DECON_MAX_WIN];
 	struct dma_fence *fence;	/* retire = release fence, may be NULL */
 	unsigned int nr_win;
@@ -206,6 +212,8 @@ struct dpu_dev {
 	atomic64_t fence_seqno;
 	spinlock_t fence_lock;
 	u32 nr_commits, nr_latch_timeouts, nr_rejects;
+	/* windows the DPP check disabled (4.9 decon_set_dpp_config()), features used */
+	u32 nr_dpp_drops, nr_scaled, nr_yuv, nr_rot, nr_hdr, nr_block;
 	u32 nr_base_mismatch;			/* active IDMA base != programmed */
 	struct dpu_bounce bounce[DECON_MAX_WIN][2];	/* per window, double buffered */
 	u8 bounce_next[DECON_MAX_WIN];
@@ -244,6 +252,7 @@ struct dpu_dev {
 	/* self-test */
 	struct delayed_work st_work;
 	u32 st_at_ms, st_flips, st_period_ms;
+	u32 nr_user_calls;			/* S3CFB_WIN_CONFIG calls from userspace */
 	bool stopping;
 
 	/* display matrix self-test (decon_drv.c dpu_mx_thread) */
@@ -319,11 +328,14 @@ void dpu_hw_update_req(struct dpu_dev *d);
 u32 dpu_hw_dma_active_rd(struct dpu_dev *d, int dpp, u32 off);
 void dpu_hw_dpp_init(struct dpu_dev *d, int dpp);
 int dpu_hw_dpp_config(struct dpu_dev *d, int dpp, const struct decon_win_config *c,
-		      u32 dpp_fmt, dma_addr_t addr);
+		      u32 dpp_fmt, dma_addr_t y, dma_addr_t cb);
+const char *dpu_hw_dpp_check(const struct decon_win_config *c, u32 dpp_fmt);
+void dpu_hw_dpp_scale_rd(struct dpu_dev *d, int dpp, u32 *h, u32 *v, u32 *scaled);
 void dpu_hw_win_config(struct dpu_dev *d, int win, const struct decon_win_config *c,
 		       bool enable);
 u32 dpu_translate_fmt_to_dpp(u32 format);
-int dpu_fmt_bpp(u32 dpp_fmt);
+int dpu_fmt_planes(u32 dpp_fmt, u32 f_w, u32 f_h, u64 need[2]);
+bool dpu_fmt_is_yuv(u32 dpp_fmt);
 
 /* decon_drv.c: DECON-side guard around panel commands */
 int dpu_cmd_window_begin(struct dpu_dev *d, u32 *trig);
