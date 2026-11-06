@@ -130,8 +130,6 @@ static void booster_event_work(struct work_struct *work)
 				 msecs_to_jiffies(b->head_ms));
 		if (!b->first_logged) {
 			b->first_logged = true;
-			if (!pressed)
-				b->tail_deadline = jiffies + msecs_to_jiffies(b->tail_ms);
 			mutex_unlock(&b->lock);
 			/* the policy update runs from the policy's work: give it time */
 			usleep_range(5000, 6000);
@@ -142,9 +140,6 @@ static void booster_event_work(struct work_struct *work)
 		mod_delayed_work(system_highpri_wq, &b->tail_work,
 				 msecs_to_jiffies(b->tail_ms));
 	}
-	/* a release (also one coalesced with its touch-down) starts the tail clock */
-	if (!pressed)
-		b->tail_deadline = jiffies + msecs_to_jiffies(b->tail_ms);
 	mutex_unlock(&b->lock);
 }
 
@@ -158,7 +153,10 @@ static void booster_head_end(struct work_struct *work)
 			booster_set(b, PHASE_TAIL);
 			if (!atomic_read(&b->pressed)) {
 				/* released during the head: the tail ends tail_ms after the release */
-				long left = (long)(b->tail_deadline - jiffies);
+				long left;
+
+				smp_rmb();
+				left = (long)(READ_ONCE(b->tail_deadline) - jiffies);
 
 				mod_delayed_work(system_highpri_wq, &b->tail_work,
 						 left > 0 ? left : 0);
@@ -175,13 +173,27 @@ static void booster_tail_end(struct work_struct *work)
 	struct booster *b = container_of(to_delayed_work(work), struct booster, tail_work);
 
 	mutex_lock(&b->lock);
-	if (b->phase == PHASE_TAIL && !atomic_read(&b->pressed))
-		booster_set(b, PHASE_IDLE);
+	if (b->phase == PHASE_TAIL && !atomic_read(&b->pressed)) {
+		long left;
+
+		smp_rmb();
+		left = (long)(READ_ONCE(b->tail_deadline) - jiffies);
+		if (left > 0)
+			/* a newer release moved the deadline: wait for it */
+			mod_delayed_work(system_highpri_wq, &b->tail_work, left);
+		else
+			booster_set(b, PHASE_IDLE);
+	}
 	mutex_unlock(&b->lock);
 }
 
 static void booster_touch(struct booster *b, bool down)
 {
+	if (!down) {
+		/* deadline first, then the release it belongs to (paired smp_rmb) */
+		WRITE_ONCE(b->tail_deadline, jiffies + msecs_to_jiffies(b->tail_ms));
+		smp_wmb();
+	}
 	atomic_set(&b->pressed, down);
 	if (down)
 		atomic_inc(&b->downs);

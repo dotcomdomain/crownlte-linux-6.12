@@ -51,7 +51,7 @@
  * Cooling states are positions in the LITTLE table 1950, 1794, 1690, 1456,
  * 1248, 1053, 949, 832, 715, 598, 455 MHz (state 0 = 1950). If 1950 is not
  * available the same state is one level lower (more throttling; the 96 C
- * cap binds as <9 max> so it exists in both tables); the TMU
+ * cap is the TMU cluster cap, not a cooling state); the TMU
  * driver logs the resulting frequency of every trip next to the ECT value.
  */
 &{/tmu-big@10070000} {
@@ -63,6 +63,14 @@
 &{/tmu-little@10070000} {
 	samsung,cooling-cpu = <&{/cpus/cpu@0}>;
 	samsung,ect-thermal = "LITTLE";
+	/*
+	 * 4.9 LITTLE step 96+ C = 455 MHz: the cluster is capped at its
+	 * cpuinfo.min_freq (455 MHz) from 96 C until below 91 C (4.9 hysteresis
+	 * 5 C) by the same freq QoS cap as the BIG hotplug equivalent. This is
+	 * independent of the cooling-state numbering, which differs with and
+	 * without the 1950 MHz entry.
+	 */
+	samsung,hotplug-temps = <96000 91000>;
 };
 
 &{/thermal-zones/BIG} {
@@ -156,17 +164,7 @@
 			cooling-device = <&{/cpus/cpu@0} 5 5>, <&{/cpus/cpu@1} 5 5>,
 					 <&{/cpus/cpu@2} 5 5>, <&{/cpus/cpu@3} 5 5>;
 		};
-		map96 {	/* 455 MHz = the lowest state, in both tables */
-			trip = <&little_96>;
-			/*
-			 * lower 9, upper THERMAL_NO_LIMIT (= the max state): valid with 10
-			 * states (no 1950: 9 = 455 MHz) and with 11 (9 = 598, step_wise
-			 * reaches 10 = 455 MHz one 250 ms poll later). A fixed state 10
-			 * failed to bind without 1950 and lost the cap.
-			 */
-			cooling-device = <&{/cpus/cpu@0} 9 0xffffffff>, <&{/cpus/cpu@1} 9 0xffffffff>,
-					 <&{/cpus/cpu@2} 9 0xffffffff>, <&{/cpus/cpu@3} 9 0xffffffff>;
-		};
+		/* 96 C: no cooling map; the TMU cluster cap holds 455 MHz (see tmu-little) */
 	};
 };
 
