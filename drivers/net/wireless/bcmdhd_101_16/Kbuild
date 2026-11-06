@@ -11,7 +11,7 @@
 # DHD_SUPPORT_VFS_CALL stays undefined, as on 4.9: dhd_filp_open() and the
 # other dhd_vfs_* helpers are stubs, so DHD reads and writes no files.
 # The object list is the 4.9 dhd.o list plus the two Exynos glue objects
-# (built outside dhd.o on 4.9), minus wl_bam.o.
+# (built outside dhd.o on 4.9), minus wl_bam.o, plus the crownlte self-test.
 #
 # See Documentation/crownlte/wifi-port.md.
 
@@ -297,6 +297,6 @@ ccflags-y += -Wno-unused-but-set-variable -Wno-unused-variable -Wno-unused-funct
 ccflags-y += -Wno-missing-prototypes -Wno-missing-declarations
 ccflags-y += -Wno-strict-prototypes
 
-dhd-y := dhd_pno.o dhd_common.o dhd_ip.o dhd_custom_gpio.o dhd_custom_sec.o 	dhd_linux.o dhd_linux_sched.o dhd_cfg80211.o dhd_linux_wq.o aiutils.o 	bcmevent.o bcmutils.o bcmwifi_channels.o hndpmu.o linux_osl.o linux_pkt.o 	sbutils.o siutils.o wl_android.o wl_cfg80211.o wl_cfgscan.o wl_cfgp2p.o 	wl_cfgvif.o wl_cfg_btcoex.o wldev_common.o wl_linux_mon.o wl_roam.o 	dhd_linux_platdev.o dhd_linux_pktdump.o hnd_pktq.o hnd_pktpool.o 	dhd_custom_cis.o dhd_debug.o dhd_debug_linux.o dhd_mschdbg.o 	dhd_dbg_ring.o bcmstdlib_s.o dhd_linux_exportfs.o wl_cfgnan.o bcmbloom.o 	bcmxtlv.o frag.o dhd_linux_tx.o wl_cfgdbg.o dhd_pcie.o dhd_pcie_linux.o 	pcie_core.o dhd_flowring.o dhd_msgbuf.o dhd_linux_lb.o wl_cfgvendor.o 	bcm_app_utils.o dhd_pktlog.o wl_bigdata.o dhd_event_log_filter.o 	dhd_custom_memprealloc.o dhd_custom_exynos.o
+dhd-y := dhd_pno.o dhd_common.o dhd_ip.o dhd_custom_gpio.o dhd_custom_sec.o 	dhd_linux.o dhd_linux_sched.o dhd_cfg80211.o dhd_linux_wq.o aiutils.o 	bcmevent.o bcmutils.o bcmwifi_channels.o hndpmu.o linux_osl.o linux_pkt.o 	sbutils.o siutils.o wl_android.o wl_cfg80211.o wl_cfgscan.o wl_cfgp2p.o 	wl_cfgvif.o wl_cfg_btcoex.o wldev_common.o wl_linux_mon.o wl_roam.o 	dhd_linux_platdev.o dhd_linux_pktdump.o hnd_pktq.o hnd_pktpool.o 	dhd_custom_cis.o dhd_debug.o dhd_debug_linux.o dhd_mschdbg.o 	dhd_dbg_ring.o bcmstdlib_s.o dhd_linux_exportfs.o wl_cfgnan.o bcmbloom.o 	bcmxtlv.o frag.o dhd_linux_tx.o wl_cfgdbg.o dhd_pcie.o dhd_pcie_linux.o 	pcie_core.o dhd_flowring.o dhd_msgbuf.o dhd_linux_lb.o wl_cfgvendor.o 	bcm_app_utils.o dhd_pktlog.o wl_bigdata.o dhd_event_log_filter.o 	dhd_custom_memprealloc.o dhd_custom_exynos.o dhd_crownlte_selftest.o
 
 obj-$(CONFIG_BCM4361) += dhd.o

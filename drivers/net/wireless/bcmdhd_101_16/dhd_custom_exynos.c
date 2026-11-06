@@ -209,6 +209,7 @@ dhd_crownlte_wlan_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct gpio_desc *reg_on, *wake;
+	u32 selftest_ms = 0;
 	int ret, irq;
 
 	reg_on = devm_gpiod_get(dev, "wlan-reg-on", GPIOD_ASIS);
@@ -269,6 +270,14 @@ dhd_crownlte_wlan_probe(struct platform_device *pdev)
 	crownlte_wlan.probe_ret = 0;
 	dev_info(dev, "BCM4361 powered, PCIe ch%d link up, host-wake irq %d\n",
 		CROWNLTE_PCIE_CH, irq);
+
+	if (of_property_read_bool(dev->of_node, "samsung,wifi-selftest")) {
+		of_property_read_u32(dev->of_node, "samsung,wifi-selftest-ms",
+			&selftest_ms);
+		dhd_crownlte_selftest_arm(dev, selftest_ms,
+			of_property_read_bool(dev->of_node,
+				"samsung,wifi-selftest-keep-up"));
+	}
 	return 0;
 }
 

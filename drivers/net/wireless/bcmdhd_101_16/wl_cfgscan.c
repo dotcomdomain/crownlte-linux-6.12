@@ -6367,3 +6367,177 @@ wl_cfgscan_acs(struct wiphy *wiphy,
 	return ret;
 }
 #endif /* WL_SOFTAP_ACS */
+
+#ifdef DHD_CROWNLTE_612
+#include <dhd_crownlte.h>
+
+static void
+wl_crownlte_scan_top(struct dhd_crownlte_scan_report *rep, const u8 *bssid,
+	s16 rssi, u16 chan)
+{
+	u32 i, pos;
+
+	for (pos = 0; pos < rep->ntop && rep->top_rssi[pos] >= rssi; pos++)
+		;
+	if (pos >= DHD_CROWNLTE_SCAN_TOP)
+		return;
+	if (rep->ntop < DHD_CROWNLTE_SCAN_TOP)
+		rep->ntop++;
+	for (i = rep->ntop - 1; i > pos; i--) {
+		memcpy(rep->top_oui[i], rep->top_oui[i - 1], 3);
+		rep->top_rssi[i] = rep->top_rssi[i - 1];
+		rep->top_chan[i] = rep->top_chan[i - 1];
+	}
+	memcpy(rep->top_oui[pos], bssid, 3);
+	rep->top_rssi[pos] = rssi;
+	rep->top_chan[pos] = chan;
+}
+
+/*
+ * crownlte stage-1 self-test: one passive firmware escan on the primary
+ * interface. The request is synthetic and never given to cfg80211:
+ * cfg->scan_request stays NULL, which is the "internal scan" case that
+ * wl_notify_escan_complete() already handles, so nothing reaches cfg80211 or
+ * userspace. The results are summarised from the escan buffer under
+ * scan_sync. A cfg80211 scan arriving meanwhile force-clears SCANNING in
+ * __wl_cfg80211_scan() and takes over; that is reported as "preempted" and
+ * its request is left alone.
+ */
+int
+wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev, unsigned int timeout_ms,
+	struct dhd_crownlte_scan_report *rep)
+{
+	struct bcm_cfg80211 *cfg;
+	struct wiphy *wiphy;
+	struct cfg80211_scan_request *req = NULL;
+	wl_scan_results_t *list;
+	wl_bss_info_t *bi = NULL;
+	unsigned long t0, deadline;
+	s32 saved_active, err;
+	u32 nch = 0, i;
+	int band;
+
+	memset(rep, 0, sizeof(*rep));
+	cfg = ndev ? wl_get_cfg(ndev) : NULL;
+	if (!cfg || ndev != bcmcfg_to_prmry_ndev(cfg)) {
+		rep->ret = -ENODEV;
+		return rep->ret;
+	}
+	wiphy = bcmcfg_to_wiphy(cfg);
+
+	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+		struct ieee80211_supported_band *sb = wiphy->bands[band];
+
+		if (!sb)
+			continue;
+		for (i = 0; i < sb->n_channels; i++)
+			if (!(sb->channels[i].flags & IEEE80211_CHAN_DISABLED))
+				nch++;
+	}
+	if (!nch) {
+		rep->ret = -ENOENT;
+		return rep->ret;
+	}
+
+	req = kzalloc(struct_size(req, channels, nch), GFP_KERNEL);
+	if (!req) {
+		rep->ret = -ENOMEM;
+		return rep->ret;
+	}
+	nch = 0;
+	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+		struct ieee80211_supported_band *sb = wiphy->bands[band];
+
+		if (!sb)
+			continue;
+		for (i = 0; i < sb->n_channels; i++)
+			if (!(sb->channels[i].flags & IEEE80211_CHAN_DISABLED))
+				req->channels[nch++] = &sb->channels[i];
+	}
+	req->n_channels = nch;
+	req->n_ssids = 0;
+	req->wiphy = wiphy;
+	req->wdev = ndev->ieee80211_ptr;
+	req->scan_start = jiffies;
+	rep->channels = nch;
+
+	mutex_lock(&cfg->scan_sync);
+	if (wl_get_drv_status_all(cfg, SCANNING) || cfg->scan_request ||
+		wl_get_drv_status(cfg, SCAN_ABORTING, ndev) ||
+		cfg->sched_scan_running || cfg->loc.in_progress ||
+		(cfg->p2p_supported && wl_get_p2p_status(cfg, DISCOVERY_ON))) {
+		mutex_unlock(&cfg->scan_sync);
+		rep->ret = -EBUSY;
+		goto out;
+	}
+	if (cfg->p2p_supported)
+		p2p_scan(cfg) = false;
+
+	/* passive: the self-test transmits no probe requests */
+	saved_active = cfg->active_scan;
+	cfg->active_scan = 0;
+	DHD_OS_SCAN_WAKE_LOCK_TIMEOUT((dhd_pub_t *)(cfg->pub),
+		timeout_ms + SCAN_WAKE_LOCK_MARGIN_MS);
+	list = wl_escan_get_buf(cfg, FALSE);	/* the buffer wl_do_escan() fills */
+	err = wl_do_escan(cfg, wiphy, ndev, req);
+	cfg->active_scan = saved_active;
+	if (err) {
+		mutex_unlock(&cfg->scan_sync);
+		DHD_OS_SCAN_WAKE_UNLOCK((dhd_pub_t *)(cfg->pub));
+		rep->ret = err;
+		goto out;
+	}
+	wl_set_drv_status(cfg, SCANNING, ndev);
+	mutex_unlock(&cfg->scan_sync);
+
+	t0 = jiffies;
+	deadline = t0 + msecs_to_jiffies(timeout_ms);
+	while (cfg->escan_info.escan_state == WL_ESCAN_STATE_SCANING &&
+		!cfg->scan_request && time_before(jiffies, deadline))
+		msleep(100);
+
+	mutex_lock(&cfg->scan_sync);
+	rep->elapsed_ms = jiffies_to_msecs(jiffies - t0);
+	if (cfg->scan_request) {
+		rep->preempted = true;
+		mutex_unlock(&cfg->scan_sync);
+		rep->ret = -EBUSY;
+		goto out;
+	}
+	if (cfg->escan_info.escan_state == WL_ESCAN_STATE_SCANING) {
+		rep->timed_out = true;
+		wl_cfgscan_scan_abort(cfg);
+		wl_notify_escan_complete(cfg, ndev, true);
+		mutex_unlock(&cfg->scan_sync);
+		rep->ret = -ETIMEDOUT;
+		goto out;
+	}
+
+	rep->count = list->count;
+	for (i = 0; i < list->count; i++) {
+		chanspec_t cs;
+		u8 *end = (u8 *)list + ESCAN_BUF_SIZE;
+
+		bi = next_bss(list, bi);
+		if ((u8 *)bi + sizeof(*bi) > end || (u8 *)bi + dtoh32(bi->length) > end ||
+			dtoh32(bi->length) < sizeof(*bi)) {
+			rep->count = i;
+			break;
+		}
+		cs = wl_chspec_driver_to_host(bi->chanspec);
+		if (CHSPEC_IS2G(cs))
+			rep->n2g++;
+		else
+			rep->n5g++;
+		wl_crownlte_scan_top(rep, bi->BSSID.octet, (s16)dtoh16(bi->RSSI),
+			wf_chspec_ctlchan(cs));
+	}
+	/* clears SCANNING and drops the scan wakelock; no cfg80211 report */
+	wl_notify_escan_complete(cfg, ndev, false);
+	mutex_unlock(&cfg->scan_sync);
+	rep->ret = 0;
+out:
+	kfree(req);
+	return rep->ret;
+}
+#endif /* DHD_CROWNLTE_612 */
