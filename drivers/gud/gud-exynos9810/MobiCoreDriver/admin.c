@@ -948,6 +948,11 @@ static long admin_ioctl(struct file *file, unsigned int cmd,
 		struct tee_client *client = file->private_data;
 		struct mc_admin_load_info info;
 
+		/* crownlte staging: no secure driver loads while the session guard is on */
+		ret = mc_session_guard(NULL, false, "admin-load-driver");
+		if (ret)
+			break;
+
 		if (copy_from_user(&info, uarg, sizeof(info))) {
 			ret = -EFAULT;
 			break;
@@ -981,6 +986,11 @@ static long admin_ioctl(struct file *file, unsigned int cmd,
 	}
 	case MC_ADMIN_IO_LOAD_CHECK: {
 		struct mc_admin_load_info info;
+
+		/* crownlte staging: refused while the session guard is on */
+		ret = mc_session_guard(NULL, false, "admin-load-check");
+		if (ret)
+			break;
 
 		if (copy_from_user(&info, uarg, sizeof(info))) {
 			ret = -EFAULT;
