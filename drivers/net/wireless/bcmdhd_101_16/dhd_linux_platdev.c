@@ -386,6 +386,17 @@ static int wifi_plat_dev_drv_resume(struct platform_device *pdev)
 	return 0;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+/* platform_driver.remove returns void since 6.11 */
+static void wifi_plat_dev_drv_remove_void(struct platform_device *pdev)
+{
+	(void)wifi_plat_dev_drv_remove(pdev);
+}
+#define WIFI_PLAT_DEV_DRV_REMOVE	wifi_plat_dev_drv_remove_void
+#else
+#define WIFI_PLAT_DEV_DRV_REMOVE	wifi_plat_dev_drv_remove
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0) */
+
 #ifdef CONFIG_DTS
 static const struct of_device_id wifi_device_dt_match[] = {
 	{ .compatible = "android,bcmdhd_wlan", },
@@ -394,7 +405,7 @@ static const struct of_device_id wifi_device_dt_match[] = {
 #endif /* CONFIG_DTS */
 static struct platform_driver wifi_platform_dev_driver = {
 	.probe          = wifi_plat_dev_drv_probe,
-	.remove         = wifi_plat_dev_drv_remove,
+	.remove         = WIFI_PLAT_DEV_DRV_REMOVE,
 	.suspend        = wifi_plat_dev_drv_suspend,
 	.resume         = wifi_plat_dev_drv_resume,
 #ifdef DHD_WIFI_SHUTDOWN
@@ -410,7 +421,7 @@ static struct platform_driver wifi_platform_dev_driver = {
 
 static struct platform_driver wifi_platform_dev_driver_legacy = {
 	.probe          = wifi_plat_dev_drv_probe,
-	.remove         = wifi_plat_dev_drv_remove,
+	.remove         = WIFI_PLAT_DEV_DRV_REMOVE,
 	.suspend        = wifi_plat_dev_drv_suspend,
 	.resume         = wifi_plat_dev_drv_resume,
 #ifdef DHD_WIFI_SHUTDOWN
@@ -589,9 +600,20 @@ static int bcmdhd_wifi_plat_dev_drv_remove(struct platform_device *pdev)
 	return 0;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+static void bcmdhd_wifi_plat_dev_drv_remove_void(struct platform_device *pdev)
+{
+	(void)bcmdhd_wifi_plat_dev_drv_remove(pdev);
+}
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0) */
+
 static struct platform_driver dhd_wifi_platform_dev_driver = {
 	.probe          = bcmdhd_wifi_plat_dev_drv_probe,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0))
+	.remove         = bcmdhd_wifi_plat_dev_drv_remove_void,
+#else
 	.remove         = bcmdhd_wifi_plat_dev_drv_remove,
+#endif
 	.driver         = {
 	.name   = WIFI_PLAT_EXT,
 	}

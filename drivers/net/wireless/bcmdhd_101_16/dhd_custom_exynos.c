@@ -22,60 +22,49 @@
  *
  * $Id$
  */
-#include <linux/device.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
+
+/*
+ * crownlte (Galaxy Note9, Exynos 9810, BCM4361 on PCIe ch0), Linux 6.12.
+ *
+ * Same power sequence and wifi_platform_data callbacks as the crownlte 4.9
+ * dhd_custom_exynos.c (dhd_wlan_init_gpio/dhd_wlan_power/
+ * dhd_wlan_set_carddetect), restructured as a platform driver for the
+ * "samsung,brcm-wlan" DT node so that GPIOs come from gpiod, the pin states
+ * are applied by the driver core, and probe can wait for the PCIe RC
+ * (-EPROBE_DEFER) instead of failing at a fixed initcall. Nothing in DHD
+ * runs unless this node is enabled (dhd_crownlte_wlan_ready()).
+ *
+ * Dropped from 4.9: sec_device_create("wlan") and the gpio_export() links
+ * under /sys/class/sec/wlan (no userspace consumer in Lineage), and the
+ * SDIO/MMC branches (PCIe only).
+ */
+
 #include <linux/delay.h>
-#include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-#include <linux/poll.h>
-#include <linux/miscdevice.h>
-#include <linux/sched.h>
-#include <linux/module.h>
-#include <linux/fs.h>
-#include <linux/list.h>
-#include <linux/io.h>
-#include <linux/workqueue.h>
-#include <linux/unistd.h>
-#include <linux/bug.h>
-#include <linux/skbuff.h>
-#include <linux/init.h>
-#include <linux/platform_device.h>
-#include <linux/wlan_plat.h>
-#if defined(CONFIG_SOC_EXYNOS8895) || defined(CONFIG_SOC_EXYNOS9810) || \
-	defined(CONFIG_SOC_EXYNOS9820) || defined(CONFIG_SOC_EXYNOS9830) || \
-	defined(CONFIG_SOC_EXYNOS2100) || defined(CONFIG_SOC_EXYNOS1000)
 #include <linux/exynos-pci-ctrl.h>
-#endif /* CONFIG_SOC_EXYNOS8895 || CONFIG_SOC_EXYNOS9810 ||
-	* CONFIG_SOC_EXYNOS9820 || CONFIG_SOC_EXYNOS9830 ||
-	* CONFIG_SOC_EXYNOS2100 || CONFIG_SOC_EXYNOS1000
-	*/
+#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
 
-#if defined(CONFIG_64BIT)
-#include <asm-generic/gpio.h>
-#endif /* CONFIG_64BIT */
+#include <typedefs.h>
+#include <linuxver.h>
+#include <osl.h>
+#include <bcmutils.h>
+#include <linux_osl.h>
+#include <dhd_dbg.h>
+#include <dngl_stats.h>
+#include <dhd.h>
+#include <dhd_bus.h>
+#include <dhd_linux.h>
+#include <dhd_crownlte.h>
 
-#ifdef BCMDHD_MODULAR
-#if IS_ENABLED(CONFIG_SEC_SYSFS)
-#include <linux/sec_sysfs.h>
-#endif /* CONFIG_SEC_SYSFS */
-#if IS_ENABLED(CONFIG_DRV_SAMSUNG)
-#include <linux/sec_class.h>
-#endif /* CONFIG_SEC_SYSFS */
-#else
-#if defined(CONFIG_SEC_SYSFS)
-#include <linux/sec_sysfs.h>
-#elif defined(CONFIG_DRV_SAMSUNG)
-#include <linux/sec_class.h>
-#endif /* CONFIG_SEC_SYSFS */
-#endif /* BCMDHD_MODULAR */
-
-#if defined(CONFIG_MACH_A7LTE) || defined(CONFIG_NOBLESSE) || \
-	defined(CONFIG_WLAN_MERLOT)
-#define PINCTL_DELAY 150
-#endif /* CONFIG_MACH_A7LTE || CONFIG_NOBLESSE || CONFIG_WLAN_MERLOT */
+#ifndef WIFI_TURNON_DELAY
+#define WIFI_TURNON_DELAY	200	/* ms, 4.9 dhd_custom_exynos.c (dhd.h has the same) */
+#endif
+#define CROWNLTE_PCIE_CH	0	/* 4.9 EXYNOS_PCIE_CH_NUM for crownlte */
 
 #ifdef CONFIG_BROADCOM_WIFI_RESERVED_MEM
 extern void dhd_exit_wlan_mem(void);
@@ -83,69 +72,40 @@ extern int dhd_init_wlan_mem(void);
 extern void *dhd_wlan_mem_prealloc(int section, unsigned long size);
 #endif /* CONFIG_BROADCOM_WIFI_RESERVED_MEM */
 
-#define WIFI_TURNON_DELAY	200
-static int wlan_pwr_on = -1;
-
-#ifdef CONFIG_BCMDHD_OOB_HOST_WAKE
-static int wlan_host_wake_irq = 0;
-static unsigned int wlan_host_wake_up = -1;
-#endif /* CONFIG_BCMDHD_OOB_HOST_WAKE */
-
-#if defined(CONFIG_MACH_A7LTE) || defined(CONFIG_NOBLESSE) || \
-	defined(CONFIG_WLAN_MERLOT)
-extern struct device *mmc_dev_for_wlan;
-#endif /* CONFIG_MACH_A7LTE || CONFIG_NOBLESSE || CONFIG_WLAN_MERLOT */
-
-#ifdef CONFIG_BCMDHD_PCIE
-extern int pcie_ch_num;
-extern int exynos_pcie_pm_resume(int);
-extern void exynos_pcie_pm_suspend(int);
-#endif /* CONFIG_BCMDHD_PCIE */
-
-#if defined(CONFIG_SOC_EXYNOS7870) || defined(CONFIG_SOC_EXYNOS9110)
-extern struct mmc_host *wlan_mmc;
-extern void mmc_ctrl_power(struct mmc_host *host, bool onoff);
-#endif /* SOC_EXYNOS7870 || CONFIG_SOC_EXYNOS9110 */
+static struct {
+	struct gpio_desc *reg_on;
+	struct gpio_desc *host_wake;
+	int host_wake_irq;
+	bool probed;
+	int probe_ret;
+	u32 power_on;
+	u32 power_off;
+	u32 card_on;
+	u32 card_off;
+	int last_card_ret;
+	int prealloc_ret;
+} crownlte_wlan = {
+	.probe_ret = -ENODEV,
+};
 
 static int
 dhd_wlan_power(int onoff)
 {
-#if defined(CONFIG_MACH_A7LTE) || defined(CONFIG_NOBLESSE) || \
-	defined(CONFIG_WLAN_MERLOT)
-	struct pinctrl *pinctrl = NULL;
-#endif /* CONFIG_MACH_A7LTE || ONFIG_NOBLESSE || CONFIG_WLAN_MERLOT */
+	printk(KERN_INFO "%s Enter: power %s\n", __FUNCTION__, onoff ? "on" : "off");
 
-	printk(KERN_INFO"%s Enter: power %s\n", __FUNCTION__, onoff ? "on" : "off");
-
-#if defined(CONFIG_MACH_A7LTE) || defined(CONFIG_NOBLESSE) || \
-	defined(CONFIG_WLAN_MERLOT)
-	if (onoff) {
-		pinctrl = devm_pinctrl_get_select(mmc_dev_for_wlan, "sdio_wifi_on");
-		if (IS_ERR(pinctrl))
-			printk(KERN_INFO "%s WLAN SDIO GPIO control error\n", __FUNCTION__);
-		msleep(PINCTL_DELAY);
+	if (!crownlte_wlan.reg_on) {
+		printk(KERN_ERR "%s: no WLAN_REG_ON\n", __FUNCTION__);
+		return -EIO;
 	}
-#endif /* CONFIG_MACH_A7LTE || CONFIG_NOBLESSE || CONFIG_WLAN_MERLOT */
-
-	if (gpio_direction_output(wlan_pwr_on, onoff)) {
+	if (gpiod_direction_output(crownlte_wlan.reg_on, onoff ? 1 : 0)) {
 		printk(KERN_ERR "%s failed to control WLAN_REG_ON to %s\n",
 			__FUNCTION__, onoff ? "HIGH" : "LOW");
 		return -EIO;
 	}
-
-#if defined(CONFIG_MACH_A7LTE) || defined(CONFIG_NOBLESSE) || \
-	defined(CONFIG_WLAN_MERLOT)
-	if (!onoff) {
-		pinctrl = devm_pinctrl_get_select(mmc_dev_for_wlan, "sdio_wifi_off");
-		if (IS_ERR(pinctrl))
-			printk(KERN_INFO "%s WLAN SDIO GPIO control error\n", __FUNCTION__);
-	}
-#endif /* CONFIG_MACH_A7LTE || CONFIG_NOBLESSE || CONFIG_WLAN_MERLOT */
-
-#if defined(CONFIG_SOC_EXYNOS7870) || defined(CONFIG_SOC_EXYNOS9110)
-	if (wlan_mmc)
-		mmc_ctrl_power(wlan_mmc, onoff);
-#endif /* SOC_EXYNOS7870 || CONFIG_SOC_EXYNOS9110 */
+	if (onoff)
+		crownlte_wlan.power_on++;
+	else
+		crownlte_wlan.power_off++;
 	return 0;
 }
 
@@ -155,97 +115,18 @@ dhd_wlan_reset(int onoff)
 	return 0;
 }
 
-#ifndef CONFIG_BCMDHD_PCIE
-extern void (*notify_func_callback)(void *dev_id, int state);
-extern void *mmc_host_dev;
-#endif /* !CONFIG_BCMDHD_PCIE */
-
 static int
 dhd_wlan_set_carddetect(int val)
 {
-#ifndef CONFIG_BCMDHD_PCIE
-	pr_err("%s: notify_func=%p, mmc_host_dev=%p, val=%d\n",
-		__FUNCTION__, notify_func_callback, mmc_host_dev, val);
-
-	if (notify_func_callback) {
-		notify_func_callback(mmc_host_dev, val);
-	} else {
-		pr_warning("%s: Nobody to notify\n", __FUNCTION__);
-	}
-#else
 	if (val) {
-		exynos_pcie_pm_resume(pcie_ch_num);
+		crownlte_wlan.card_on++;
+		crownlte_wlan.last_card_ret = exynos_pcie_pm_resume(CROWNLTE_PCIE_CH);
 	} else {
-		exynos_pcie_pm_suspend(pcie_ch_num);
+		crownlte_wlan.card_off++;
+		exynos_pcie_pm_suspend(CROWNLTE_PCIE_CH);
+		crownlte_wlan.last_card_ret = 0;
 	}
-#endif /* CONFIG_BCMDHD_PCIE */
-
-	return 0;
-}
-
-int
-dhd_wlan_init_gpio(void)
-{
-	const char *wlan_node = "samsung,brcm-wlan";
-	struct device_node *root_node = NULL;
-	struct device *wlan_dev;
-
-	wlan_dev = sec_device_create(NULL, "wlan");
-
-	root_node = of_find_compatible_node(NULL, NULL, wlan_node);
-	if (!root_node) {
-		WARN(1, "failed to get device node of bcm4354\n");
-		return -ENODEV;
-	}
-
-	/* ========== WLAN_PWR_EN ============ */
-	wlan_pwr_on = of_get_gpio(root_node, 0);
-	if (!gpio_is_valid(wlan_pwr_on)) {
-		WARN(1, "Invalied gpio pin : %d\n", wlan_pwr_on);
-		return -ENODEV;
-	}
-
-	if (gpio_request(wlan_pwr_on, "WLAN_REG_ON")) {
-		WARN(1, "fail to request gpio(WLAN_REG_ON)\n");
-		return -ENODEV;
-	}
-#ifdef CONFIG_BCMDHD_PCIE
-	gpio_direction_output(wlan_pwr_on, 1);
-	msleep(WIFI_TURNON_DELAY);
-#else
-	gpio_direction_output(wlan_pwr_on, 0);
-#endif /* CONFIG_BCMDHD_PCIE */
-	gpio_export(wlan_pwr_on, 1);
-	if (wlan_dev)
-		gpio_export_link(wlan_dev, "WLAN_REG_ON", wlan_pwr_on);
-
-#ifdef CONFIG_BCMDHD_PCIE
-	if (exynos_pcie_pm_resume(pcie_ch_num)) {
-		WARN(1, "pcie link up failure\n");
-		return -ENODEV;
-	}
-#endif /* CONFIG_BCMDHD_PCIE */
-
-#ifdef CONFIG_BCMDHD_OOB_HOST_WAKE
-	/* ========== WLAN_HOST_WAKE ============ */
-	wlan_host_wake_up = of_get_gpio(root_node, 1);
-	if (!gpio_is_valid(wlan_host_wake_up)) {
-		WARN(1, "Invalied gpio pin : %d\n", wlan_host_wake_up);
-		return -ENODEV;
-	}
-
-	if (gpio_request(wlan_host_wake_up, "WLAN_HOST_WAKE")) {
-		WARN(1, "fail to request gpio(WLAN_HOST_WAKE)\n");
-		return -ENODEV;
-	}
-	gpio_direction_input(wlan_host_wake_up);
-	gpio_export(wlan_host_wake_up, 1);
-	if (wlan_dev)
-		gpio_export_link(wlan_dev, "WLAN_HOST_WAKE", wlan_host_wake_up);
-
-	wlan_host_wake_irq = gpio_to_irq(wlan_host_wake_up);
-#endif /* CONFIG_BCMDHD_OOB_HOST_WAKE */
-
+	/* 4.9 ignored the RC result here as well */
 	return 0;
 }
 
@@ -253,15 +134,15 @@ dhd_wlan_init_gpio(void)
 int
 dhd_get_wlan_oob_gpio(void)
 {
-	return gpio_is_valid(wlan_host_wake_up) ?
-		gpio_get_value(wlan_host_wake_up) : -1;
+	return crownlte_wlan.host_wake ?
+		gpiod_get_value(crownlte_wlan.host_wake) : -1;
 }
 EXPORT_SYMBOL(dhd_get_wlan_oob_gpio);
+
 int
 dhd_get_wlan_oob_gpio_number(void)
 {
-	return gpio_is_valid(wlan_host_wake_up) ?
-		wlan_host_wake_up : -1;
+	return crownlte_wlan.host_wake ? desc_to_gpio(crownlte_wlan.host_wake) : -1;
 }
 EXPORT_SYMBOL(dhd_get_wlan_oob_gpio_number);
 #endif /* CONFIG_BCMDHD_OOB_HOST_WAKE && CONFIG_BCMDHD_GET_OOB_STATE */
@@ -271,11 +152,7 @@ struct resource dhd_wlan_resources = {
 	.start	= 0,
 	.end	= 0,
 	.flags	= IORESOURCE_IRQ | IORESOURCE_IRQ_SHAREABLE |
-#ifdef CONFIG_BCMDHD_PCIE
 	IORESOURCE_IRQ_HIGHEDGE,
-#else
-	IORESOURCE_IRQ_HIGHLEVEL,
-#endif /* CONFIG_BCMDHD_PCIE */
 };
 EXPORT_SYMBOL(dhd_wlan_resources);
 
@@ -289,60 +166,123 @@ struct wifi_platform_data dhd_wlan_control = {
 };
 EXPORT_SYMBOL(dhd_wlan_control);
 
+bool
+dhd_crownlte_wlan_ready(void)
+{
+	return crownlte_wlan.probed && crownlte_wlan.probe_ret == 0;
+}
+
+void
+dhd_crownlte_get_plat_status(struct dhd_crownlte_plat_status *st)
+{
+	memset(st, 0, sizeof(*st));
+	st->probed = crownlte_wlan.probed;
+	st->probe_ret = crownlte_wlan.probe_ret;
+	st->reg_on = crownlte_wlan.reg_on ?
+		gpiod_get_value_cansleep(crownlte_wlan.reg_on) : -1;
+	st->host_wake = crownlte_wlan.host_wake ?
+		gpiod_get_value_cansleep(crownlte_wlan.host_wake) : -1;
+	st->host_wake_irq = crownlte_wlan.host_wake_irq;
+	st->power_on = crownlte_wlan.power_on;
+	st->power_off = crownlte_wlan.power_off;
+	st->card_on = crownlte_wlan.card_on;
+	st->card_off = crownlte_wlan.card_off;
+	st->last_card_ret = crownlte_wlan.last_card_ret;
+	st->prealloc_ret = crownlte_wlan.prealloc_ret;
+}
+
+/* Called by dhd_linux_platdev.c only for BCMDHD_MODULAR builds. */
 int
 dhd_wlan_init(void)
 {
-	int ret;
-
-	printk(KERN_INFO "%s: START.......\n", __FUNCTION__);
-	ret = dhd_wlan_init_gpio();
-	if (ret < 0) {
-		printk(KERN_ERR "%s: failed to initiate GPIO, ret=%d\n",
-			__FUNCTION__, ret);
-		goto fail;
-	}
-
-#ifdef CONFIG_BCMDHD_OOB_HOST_WAKE
-	dhd_wlan_resources.start = wlan_host_wake_irq;
-	dhd_wlan_resources.end = wlan_host_wake_irq;
-#endif /* CONFIG_BCMDHD_OOB_HOST_WAKE */
-
-#ifdef CONFIG_BROADCOM_WIFI_RESERVED_MEM
-	ret = dhd_init_wlan_mem();
-	if (ret < 0) {
-		printk(KERN_ERR "%s: failed to alloc reserved memory,"
-			" ret=%d\n", __FUNCTION__, ret);
-	}
-#endif /* CONFIG_BROADCOM_WIFI_RESERVED_MEM */
-
-fail:
-	return ret;
+	return dhd_crownlte_wlan_ready() ? 0 : -ENODEV;
 }
 
 int
 dhd_wlan_deinit(void)
 {
-#ifdef CONFIG_BCMDHD_OOB_HOST_WAKE
-	gpio_free(wlan_host_wake_up);
-#endif /* CONFIG_BCMDHD_OOB_HOST_WAKE */
-	gpio_free(wlan_pwr_on);
-
-#ifdef CONFIG_BROADCOM_WIFI_RESERVED_MEM
-	dhd_exit_wlan_mem();
-#endif /*  CONFIG_BROADCOM_WIFI_RESERVED_MEM */
 	return 0;
 }
 
-#ifndef BCMDHD_MODULAR
-#if defined(CONFIG_MACH_UNIVERSAL7420) || defined(CONFIG_SOC_EXYNOS8890) || \
-	defined(CONFIG_SOC_EXYNOS8895) || defined(CONFIG_SOC_EXYNOS9810) || \
-	defined(CONFIG_SOC_EXYNOS9820) || defined(CONFIG_SOC_EXYNOS9830)
-#if defined(CONFIG_DEFERRED_INITCALLS)
-deferred_module_init(dhd_wlan_init);
-#else
-late_initcall(dhd_wlan_init);
-#endif /* CONFIG_DEFERRED_INITCALLS */
-#else
-device_initcall(dhd_wlan_init);
-#endif /* CONFIG Exynos PCIE Platforms */
-#endif /* !BCMDHD_MODULAR */
+static int
+dhd_crownlte_wlan_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct gpio_desc *reg_on, *wake;
+	int ret, irq;
+
+	reg_on = devm_gpiod_get(dev, "wlan-reg-on", GPIOD_ASIS);
+	if (IS_ERR(reg_on))
+		return dev_err_probe(dev, PTR_ERR(reg_on), "WLAN_REG_ON\n");
+	wake = devm_gpiod_get(dev, "wlan-host-wake", GPIOD_IN);
+	if (IS_ERR(wake))
+		return dev_err_probe(dev, PTR_ERR(wake), "WLAN_HOST_WAKE\n");
+	irq = gpiod_to_irq(wake);
+	if (irq < 0)
+		return dev_err_probe(dev, irq, "WLAN_HOST_WAKE irq\n");
+
+	crownlte_wlan.reg_on = reg_on;
+	crownlte_wlan.host_wake = wake;
+	crownlte_wlan.host_wake_irq = irq;
+
+	/* 4.9 dhd_wlan_init_gpio(): REG_ON high, 200 ms, then train the link */
+	ret = gpiod_direction_output(reg_on, 1);
+	if (ret)
+		return dev_err_probe(dev, ret, "WLAN_REG_ON output\n");
+	crownlte_wlan.power_on++;
+	msleep(WIFI_TURNON_DELAY);
+
+	crownlte_wlan.card_on++;
+	ret = exynos_pcie_pm_resume(CROWNLTE_PCIE_CH);
+	crownlte_wlan.last_card_ret = ret;
+	if (ret == -ENODEV) {
+		/* RC not probed yet: power the chip down again and retry later */
+		gpiod_direction_output(reg_on, 0);
+		crownlte_wlan.power_off++;
+		crownlte_wlan.reg_on = NULL;
+		crownlte_wlan.host_wake = NULL;
+		return -EPROBE_DEFER;
+	}
+	if (ret) {
+		dev_err(dev, "pcie link up failure: %d, WLAN_REG_ON low\n", ret);
+		gpiod_direction_output(reg_on, 0);
+		crownlte_wlan.power_off++;
+		/* devm releases the GPIOs when probe fails */
+		crownlte_wlan.reg_on = NULL;
+		crownlte_wlan.host_wake = NULL;
+		crownlte_wlan.probed = true;
+		crownlte_wlan.probe_ret = ret;
+		return ret;
+	}
+
+	dhd_wlan_resources.start = irq;
+	dhd_wlan_resources.end = irq;
+
+#ifdef CONFIG_BROADCOM_WIFI_RESERVED_MEM
+	crownlte_wlan.prealloc_ret = dhd_init_wlan_mem();
+	if (crownlte_wlan.prealloc_ret < 0)
+		dev_err(dev, "failed to alloc reserved memory, ret=%d\n",
+			crownlte_wlan.prealloc_ret);
+#endif /* CONFIG_BROADCOM_WIFI_RESERVED_MEM */
+
+	crownlte_wlan.probed = true;
+	crownlte_wlan.probe_ret = 0;
+	dev_info(dev, "BCM4361 powered, PCIe ch%d link up, host-wake irq %d\n",
+		CROWNLTE_PCIE_CH, irq);
+	return 0;
+}
+
+static const struct of_device_id dhd_crownlte_wlan_of_match[] = {
+	{ .compatible = "samsung,brcm-wlan" },
+	{ }
+};
+
+static struct platform_driver dhd_crownlte_wlan_driver = {
+	.probe = dhd_crownlte_wlan_probe,
+	.driver = {
+		.name = "crownlte-brcm-wlan",
+		.of_match_table = dhd_crownlte_wlan_of_match,
+		.suppress_bind_attrs = true,
+	},
+};
+builtin_platform_driver(dhd_crownlte_wlan_driver);

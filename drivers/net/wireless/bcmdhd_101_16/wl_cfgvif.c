@@ -3295,9 +3295,16 @@ wl_cfg80211_start_ap(
  *      hardcoded values in 'wl_cfg80211_set_channel()'.
  */
 #if ((LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)) && !defined(WL_COMPAT_WIRELESS))
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0))
+	/* wdev->preset_chandef is gone; nl80211 hands the channel in info */
+	if ((err = wl_cfg80211_set_channel(wiphy, dev,
+		info->chandef.chan,
+		NL80211_CHAN_HT20) < 0)) {
+#else
 	if ((err = wl_cfg80211_set_channel(wiphy, dev,
 		dev->ieee80211_ptr->preset_chandef.chan,
 		NL80211_CHAN_HT20) < 0)) {
+#endif
 		WL_ERR(("Set channel failed \n"));
 		goto fail;
 	}
@@ -4746,7 +4753,11 @@ wl_cfg80211_ch_switch_notify(struct net_device *dev, uint16 chanspec, struct wip
 	}
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION (3, 8, 0))
 	freq = chandef.chan ? chandef.chan->center_freq : chandef.center_freq1;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
+	cfg80211_ch_switch_notify(dev, &chandef, 0);
+#else
 	cfg80211_ch_switch_notify(dev, &chandef);
+#endif
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION (3, 5, 0) && (LINUX_VERSION_CODE <= (3, 7, \
 	0)))
 	freq = chan_info.freq;

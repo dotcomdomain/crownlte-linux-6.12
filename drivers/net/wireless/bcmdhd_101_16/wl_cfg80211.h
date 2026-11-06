@@ -106,6 +106,17 @@ struct wl_ibss;
 #define WL_SELF_MANAGED_REGDOM
 #endif /* KERNEL >= 4.0 */
 
+/* crownlte: struct wireless_dev moved these into unions/links[] in 6.0 */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0))
+#define WL_WDEV_SSID(wdev)		((wdev)->u.client.ssid)
+#define WL_WDEV_SSID_LEN(wdev)		((wdev)->u.client.ssid_len)
+#define WL_WDEV_CURRENT_BSS(wdev)	((wdev)->links[0].client.current_bss)
+#else
+#define WL_WDEV_SSID(wdev)		((wdev)->ssid)
+#define WL_WDEV_SSID_LEN(wdev)		((wdev)->ssid_len)
+#define WL_WDEV_CURRENT_BSS(wdev)	((wdev)->current_bss)
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0) */
+
 /* mandatory for Android 11 */
 #define WL_ACT_FRAME_MAC_RAND
 

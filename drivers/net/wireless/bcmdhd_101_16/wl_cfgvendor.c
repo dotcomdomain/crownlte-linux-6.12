@@ -9562,9 +9562,11 @@ const struct nla_policy rtt_attr_policy[RTT_ATTRIBUTE_MAX] = {
 	[RTT_ATTRIBUTE_RESULTS_COMPLETE] = { .type = NLA_U32 },
 	[RTT_ATTRIBUTE_RESULTS_PER_TARGET] = { .type = NLA_NESTED },
 	[RTT_ATTRIBUTE_RESULT_CNT] = { .type = NLA_U32 },
+#ifdef RTT_SUPPORT
 	[RTT_ATTRIBUTE_RESULT] = { .type = NLA_BINARY, .len = sizeof(rtt_result_t) },
 	[RTT_ATTRIBUTE_RESULT_DETAIL] = { .type = NLA_BINARY,
 	.len = sizeof(struct rtt_result_detail) },
+#endif /* RTT_SUPPORT */
 };
 
 #ifdef RSSI_MONITOR_SUPPORT

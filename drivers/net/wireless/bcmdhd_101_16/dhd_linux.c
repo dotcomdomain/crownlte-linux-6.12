@@ -61,7 +61,11 @@
 #endif /* ENABLE_ADAPTIVE_SCHED */
 #include <linux/rtc.h>
 #include <asm/uaccess.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
+#include <net/ndisc.h>
+#ifdef DHD_CROWNLTE_612
+#include <dhd_crownlte.h>
+#endif /* DHD_CROWNLTE_612 */
 #include <dhd_linux_priv.h>
 
 #include <epivers.h>
@@ -2499,7 +2503,7 @@ _dhd_set_mac_address(dhd_info_t *dhd, int ifidx, uint8 *addr)
 	if (ret < 0) {
 		DHD_ERROR(("%s: set cur_etheraddr failed\n", dhd_ifname(&dhd->pub, ifidx)));
 	} else {
-		memcpy(dhd->iflist[ifidx]->net->dev_addr, addr, ETHER_ADDR_LEN);
+		eth_hw_addr_set(dhd->iflist[ifidx]->net, addr);
 		if (ifidx == 0)
 			memcpy(dhd->pub.mac.octet, addr, ETHER_ADDR_LEN);
 	}
@@ -2910,7 +2914,7 @@ dhd_set_mac_address(struct net_device *dev, void *addr)
 			 * available). Store the address and return. macaddr will be applied
 			 * from interface create context.
 			 */
-			(void)memcpy_s(dev->dev_addr, ETH_ALEN, dhdif->mac_addr, ETH_ALEN);
+			eth_hw_addr_set(dev, dhdif->mac_addr);
 			return ret;
 		}
 #endif /* WL_STATIC_IF */
@@ -3898,7 +3902,9 @@ dhd_rx_frame(dhd_pub_t *dhdp, int ifidx, void *pktbuf, int numpkt, uint8 chan)
 				qdisc = dev_ingress_queue(ifp->net)->qdisc_sleeping;
 				if (qdisc != NULL && (qdisc->flags & TCQ_F_INGRESS)) {
 #ifdef CONFIG_NET_CLS_ACT
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
+#if defined(CONFIG_NET_XGRESS) && (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0))
+					if (rcu_access_pointer(ifp->net->tcx_ingress) != NULL) {
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0))
 					if (ifp->net->miniq_ingress != NULL) {
 #elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0))
 					if (ifp->net->ingress_cl_list != NULL) {
@@ -6809,7 +6815,7 @@ dhd_open(struct net_device *net)
 #endif
 
 		/* dhd_sync_with_dongle has been called in dhd_bus_start or wl_android_wifi_on */
-		memcpy(net->dev_addr, dhd->pub.mac.octet, ETHER_ADDR_LEN);
+		eth_hw_addr_set(net, dhd->pub.mac.octet);
 
 #ifdef TOE
 		/* Get current TOE mode from dongle */
@@ -6834,8 +6840,13 @@ dhd_open(struct net_device *net)
 		if (dhd->rx_napi_netdev == NULL) {
 			dhd->rx_napi_netdev = dhd->iflist[ifidx]->net;
 			memset(&dhd->rx_napi_struct, 0, sizeof(struct napi_struct));
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0))
+			netif_napi_add_weight(dhd->rx_napi_netdev, &dhd->rx_napi_struct,
+				dhd_napi_poll, dhd_napi_weight);
+#else
 			netif_napi_add(dhd->rx_napi_netdev, &dhd->rx_napi_struct,
 				dhd_napi_poll, dhd_napi_weight);
+#endif
 			DHD_INFO(("%s napi<%p> enabled ifp->net<%p,%s> dhd_napi_weight: %d\n",
 				__FUNCTION__, &dhd->rx_napi_struct, net,
 				net->name, dhd_napi_weight));
@@ -12811,7 +12822,7 @@ dhd_register_if(dhd_pub_t *dhdp, int ifidx, bool need_rtnl_lock)
 	 * XXX Linux 2.6.25 does not like a blank MAC address, so use a
 	 * dummy address until the interface is brought up.
 	 */
-	memcpy(net->dev_addr, temp_addr, ETHER_ADDR_LEN);
+	eth_hw_addr_set(net, temp_addr);
 
 	if (ifidx == 0)
 		printf("%s\n", dhd_version);
@@ -13517,6 +13528,19 @@ static int
 dhd_module_init(void)
 {
 	int err;
+
+#ifdef DHD_CROWNLTE_612
+	/*
+	 * crownlte: the samsung,brcm-wlan DT node gates everything. Without it
+	 * (or if the chip/link did not come up) DHD registers no driver, no
+	 * wlan0 and no /sys/wifi.
+	 */
+	if (!dhd_crownlte_wlan_ready()) {
+		DHD_ERROR(("%s: crownlte wlan platform not ready, DHD stays off\n",
+			__FUNCTION__));
+		return 0;
+	}
+#endif /* DHD_CROWNLTE_612 */
 
 	err = _dhd_module_init();
 #ifdef DHD_SUPPORT_HDM
@@ -21137,6 +21161,21 @@ dhd_write_file(const char *filepath, char *buf, int buf_len)
 	mm_segment_t old_fs;
 	int ret = 0;
 
+#ifdef DHD_CROWNLTE_612
+	/*
+	 * crownlte: refuse every kernel file write. Callers include
+	 * dhd_check_module_mac() with /efs/wifi/.mac.info. On 4.9 this already
+	 * failed because DHD_SUPPORT_VFS_CALL was off; make it explicit.
+	 */
+	DHD_ERROR(("%s: write to %s suppressed (crownlte)\n", __FUNCTION__, filepath));
+	BCM_REFERENCE(fp);
+	BCM_REFERENCE(old_fs);
+	BCM_REFERENCE(buf);
+	BCM_REFERENCE(buf_len);
+	BCM_REFERENCE(ret);
+	return BCME_ERROR;
+#endif /* DHD_CROWNLTE_612 */
+
 	/* change to KERNEL_DS address limit */
 	old_fs = get_fs();
 	set_fs(KERNEL_DS);
@@ -21766,7 +21805,11 @@ dhd_print_kirqstats(dhd_pub_t *dhd, unsigned int irq_num)
 	bcm_bprintf(&strbuf, "dhd irq %u:", irq_num);
 	for_each_online_cpu(i)
 		bcm_bprintf(&strbuf, "%10u ",
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))
+			desc->kstat_irqs ? per_cpu_ptr(desc->kstat_irqs, i)->cnt : 0);
+#else
 			desc->kstat_irqs ? *per_cpu_ptr(desc->kstat_irqs, i) : 0);
+#endif
 	if (desc->irq_data.chip) {
 		if (desc->irq_data.chip->name)
 			bcm_bprintf(&strbuf, " %8s", desc->irq_data.chip->name);

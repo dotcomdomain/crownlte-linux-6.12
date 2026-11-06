@@ -403,8 +403,8 @@ s32 wl_inform_single_bss(struct bcm_cfg80211 *cfg, wl_bss_info_t *bi, bool updat
 	signal = notif_bss_info->rssi * 100;
 	if (!mgmt->u.probe_resp.timestamp) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 39))
-		struct timespec ts;
-		get_monotonic_boottime(&ts);
+		struct timespec64 ts;
+		ktime_get_boottime_ts64(&ts);
 		mgmt->u.probe_resp.timestamp = ((u64)ts.tv_sec*1000000)
 				+ ts.tv_nsec / 1000;
 #else
@@ -631,7 +631,7 @@ wl_bcnrecv_result_handler(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev,
 	s32 err = BCME_OK;
 	struct wiphy *wiphy = NULL;
 	wl_bcnrecv_result_t *bcn_recv = NULL;
-	struct timespec ts;
+	struct timespec64 ts;
 	if (!bi) {
 		WL_ERR(("%s: bi is NULL\n", __func__));
 		err = BCME_NORESOURCE;
@@ -664,7 +664,7 @@ wl_bcnrecv_result_handler(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev,
 		bcn_recv->beacon_interval = bi->beacon_period;
 
 		/* kernal timestamp */
-		get_monotonic_boottime(&ts);
+		ktime_get_boottime_ts64(&ts);
 		bcn_recv->system_time = ((u64)ts.tv_sec*1000000)
 				+ ts.tv_nsec / 1000;
 		bcn_recv->timestamp[0] = bi->timestamp[0];
@@ -3659,6 +3659,25 @@ wl_cfgscan_sched_scan_stop_work(struct work_struct *work)
 	cfg = container_of(dw, struct bcm_cfg80211, sched_scan_stop_work);
 	GCC_DIAGNOSTIC_POP();
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0))
+	/*
+	 * crownlte: since 5.12 cfg80211 serialises ops with the wiphy mutex
+	 * (nl80211: rtnl -> wiphy -> driver), and _rtnl() became _locked().
+	 * Take the locks in the same order as the cfg80211_ops path.
+	 */
+	wiphy = bcmcfg_to_wiphy(cfg);
+	rtnl_lock();
+	wiphy_lock(wiphy);
+	mutex_lock(&cfg->scan_sync);
+	if (cfg->sched_scan_req) {
+		cfg80211_sched_scan_stopped_locked(cfg->sched_scan_req->wiphy,
+			cfg->sched_scan_req->reqid);
+		cfg->sched_scan_req = NULL;
+	}
+	mutex_unlock(&cfg->scan_sync);
+	wiphy_unlock(wiphy);
+	rtnl_unlock();
+#else
 	/* Hold rtnl_lock -> scan_sync lock to be in sync with cfg80211_ops path */
 	rtnl_lock();
 	mutex_lock(&cfg->scan_sync);
@@ -3676,6 +3695,7 @@ wl_cfgscan_sched_scan_stop_work(struct work_struct *work)
 	}
 	mutex_unlock(&cfg->scan_sync);
 	rtnl_unlock();
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0) */
 }
 #endif /* WL_SCHED_SCAN */
 
@@ -3849,7 +3869,11 @@ static void wl_scan_timeout(unsigned long data)
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)) && !defined(CONFIG_MODULES)
 	/* Print WQ states. Enable only for in-built drivers as the symbol is not exported  */
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0))
+	show_all_workqueues();
+#else
 	show_workqueue_state();
+#endif
 #endif /* LINUX_VER >= 4.1 && !CONFIG_MODULES */
 
 	bss_list = wl_escan_get_buf(cfg, FALSE);

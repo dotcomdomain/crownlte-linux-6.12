@@ -42,11 +42,19 @@ extern dhd_pub_t* g_dhd_pub;
 static int dhd_ring_proc_open(struct inode *inode, struct file *file);
 ssize_t dhd_ring_proc_read(struct file *file, char *buffer, size_t tt, loff_t *loff);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+static const struct proc_ops dhd_ring_proc_fops = {
+	.proc_open = dhd_ring_proc_open,
+	.proc_read = dhd_ring_proc_read,
+	.proc_release = single_release,
+};
+#else
 static const struct file_operations dhd_ring_proc_fops = {
 	.open = dhd_ring_proc_open,
 	.read = dhd_ring_proc_read,
 	.release = single_release,
 };
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0) */
 
 static int
 dhd_ring_proc_open(struct inode *inode, struct file *file)
@@ -1696,9 +1704,16 @@ static struct sysfs_ops dhd_sysfs_ops = {
 	.store = dhd_store,
 };
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0))
+ATTRIBUTE_GROUPS(default_file);
+#endif
 static struct kobj_type dhd_ktype = {
 	.sysfs_ops = &dhd_sysfs_ops,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0))
+	.default_groups = default_file_groups,
+#else
 	.default_attrs = default_file_attrs,
+#endif
 };
 
 /*
@@ -2155,9 +2170,16 @@ static struct sysfs_ops dhd_sysfs_lb_ops = {
 	.store = dhd_lb_store,
 };
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0))
+ATTRIBUTE_GROUPS(debug_lb);
+#endif
 static struct kobj_type dhd_lb_ktype = {
 	.sysfs_ops = &dhd_sysfs_lb_ops,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0))
+	.default_groups = debug_lb_groups,
+#else
 	.default_attrs = debug_lb_attrs,
+#endif
 };
 #endif /* DHD_LB */
 

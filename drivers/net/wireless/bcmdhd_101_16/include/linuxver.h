@@ -89,6 +89,8 @@
 #include <linux/netdevice.h>
 #include <linux/time.h>
 #include <linux/rtc.h>
+/* crownlte: 6.12 API compatibility */
+#include <linuxver_crownlte612.h>
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27))
 #include <linux/semaphore.h>
 #else

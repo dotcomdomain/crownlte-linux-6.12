@@ -45,7 +45,7 @@
 #include <linux/ethtool.h>
 #include <linux/proc_fs.h>
 #include <asm/uaccess.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
 #include <linux/fs.h>
 #include <linux/namei.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
@@ -3816,6 +3816,14 @@ void * BCMFASTPATH(dhd_rxpool_pktget)(osl_t *osh, struct dhd_info *dhd, uint16 l
 #endif /* RX_PKT_POOL */
 
 #if defined(__linux__)
+#if defined(DHD_CROWNLTE_612) && defined(DHD_SUPPORT_VFS_CALL)
+/*
+ * crownlte: 4.9 was built without DHD_SUPPORT_VFS_CALL, so every dhd_filp_open()
+ * failed and DHD never touched a file. Keep it that way: with VFS calls on,
+ * dhd_check_module_mac() would write /efs/wifi/.mac.info.
+ */
+#error "crownlte: DHD kernel file I/O must stay disabled"
+#endif /* DHD_CROWNLTE_612 && DHD_SUPPORT_VFS_CALL */
 #ifdef DHD_SUPPORT_VFS_CALL
 static INLINE struct file *dhd_filp_open(const char *filename, int flags, int mode)
 {

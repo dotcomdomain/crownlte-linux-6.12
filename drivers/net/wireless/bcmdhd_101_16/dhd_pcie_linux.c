@@ -245,7 +245,9 @@ static const struct dev_pm_ops dhdpcie_pm_ops = {
 #endif /* DHD_PCIE_NATIVE_RUNTIMEPM */
 
 static struct pci_driver dhdpcie_driver = {
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0))
 	node:		{&dhdpcie_driver.node, &dhdpcie_driver.node},
+#endif
 	name:		"pcieh",
 	id_table:	dhdpcie_pci_devid,
 	probe:		dhdpcie_pci_probe,
