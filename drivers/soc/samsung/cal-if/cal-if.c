@@ -112,7 +112,8 @@ int cal_dfs_set_rate(unsigned int id, unsigned long rate)
 		if (!vclk->max_freq || vclk->max_freq == UINT_MAX ||
 		    vclk->min_freq == UINT_MAX || vclk->min_freq > vclk->max_freq)
 			return -EINVAL;
-		if (rate < vclk->min_freq || rate > vclk->max_freq)
+		if (rate < vclk->min_freq ||
+		    rate > max(vclk->max_freq, READ_ONCE(vclk->ext_max_freq)))
 			return -ERANGE;
 		for (i = 0; i < vclk->num_rates; i++)
 			if (vclk->lut[i].rate == rate)
@@ -134,6 +135,45 @@ int cal_dfs_set_rate(unsigned int id, unsigned long rate)
 
 	return ret;
 }
+
+/*
+ * 4.9 exynos-acme init_domain() lets the cpufreq DT max-freq replace the CAL
+ * maximum outright, and its cal_dfs_set_rate() has no range check, so 4.9
+ * runs ECT levels above the CAL maximum (crownlte LITTLE: 1950 MHz against a
+ * CAL maximum of 1794 MHz). cal_dfs_set_rate() here refuses rates above the
+ * CAL maximum. This raises that ceiling of ACPM domain @id to @rate, only if
+ * @rate is a level of the ECT DVFS table with a non-zero FVMap voltage (the
+ * firmware then selects that voltage itself, as it does for 4.9). It never
+ * lowers the ceiling and never changes the CAL maximum that
+ * cal_dfs_get_max_freq() reports. @uv returns the FVMap voltage of @rate.
+ * The caller decides whether a domain may run above its CAL maximum.
+ */
+int cal_dfs_extend_max_freq(unsigned int id, unsigned long rate, unsigned int *uv)
+{
+	unsigned int voltage[48], i;
+	struct vclk *vclk;
+
+	if (!cal_dfs_is_ready(id))
+		return -ENODEV;
+	vclk = cmucal_get_node(id);
+	if (!vclk || vclk->num_rates > ARRAY_SIZE(voltage))
+		return -ENODEV;
+	if (rate <= vclk->max_freq || rate > UINT_MAX)
+		return -EINVAL;
+	for (i = 0; i < vclk->num_rates; i++)
+		if (vclk->lut[i].rate == rate)
+			break;
+	if (i == vclk->num_rates)
+		return -EINVAL;
+	if (fvmap_get_voltage_table(id, voltage) != vclk->num_rates || !voltage[i])
+		return -ENODEV;
+	if (rate > READ_ONCE(vclk->ext_max_freq))
+		WRITE_ONCE(vclk->ext_max_freq, rate);
+	if (uv)
+		*uv = voltage[i];
+	return 0;
+}
+EXPORT_SYMBOL_GPL(cal_dfs_extend_max_freq);
 
 int cal_dfs_set_rate_switch(unsigned int id, unsigned long switch_rate)
 {

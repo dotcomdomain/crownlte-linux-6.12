@@ -132,6 +132,7 @@ struct vclk {
 	unsigned int		num_rates;
 	unsigned int		num_list;
 	unsigned int		max_freq;
+	unsigned int		ext_max_freq;	/* cal_dfs_extend_max_freq(), 0 = none */
 	unsigned int		min_freq;
 	unsigned int		boot_freq;
 	unsigned int		resume_freq;

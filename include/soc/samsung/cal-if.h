@@ -50,6 +50,8 @@ extern unsigned long cal_dfs_get_max_freq(unsigned int id);
 extern unsigned long cal_dfs_get_min_freq(unsigned int id);
 extern bool cal_dfs_is_ready(unsigned int id);
 extern int cal_dfs_set_rate(unsigned int id, unsigned long rate);
+extern int cal_dfs_extend_max_freq(unsigned int id, unsigned long rate,
+				   unsigned int *uv);
 extern int cal_dfs_set_rate_switch(unsigned int id, unsigned long switch_rate);
 extern unsigned long cal_dfs_cached_get_rate(unsigned int id);
 extern unsigned long cal_dfs_get_rate(unsigned int id);
