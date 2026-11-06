@@ -43,6 +43,7 @@ struct exynos_usi_variant {
 	unsigned int sw_conf_mask;	/* SW_CONF mask for all protocols */
 	size_t min_mode;		/* first index in exynos_usi_modes[] */
 	size_t max_mode;		/* last index in exynos_usi_modes[] */
+	bool fixed_i2c;		/* dedicated I2C channel: no SW_CONF */
 	size_t num_clks;		/* number of clocks to assert */
 	const char * const *clk_names;	/* clock names to assert */
 };
@@ -97,7 +98,23 @@ static const struct exynos_usi_variant exynos9810_usi_data = {
 	.clk_names	= exynos850_usi_clk_names,
 };
 
+/*
+ * Odd CMGP HSI2C channels use the shared I2C clock and dedicated pin
+ * function. The 4.9 crownlte DT leaves their SW_CONF nodes disabled, but
+ * i2c-exynos5 still clears the local USI reset at +0xc4 before use.
+ */
+static const struct exynos_usi_variant exynos9810_i2c_wrapper_data = {
+	.ver = USI_VER2,
+	.fixed_i2c = true,
+	.num_clks = ARRAY_SIZE(exynos850_usi_clk_names),
+	.clk_names = exynos850_usi_clk_names,
+};
+
 static const struct of_device_id exynos_usi_dt_match[] = {
+	{
+		.compatible = "samsung,exynos9810-i2c-wrapper",
+		.data = &exynos9810_i2c_wrapper_data,
+	},
 	{
 		.compatible = "samsung,exynos9810-usi",
 		.data = &exynos9810_usi_data,
@@ -176,14 +193,16 @@ static int exynos_usi_enable(const struct exynos_usi *usi)
 	/* The diagnostic must retain the configured wrapper state while its
 	 * clocks are on. Failure here prevents protocol child population.
 	 */
-	if (usi->data == &exynos9810_usi_data) {
-		u32 sw_conf, con, option;
+	if (usi->data == &exynos9810_usi_data || usi->data->fixed_i2c) {
+		u32 sw_conf = 0, con, option;
 
-		ret = regmap_read(usi->sysreg, usi->sw_conf, &sw_conf);
+		if (!usi->data->fixed_i2c)
+			ret = regmap_read(usi->sysreg, usi->sw_conf, &sw_conf);
 		con = readl(usi->regs + USI_CON);
 		option = readl(usi->regs + USI_OPTION);
-		if (!ret && ((sw_conf & usi->data->sw_conf_mask) !=
-			     exynos_usi_modes[usi->mode].val ||
+		if (!ret && ((!usi->data->fixed_i2c &&
+			     (sw_conf & usi->data->sw_conf_mask) !=
+			     exynos_usi_modes[usi->mode].val) ||
 			     (con & USI_CON_RESET) ||
 			     (usi->clkreq_on &&
 			      (option & (USI_OPTION_CLKREQ_ON |
@@ -206,9 +225,11 @@ static int exynos_usi_configure(struct exynos_usi *usi)
 {
 	int ret;
 
-	ret = exynos_usi_set_sw_conf(usi, usi->mode);
-	if (ret)
-		return ret;
+	if (!usi->data->fixed_i2c) {
+		ret = exynos_usi_set_sw_conf(usi, usi->mode);
+		if (ret)
+			return ret;
+	}
 
 	if (usi->data->ver == USI_VER2)
 		return exynos_usi_enable(usi);
@@ -220,6 +241,11 @@ static int exynos_usi_parse_dt(struct device_node *np, struct exynos_usi *usi)
 {
 	int ret;
 	u32 mode;
+
+	if (usi->data->fixed_i2c) {
+		usi->clkreq_on = of_property_read_bool(np, "samsung,clkreq-on");
+		return 0;
+	}
 
 	ret = of_property_read_u32(np, "samsung,mode", &mode);
 	if (ret)
