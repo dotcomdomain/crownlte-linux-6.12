@@ -5,7 +5,7 @@
  * Armed only by the diagnostic DT ("samsung,wifi-selftest" on the
  * samsung,brcm-wlan node). It runs once, in its own kthread, at
  * "samsung,wifi-selftest-ms" after boot and only does what Android does when
- * Wi-Fi is switched on and scans, minus association:
+ * Wi-Fi is switched on, without scanning or associating:
  *
  *   1. platform: WLAN_REG_ON / WLAN_HOST_WAKE state (set at probe)
  *   2. PCIe: RC link state, GEN/width, counters (read only)
@@ -13,7 +13,8 @@
  *   4. chip: chipcommon chip id/rev read by DHD at attach (expect 0x4361)
  *   5. wlan0 up (dev_open): firmware + NVRAM + CLM download from /vendor via
  *      the firmware loader, dongle init, MAC read (cur_etheraddr / OTP)
- *   6. one passive escan (no probe requests), results summarised
+ *   6. no scan (the vendor driver has unlocked scan owners); scanning is
+ *      verified through the Wi-Fi HAL over adb
  *   7. wlan0 down again (unless samsung,wifi-selftest-keep-up)
  *
  * It never associates, never writes NVRAM/OTP/MAC to the chip's flash (the
@@ -48,7 +49,6 @@
 #include <dhd_crownlte.h>
 
 #define WST "wifi selftest: "
-#define ST_SCAN_TIMEOUT_MS	20000
 
 extern dhd_pub_t *g_dhd_pub;
 extern char fw_version[];
@@ -82,7 +82,7 @@ static int crownlte_selftest_fn(void *arg)
 	bool opened = false, shared = false, nofw = false;
 	u64 t0;
 	u32 chip = 0, rev = 0;
-	int ret, i;
+	int ret;
 
 	while (!kthread_should_stop()) {
 		u64 now = ktime_get_boottime_ns() / NSEC_PER_MSEC;
@@ -94,7 +94,7 @@ static int crownlte_selftest_fn(void *arg)
 	if (kthread_should_stop())
 		return 0;
 
-	pr_info(WST "start at %llu ms (stage 1: power, link, chip id, firmware, wlan0, passive scan)\n",
+	pr_info(WST "start at %llu ms (stage 1: power, link, chip id, firmware, wlan0 bring-up)\n",
 		ktime_get_boottime_ns() / NSEC_PER_MSEC);
 
 	/* 1. platform */
