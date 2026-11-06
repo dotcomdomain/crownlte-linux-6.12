@@ -7717,6 +7717,28 @@ dhd_remove_if(dhd_pub_t *dhdpub, int ifidx, bool need_rtnl_lock)
 	return BCME_OK;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+/*
+ * crownlte: since 5.15 SIOCDEVPRIVATE..+15 reach drivers only through
+ * ndo_siocdevprivate (dev_siocdevprivate() returns -EOPNOTSUPP otherwise).
+ * wpa_supplicant/hostapd send the Android "DRIVER" commands as
+ * SIOCDEVPRIVATE+1; dhd_ioctl_entry() still reads ifr->ifr_data itself.
+ */
+static int
+dhd_siocdevprivate(struct net_device *net, struct ifreq *ifr,
+	void __user *data, int cmd)
+{
+#ifdef DHD_PCIE_NATIVE_RUNTIMEPM
+	return dhd_ioctl_entry_wrapper(net, ifr, cmd);
+#else
+	return dhd_ioctl_entry(net, ifr, cmd);
+#endif /* DHD_PCIE_NATIVE_RUNTIMEPM */
+}
+#define DHD_NDO_SIOCDEVPRIVATE	.ndo_siocdevprivate = dhd_siocdevprivate,
+#else
+#define DHD_NDO_SIOCDEVPRIVATE
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) */
+
 static struct net_device_ops dhd_ops_pri = {
 	.ndo_open = dhd_pri_open,
 	.ndo_stop = dhd_pri_stop,
@@ -7728,6 +7750,7 @@ static struct net_device_ops dhd_ops_pri = {
 	.ndo_do_ioctl = dhd_ioctl_entry,
 	.ndo_start_xmit = dhd_start_xmit,
 #endif /* DHD_PCIE_NATIVE_RUNTIMEPM */
+	DHD_NDO_SIOCDEVPRIVATE
 	.ndo_set_mac_address = dhd_set_mac_address,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 2, 0))
 	.ndo_set_rx_mode = dhd_set_multicast_list,
@@ -7752,6 +7775,7 @@ static struct net_device_ops dhd_ops_virt = {
 	.ndo_do_ioctl = dhd_ioctl_entry,
 	.ndo_start_xmit = dhd_start_xmit,
 #endif /* DHD_PCIE_NATIVE_RUNTIMEPM */
+	DHD_NDO_SIOCDEVPRIVATE
 	.ndo_set_mac_address = dhd_set_mac_address,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 2, 0))
 	.ndo_set_rx_mode = dhd_set_multicast_list,

@@ -70,10 +70,21 @@ static int wl_cfgp2p_do_ioctl(struct net_device *net, struct ifreq *ifr, int cmd
 static int wl_cfgp2p_if_open(struct net_device *net);
 static int wl_cfgp2p_if_stop(struct net_device *net);
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+static int wl_cfgp2p_siocdevprivate(struct net_device *net, struct ifreq *ifr,
+	void __user *data, int cmd)
+{
+	return wl_cfgp2p_do_ioctl(net, ifr, cmd);
+}
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) */
+
 static const struct net_device_ops wl_cfgp2p_if_ops = {
 	.ndo_open       = wl_cfgp2p_if_open,
 	.ndo_stop       = wl_cfgp2p_if_stop,
 	.ndo_do_ioctl   = wl_cfgp2p_do_ioctl,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+	.ndo_siocdevprivate = wl_cfgp2p_siocdevprivate,
+#endif
 	.ndo_start_xmit = wl_cfgp2p_start_xmit,
 };
 #endif /* WL_ENABLE_P2P_IF */
@@ -87,10 +98,21 @@ static int wl_cfgp2p_if_dummy(struct net_device *net)
 	return 0;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+static int wl_cfgp2p_siocdevprivate(struct net_device *net, struct ifreq *ifr,
+	void __user *data, int cmd)
+{
+	return wl_cfgp2p_do_ioctl(net, ifr, cmd);
+}
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0) */
+
 static const struct net_device_ops wl_cfgp2p_if_ops = {
 	.ndo_open       = wl_cfgp2p_if_dummy,
 	.ndo_stop       = wl_cfgp2p_if_dummy,
 	.ndo_do_ioctl   = wl_cfgp2p_do_ioctl,
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
+	.ndo_siocdevprivate = wl_cfgp2p_siocdevprivate,
+#endif
 	.ndo_start_xmit = wl_cfgp2p_start_xmit,
 };
 #endif /* WL_NEWCFG_PRIVCMD_SUPPORT */
