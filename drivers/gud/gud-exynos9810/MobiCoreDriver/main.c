@@ -683,6 +683,8 @@ static inline void device_admin_exit(void)
  */
 #define MC_GUARD_MAX 8
 static bool mc_guard_on;
+/* Read-only proof for userspace staging: /sys/module/mcDrvModule/parameters/session_guard */
+module_param_named(session_guard, mc_guard_on, bool, 0444);
 static struct mc_uuid_t mc_guard_allow[MC_GUARD_MAX];
 static int mc_guard_n;
 
