@@ -165,21 +165,30 @@ static int crownlte_selftest_fn(void *arg)
 		fail = "wlan0";
 		goto out;
 	}
+	/* check and open atomically under RTNL: never adopt a userspace-owned wlan0 */
+	t0 = ktime_get_boottime_ns();
+	rtnl_lock();
 	if (ndev->flags & IFF_UP) {
 		shared = true;
+		ret = 0;
+	} else {
+		wl_cfgscan_crownlte_watch(true);
+		ret = dev_open(ndev, NULL);
+		if (!ret)
+			opened = true;
+		else
+			wl_cfgscan_crownlte_watch(false);
+	}
+	rtnl_unlock();
+	if (shared) {
 		pr_info(WST "wlan0 already up (userspace owns it): no bring-up, no scan\n");
 	} else {
-		t0 = ktime_get_boottime_ns();
-		rtnl_lock();
-		ret = dev_open(ndev, NULL);
-		rtnl_unlock();
 		pr_info(WST "wlan0 up ret=%d in %llu ms\n", ret,
 			(ktime_get_boottime_ns() - t0) / NSEC_PER_MSEC);
 		if (ret) {
 			fail = "firmware/bring-up";
 			goto out;
 		}
-		opened = true;
 	}
 
 	{
@@ -196,8 +205,8 @@ static int crownlte_selftest_fn(void *arg)
 	/* 6. one passive escan, never handed to cfg80211 */
 	if (!shared) {
 		ret = wl_cfgscan_crownlte_selftest_scan(ndev, ST_SCAN_TIMEOUT_MS, &sr);
-		pr_info(WST "scan ret=%d channels=%u elapsed=%u ms timed_out=%d preempted=%d bss=%u (2.4G %u, 5G %u)\n",
-			sr.ret, sr.channels, sr.elapsed_ms, sr.timed_out,
+		pr_info(WST "scan ret=%d status=%d channels=%u elapsed=%u ms timed_out=%d preempted=%d bss=%u (2.4G %u, 5G %u)\n",
+			sr.ret, sr.status, sr.channels, sr.elapsed_ms, sr.timed_out,
 			sr.preempted, sr.count, sr.n2g, sr.n5g);
 		for (i = 0; i < sr.ntop; i++)
 			pr_info(WST "scan top%d oui %02x:%02x:%02x ch %u rssi %d\n",
@@ -212,11 +221,18 @@ static int crownlte_selftest_fn(void *arg)
 
 out:
 	/* 7. leave wlan0 as we found it */
-	if (opened && !st_cfg.keep_up) {
+	if (opened) {
+		bool user = wl_cfgscan_crownlte_userspace_seen() || sr.preempted;
+
 		rtnl_lock();
-		dev_close(ndev);
+		wl_cfgscan_crownlte_watch(false);
+		if (user)
+			pr_info(WST "userspace used wlan0 during the test: left as is (flags 0x%x)\n", ndev->flags);
+		else if (!st_cfg.keep_up && (ndev->flags & IFF_UP)) {
+			dev_close(ndev);
+			pr_info(WST "wlan0 down again (flags 0x%x)\n", ndev->flags);
+		}
 		rtnl_unlock();
-		pr_info(WST "wlan0 down again (flags 0x%x)\n", ndev->flags);
 	}
 	if (ndev)
 		dev_put(ndev);

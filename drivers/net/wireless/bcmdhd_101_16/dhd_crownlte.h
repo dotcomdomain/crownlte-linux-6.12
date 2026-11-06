@@ -38,6 +38,7 @@ struct dhd_crownlte_scan_report {
 	int ret;
 	bool timed_out;
 	bool preempted;
+	s32 status;		/* terminal escan status of OUR sync id, -1: none */
 	u32 channels;		/* channels requested */
 	u32 elapsed_ms;
 	u32 count;		/* BSS entries in the escan buffer */
@@ -51,5 +52,8 @@ struct dhd_crownlte_scan_report {
 
 int wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev,
 	unsigned int timeout_ms, struct dhd_crownlte_scan_report *rep);
+/* watch window: any cfg80211 scan/sched-scan/connect while armed = userspace took over */
+void wl_cfgscan_crownlte_watch(bool on);
+bool wl_cfgscan_crownlte_userspace_seen(void);
 
 #endif /* _DHD_CROWNLTE_H_ */

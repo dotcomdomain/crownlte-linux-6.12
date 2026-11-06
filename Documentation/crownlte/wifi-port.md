@@ -239,3 +239,17 @@ timeouts after firmware download (DMA: SysMMU bypass or 32-bit window), `stage=s
 - Stage 3: L1SS/ASPM per 4.9 (`exynos_pcie_config_l1ss`, I/A), SysMMU or coherent DMA if
   throughput needs it, suspend/resume with OOB wake, softAP/P2P, MFG firmware.
 - Bluetooth (BCM4361 UART, rfkill) is separate.
+
+## Review note: global firmware user-helper fallback (Sol R1 S4, accepted)
+
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y (crownlte_wifi.fragment) applies to every
+request_firmware() caller, also on DTBs with Wi-Fi disabled: a missing firmware file
+waits up to 60 s for userspace. Accepted for now because:
+- under Android (ROM-RAM and later real boots) ueventd answers firmware requests and
+  cancels the wait at once when a file does not exist;
+- the other crownlte firmware users (ACPM TMU plugin) are built in via EXTRA_FIRMWARE
+  and never reach the fallback;
+- kernel-only vehicles (delayed-UFS) use samsung,wifi-selftest-no-firmware and never
+  request Wi-Fi firmware.
+To revisit before the real boot: scope the fallback to DHD (request_firmware_nowait with
+uevent, or firmware_class.path pointing at the vendor firmware directory).

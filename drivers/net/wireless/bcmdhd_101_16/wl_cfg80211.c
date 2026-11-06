@@ -1259,6 +1259,9 @@ bool fw_assoc_watchdog_started = 0;
 
 int wl_channel_to_frequency(u32 chan, chanspec_band_t band)
 {
+#ifdef DHD_CROWNLTE_612
+	{ extern void wl_cfgscan_crownlte_note_user_ext(void); wl_cfgscan_crownlte_note_user_ext(); }
+#endif
 	if (chan == 0) {
 		return 0; /* not supported */
 	}

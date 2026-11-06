@@ -539,7 +539,13 @@ retry:
 	 * setup can run; dw_pcie_host_init() does the rest right after.
 	 */
 	if (ex->host_registered) {
-		dw_pcie_setup_rc(&pci->pp);
+		int err = dw_pcie_setup_rc(&pci->pp);
+
+		if (err) {
+			/* e.g. outbound iATU programming: never train with half a setup */
+			dev_err(ex->dev, "dw_pcie_setup_rc failed: %d\n", err);
+			return err;
+		}
 	} else {
 		dw_pcie_dbi_ro_wr_en(pci);
 		dw_pcie_setup(pci);

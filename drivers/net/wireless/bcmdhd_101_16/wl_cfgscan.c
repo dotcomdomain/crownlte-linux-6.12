@@ -192,6 +192,20 @@ wl_escan_check_sync_id(struct bcm_cfg80211 *cfg, s32 status, u16 result_id, u16 
 #define wl_escan_init_sync_id(a)
 #endif /* DUAL_ESCAN_RESULT_BUFFER */
 
+#ifdef DHD_CROWNLTE_612
+/* crownlte self-test bookkeeping (wl_cfgscan_crownlte_selftest_scan) */
+static bool wl_crownlte_st_active;	/* our escan is outstanding */
+static u16 wl_crownlte_st_sync;		/* its sync id */
+static s32 wl_crownlte_st_status = -1;	/* its terminal escan status */
+static bool wl_crownlte_watch_on;	/* self-test owns wlan0 */
+static bool wl_crownlte_user_seen;	/* sticky: cfg80211 activity while watching */
+static inline void wl_crownlte_note_user(void)
+{
+	if (READ_ONCE(wl_crownlte_watch_on))
+		WRITE_ONCE(wl_crownlte_user_seen, true);
+}
+#endif /* DHD_CROWNLTE_612 */
+
 /*
  * information element utilities
  */
@@ -832,6 +846,11 @@ wl_escan_handler(struct bcm_cfg80211 *cfg, bcm_struct_cfgdev *cfgdev,
 			cfg->escan_info.cur_sync_id) < 0) {
 			goto exit;
 	}
+#ifdef DHD_CROWNLTE_612
+	if (wl_crownlte_st_active && status != WLC_E_STATUS_PARTIAL &&
+		escan_result->sync_id == wl_crownlte_st_sync && wl_crownlte_st_status < 0)
+		wl_crownlte_st_status = status;
+#endif /* DHD_CROWNLTE_612 */
 
 	if (status == WLC_E_STATUS_PARTIAL) {
 		WL_DBG(("WLC_E_STATUS_PARTIAL \n"));
@@ -2198,6 +2217,9 @@ __wl_cfg80211_scan(struct wiphy *wiphy, struct net_device *ndev,
 #ifdef WL_CFG80211_VSDB_PRIORITIZE_SCAN_REQUEST
 	struct net_device *remain_on_channel_ndev = NULL;
 #endif
+#ifdef DHD_CROWNLTE_612
+	wl_crownlte_note_user();
+#endif
 	/*
 	 * Hostapd triggers scan before starting automatic channel selection
 	 * to collect channel characteristics. However firmware scan engine
@@ -3422,6 +3444,9 @@ wl_cfg80211_sched_scan_start(struct wiphy *wiphy,
                              struct net_device *dev,
                              struct cfg80211_sched_scan_request *request)
 {
+#ifdef DHD_CROWNLTE_612
+	wl_crownlte_note_user();
+#endif
 	u16 chan_list[WL_NUMCHANNELS] = {0};
 	u32 num_channels = 0;
 	ushort pno_time = 0;
@@ -6479,9 +6504,13 @@ wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev, unsigned int timeout_
 	DHD_OS_SCAN_WAKE_LOCK_TIMEOUT((dhd_pub_t *)(cfg->pub),
 		timeout_ms + SCAN_WAKE_LOCK_MARGIN_MS);
 	list = wl_escan_get_buf(cfg, FALSE);	/* the buffer wl_do_escan() fills */
+	wl_crownlte_st_sync = cfg->escan_info.cur_sync_id;	/* wl_escan_set_sync_id() */
+	wl_crownlte_st_status = -1;
+	wl_crownlte_st_active = true;
 	err = wl_do_escan(cfg, wiphy, ndev, req);
 	cfg->active_scan = saved_active;
 	if (err) {
+		wl_crownlte_st_active = false;
 		mutex_unlock(&cfg->scan_sync);
 		DHD_OS_SCAN_WAKE_UNLOCK((dhd_pub_t *)(cfg->pub));
 		rep->ret = err;
@@ -6490,26 +6519,36 @@ wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev, unsigned int timeout_
 	wl_set_drv_status(cfg, SCANNING, ndev);
 	mutex_unlock(&cfg->scan_sync);
 
+	/* done only on a terminal event for OUR sync id; any cfg80211 scan = preempted */
 	t0 = jiffies;
 	deadline = t0 + msecs_to_jiffies(timeout_ms);
-	while (cfg->escan_info.escan_state == WL_ESCAN_STATE_SCANING &&
-		!cfg->scan_request && time_before(jiffies, deadline))
+	while (READ_ONCE(wl_crownlte_st_status) < 0 && !cfg->scan_request &&
+		!READ_ONCE(wl_crownlte_user_seen) && time_before(jiffies, deadline))
 		msleep(100);
 
 	mutex_lock(&cfg->scan_sync);
+	wl_crownlte_st_active = false;
+	rep->status = wl_crownlte_st_status;
 	rep->elapsed_ms = jiffies_to_msecs(jiffies - t0);
-	if (cfg->scan_request) {
+	if (cfg->scan_request || wl_crownlte_user_seen) {
 		rep->preempted = true;
 		mutex_unlock(&cfg->scan_sync);
 		rep->ret = -EBUSY;
 		goto out;
 	}
-	if (cfg->escan_info.escan_state == WL_ESCAN_STATE_SCANING) {
+	if (rep->status < 0) {
 		rep->timed_out = true;
 		wl_cfgscan_scan_abort(cfg);
 		wl_notify_escan_complete(cfg, ndev, true);
 		mutex_unlock(&cfg->scan_sync);
 		rep->ret = -ETIMEDOUT;
+		goto out;
+	}
+	if (rep->status != WLC_E_STATUS_SUCCESS) {
+		/* aborted / new scan / new assoc / unexpected: not a completed scan */
+		wl_notify_escan_complete(cfg, ndev, true);
+		mutex_unlock(&cfg->scan_sync);
+		rep->ret = -EIO;
 		goto out;
 	}
 
@@ -6539,5 +6578,21 @@ wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev, unsigned int timeout_
 out:
 	kfree(req);
 	return rep->ret;
+}
+void wl_cfgscan_crownlte_watch(bool on)
+{
+	if (on)
+		WRITE_ONCE(wl_crownlte_user_seen, false);
+	WRITE_ONCE(wl_crownlte_watch_on, on);
+}
+
+bool wl_cfgscan_crownlte_userspace_seen(void)
+{
+	return READ_ONCE(wl_crownlte_user_seen);
+}
+
+void wl_cfgscan_crownlte_note_user_ext(void)
+{
+	wl_crownlte_note_user();
 }
 #endif /* DHD_CROWNLTE_612 */
