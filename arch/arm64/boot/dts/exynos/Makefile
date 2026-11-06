@@ -34,6 +34,8 @@ dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-g3dpd-runtime-diag.
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-tee-diag.dtb
 # sec_ts Y771 touchscreen (q32; IC unpowered until LDO35/LDO43 are enabled)
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-touch-diag.dtb
+# Wi-Fi stage 1 (PCIe ch0 + BCM4361 + "wifi selftest:")
+dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-wifi-diag.dtb
 # integration-2 combined diagnostic (q45): all verified features at once
 DTC_FLAGS_exynos9810-crownlte-delayed-ufs-combined-diag := -Wno-unit_address_format
 dtb-$(CONFIG_ARCH_EXYNOS) += exynos9810-crownlte-delayed-ufs-combined-diag.dtb

@@ -6,6 +6,21 @@
 #include <dt-bindings/soc/samsung,exynos-usi.h>
 / {
 	/*
+	 * BCM4361 Wi-Fi power and host wake (4.9 wlan "samsung,brcm-wlan":
+	 * gpios = <gpg0 5>, <gpa0 7>). WLAN_REG_ON is driven high before the
+	 * PCIe link is trained, exactly as 4.9 dhd_wlan_init_gpio(). Disabled:
+	 * see Documentation/crownlte/wifi-port.md.
+	 */
+	wlan: wlan {
+		compatible = "samsung,brcm-wlan";
+		wlan-reg-on-gpios = <&gpg0 5 GPIO_ACTIVE_HIGH>;
+		wlan-host-wake-gpios = <&gpa0 7 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cfg_wlanen &wlan_host_wake>;
+		status = "disabled";
+	};
+
+	/*
 	 * S2MPS18 main PMIC (4.9: speedy@141C0000/s2mps18mfd@00 with
 	 * acpm-ipc-channel = <2>). Every register access is an ACPM channel-2
 	 * request; the APM firmware drives SPEEDY. Read-only unless
@@ -139,7 +154,56 @@
  * samsung,reset-before-trans on this bus; the touch driver reproduces the
  * former by issuing opcode and data as separate transfers.
  */
+/* 4.9 pcie0 pins; PERST# is gpf2-2, driven high to release the endpoint */
+&pcie0 {
+	perst-gpios = <&gpf2 2 GPIO_ACTIVE_HIGH>;
+	pinctrl-names = "default", "idle";
+	pinctrl-0 = <&pcie0_clkreq &pcie0_perst &pcie_wake>;
+	pinctrl-1 = <&pcie0_perst &pcie_wake>;
+};
+
+&pinctrl_fsys1 {
+	pcie0_clkreq: pcie0-clkreq-pins {
+		samsung,pins = "gpf2-0";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <3>;
+		samsung,pin-drv = <3>;
+		samsung,pin-con-pdn = <3>;
+		samsung,pin-pud-pdn = <3>;
+	};
+
+	pcie0_perst: pcie0-perst-pins {
+		samsung,pins = "gpf2-2";
+		samsung,pin-function = <1>;
+		samsung,pin-drv = <3>;
+		samsung,pin-con-pdn = <3>;
+	};
+};
+
+/* alive banks have no power-down config fields on 6.12: 4.9 *-pdn dropped */
+&pinctrl_alive {
+	pcie_wake: pcie-wake-pins {
+		samsung,pins = "gpa3-2";
+		samsung,pin-function = <0>;
+		samsung,pin-pud = <0>;
+	};
+
+	wlan_host_wake: wlan-host-wake-pins {
+		samsung,pins = "gpa0-7";
+		samsung,pin-function = <15>;
+		samsung,pin-pud = <1>;
+	};
+};
+
 &pinctrl_peric0 {
+	cfg_wlanen: cfg-wlanen-pins {
+		samsung,pins = "gpg0-5";
+		samsung,pin-function = <1>;
+		samsung,pin-pud = <0>;
+		samsung,pin-drv = <3>;
+		samsung,pin-con-pdn = <3>;
+	};
+
 	hsi2c10_bus: hsi2c10-bus-pins {
 		samsung,pins = "gpp1-4", "gpp1-5";
 		samsung,pin-function = <2>;
