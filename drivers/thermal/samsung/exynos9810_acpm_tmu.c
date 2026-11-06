@@ -13,9 +13,29 @@
  * reported when the plugin is attached, TMU_IPC_INIT succeeded, the channel
  * is AP-polled (so the reply really is copied back) and the TMU core is
  * enabled; otherwise get_temp fails instead of inventing a value.
+ *
+ * Opt-in 4.9 thermal parity, per sensor node (see
+ * Documentation/crownlte/perf-tuning.md). Nothing here writes TMU or PMIC
+ * registers; the bootloader-armed hardware trip stays as it is.
+ *  - samsung,ect-thermal = "<ECT THERMAL function>" + samsung,cooling-cpu:
+ *    once the zone's cooling maps are bound, log every trip with the CPU
+ *    frequency its cooling state means and the ECT value for that
+ *    temperature (4.9 took its step ladder from there).
+ *  - samsung,ect-pidtm = "<ECT PIDTM block>" + samsung,cooling-cpu: switch
+ *    the zone to power_allocator, but only once a power actor (a cooling
+ *    device with an energy model) is bound to its control trip; then apply
+ *    the ECT PID constants (k_po, k_pu, k_i, integral_cutoff), as 4.9
+ *    exynos_tmu.c did. Until then, or if that never happens, the zone keeps
+ *    the step_wise governor and its existing cooling map.
+ *  - samsung,hotplug-temps = <out in> + samsung,cooling-cpu: 4.9 took the
+ *    big cores offline at hotplug_out_threshold and brought them back below
+ *    hotplug_in_threshold. Here the cluster is held at its lowest frequency
+ *    instead (a freq QoS maximum), which needs no CPU hotplug.
  */
 
 #include <linux/bitops.h>
+#include <linux/cpu.h>
+#include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/io.h>
@@ -27,10 +47,15 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 #include <soc/samsung/acpm_ipc_ctrl.h>
+#include <soc/samsung/ect_parser.h>
+
+#include "../thermal_core.h"
 
 #define ACPM_TMU_PLUGIN		"exynos9810_acpm_tmu.fw"
 #define ACPM_TMU_MAX_SENSORS	8
 #define ACPM_TMU_SELFTEST_MS	105000
+#define ACPM_TMU_PARITY_PERIOD_MS	1000
+#define ACPM_TMU_PARITY_TRIES		180	/* give up after ~3 min */
 
 /* 4.9 exynos_acpm_tmu.h */
 #define TMU_IPC_INIT		0x01
@@ -86,6 +111,20 @@ struct acpm_tmu_sensor {
 	int rise7_min_c;	/* lowest decoded rise7 threshold, TMU_NO_TEMP if none */
 	struct thermal_zone_device *tzd;
 	unsigned int failures;	/* consecutive get_temp failures */
+	/* opt-in 4.9 parity */
+	const char *ect_thermal;	/* ECT THERMAL function name */
+	const char *ect_pidtm;		/* ECT PIDTM block name */
+	int cooling_cpu;		/* -1: none */
+	struct delayed_work parity_work;
+	unsigned int parity_tries;
+	bool pa_done;			/* power_allocator switch decided */
+	int hp_out, hp_in;		/* mC; hp_out == 0: off */
+	bool hp_want;			/* cap wanted (written in get_temp) */
+	bool hp_capped;			/* cap applied (hp_lock) */
+	struct mutex hp_lock;
+	struct work_struct hp_work;
+	struct freq_qos_request hp_req;
+	struct notifier_block hp_nb;
 };
 
 /*
@@ -173,6 +212,25 @@ static int acpm_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	if (!ret) {
 		s->failures = 0;
+		/* 4.9 exynos_throttle_cpu_hotplug(): out at >= out, back below in */
+		if (READ_ONCE(s->hp_out)) {
+			bool want = READ_ONCE(s->hp_want);
+
+			if (!want && *temp >= s->hp_out)
+				want = true;
+			else if (want && *temp < s->hp_in)
+				want = false;
+			if (want != READ_ONCE(s->hp_want)) {
+				WRITE_ONCE(s->hp_want, want);
+				dev_info(s->dev, "%s: %d mC: %s the cpu%d cluster cap (hotplug-%s %d mC)\n",
+					 s->name, *temp, want ? "applying" : "releasing",
+					 s->cooling_cpu, want ? "out" : "in",
+					 want ? s->hp_out : s->hp_in);
+			}
+			/* also retries a cap that could not be applied yet */
+			if (want != READ_ONCE(s->hp_capped))
+				schedule_work(&s->hp_work);
+		}
 		return 0;
 	}
 	if (++s->failures == ACPM_TMU_MAX_FAILURES) {
@@ -186,6 +244,359 @@ static int acpm_tmu_get_temp(struct thermal_zone_device *tz, int *temp)
 static const struct thermal_zone_device_ops acpm_tmu_ops = {
 	.get_temp = acpm_tmu_get_temp,
 };
+
+/* ---- 4.9 thermal hotplug equivalent: a freq QoS cap on the cluster ---- */
+
+static void acpm_tmu_hp_sync(struct acpm_tmu_sensor *s)
+{
+	struct cpufreq_policy *policy;
+	bool want;
+	int ret;
+
+	mutex_lock(&s->hp_lock);
+	want = READ_ONCE(s->hp_want);
+	if (!freq_qos_request_active(&s->hp_req) || want == s->hp_capped) {
+		mutex_unlock(&s->hp_lock);
+		return;
+	}
+	policy = cpufreq_cpu_get(s->cooling_cpu);
+	if (want && !policy) {
+		/* no policy to read the lowest level from: retried from get_temp */
+		mutex_unlock(&s->hp_lock);
+		return;
+	}
+	ret = freq_qos_update_request(&s->hp_req, want ? policy->cpuinfo.min_freq :
+				      FREQ_QOS_MAX_DEFAULT_VALUE);
+	if (ret >= 0)
+		WRITE_ONCE(s->hp_capped, want);
+	dev_info(s->dev, "%s: cpu%d cluster max %s %u kHz ret=%d\n", s->name,
+		 s->cooling_cpu, want ? "capped at" : "released, cap was",
+		 policy ? policy->cpuinfo.min_freq : 0, ret);
+	if (policy)
+		cpufreq_cpu_put(policy);
+	mutex_unlock(&s->hp_lock);
+}
+
+static void acpm_tmu_hp_work(struct work_struct *work)
+{
+	acpm_tmu_hp_sync(container_of(work, struct acpm_tmu_sensor, hp_work));
+}
+
+/* The request lives on the policy's constraints: follow the policy. */
+static void acpm_tmu_hp_attach(struct acpm_tmu_sensor *s, struct cpufreq_policy *policy)
+{
+	int ret;
+
+	mutex_lock(&s->hp_lock);
+	if (freq_qos_request_active(&s->hp_req) ||
+	    !cpumask_test_cpu(s->cooling_cpu, policy->related_cpus)) {
+		mutex_unlock(&s->hp_lock);
+		return;
+	}
+	s->hp_capped = false;
+	ret = freq_qos_add_request(&policy->constraints, &s->hp_req, FREQ_QOS_MAX,
+				   FREQ_QOS_MAX_DEFAULT_VALUE);
+	mutex_unlock(&s->hp_lock);
+	dev_info(s->dev, "%s: hotplug-equivalent cap armed on policy%u: cap at %u kHz from %d mC, release below %d mC (ret=%d)\n",
+		 s->name, policy->cpu, policy->cpuinfo.min_freq, s->hp_out, s->hp_in, ret);
+	acpm_tmu_hp_sync(s);
+}
+
+static int acpm_tmu_hp_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct acpm_tmu_sensor *s = container_of(nb, struct acpm_tmu_sensor, hp_nb);
+	struct cpufreq_policy *policy = data;
+
+	if (!cpumask_test_cpu(s->cooling_cpu, policy->related_cpus))
+		return NOTIFY_DONE;
+	if (event == CPUFREQ_CREATE_POLICY) {
+		acpm_tmu_hp_attach(s, policy);
+	} else if (event == CPUFREQ_REMOVE_POLICY) {
+		mutex_lock(&s->hp_lock);
+		if (freq_qos_request_active(&s->hp_req))
+			freq_qos_remove_request(&s->hp_req);
+		s->hp_capped = false;
+		mutex_unlock(&s->hp_lock);
+	}
+	return NOTIFY_OK;
+}
+
+static void acpm_tmu_hp_init(struct acpm_tmu_sensor *s)
+{
+	struct device_node *np = s->dev->of_node;
+	struct cpufreq_policy *policy;
+	u32 t[2];
+	int ret;
+
+	if (of_property_read_u32_array(np, "samsung,hotplug-temps", t, 2))
+		return;
+	if (s->cooling_cpu < 0 || !t[0] || t[1] >= t[0] || t[0] > 125000) {
+		dev_err(s->dev, "%s: samsung,hotplug-temps <%u %u> needs out > in and samsung,cooling-cpu; ignored\n",
+			s->name, t[0], t[1]);
+		return;
+	}
+	mutex_init(&s->hp_lock);
+	INIT_WORK(&s->hp_work, acpm_tmu_hp_work);
+	s->hp_nb.notifier_call = acpm_tmu_hp_notify;
+	ret = cpufreq_register_notifier(&s->hp_nb, CPUFREQ_POLICY_NOTIFIER);
+	if (ret) {
+		dev_err(s->dev, "%s: hotplug-equivalent cap unavailable: %d\n", s->name, ret);
+		return;
+	}
+	s->hp_in = t[1];
+	WRITE_ONCE(s->hp_out, t[0]);	/* get_temp may run from here on */
+	policy = cpufreq_cpu_get(s->cooling_cpu);
+	if (policy) {
+		acpm_tmu_hp_attach(s, policy);
+		cpufreq_cpu_put(policy);
+	}
+}
+
+/* ---- ECT parity report and the guarded power_allocator switch ---- */
+
+static int acpm_tmu_ect_param(struct ect_pidtm_block *b, const char *name)
+{
+	int i;
+
+	for (i = 0; i < b->num_of_parameter; i++)
+		if (!strcmp(b->param_name_list[i], name))
+			return b->param_value_list[i];
+	return -1;
+}
+
+static bool acpm_tmu_cdev_is_power_actor(struct thermal_cooling_device *cdev)
+{
+	return cdev->ops->get_requested_power && cdev->ops->state2power &&
+	       cdev->ops->power2state;
+}
+
+/*
+ * Instances bound to the zone's last passive trip (power_allocator's control
+ * trip): how many, and how many of them are power actors. tz->lock held.
+ */
+static void acpm_tmu_count_actors(struct thermal_zone_device *tz,
+				  unsigned int *bound, unsigned int *actors)
+{
+	const struct thermal_trip_desc *td, *last = NULL;
+	struct thermal_instance *ins;
+
+	*bound = *actors = 0;
+	for_each_trip_desc(tz, td)
+		if (td->trip.type == THERMAL_TRIP_PASSIVE)
+			last = td;
+	if (!last)
+		return;
+	list_for_each_entry(ins, &last->thermal_instances, trip_node) {
+		(*bound)++;
+		if (acpm_tmu_cdev_is_power_actor(ins->cdev))
+			(*actors)++;
+	}
+}
+
+/* frequency of cooling state @state of a cpufreq cooling device on @policy */
+static unsigned int acpm_tmu_state_khz(struct cpufreq_policy *policy, unsigned long state)
+{
+	unsigned int n = cpufreq_table_count_valid_entries(policy);
+
+	if (!policy->freq_table || state >= n)
+		return 0;
+	/* cpufreq_cooling: state 0 is the highest frequency */
+	if (policy->freq_table_sorted == CPUFREQ_TABLE_SORTED_ASCENDING)
+		return policy->freq_table[n - 1 - state].frequency;
+	return policy->freq_table[state].frequency;
+}
+
+static void acpm_tmu_report_trips(struct acpm_tmu_sensor *s, struct cpufreq_policy *policy)
+{
+	struct thermal_zone_device *tz = s->tzd;
+	struct ect_ap_thermal_function *fn = NULL;
+	const struct thermal_trip_desc *td;
+	struct thermal_instance *ins;
+	unsigned int checked = 0, worse = 0;
+	void *block;
+
+	if (s->ect_thermal) {
+		block = ect_get_block(BLOCK_AP_THERMAL);
+		fn = block ? ect_ap_thermal_get_function(block, (char *)s->ect_thermal) : NULL;
+		if (!fn)
+			dev_warn(s->dev, "%s: ECT THERMAL function %s not found\n",
+				 s->name, s->ect_thermal);
+	}
+	if (fn) {
+		int i;
+
+		for (i = 0; i < fn->num_of_range; i++)
+			dev_info(s->dev, "%s: ECT %s range %u-%u C max %u kHz flag %u\n",
+				 s->name, s->ect_thermal,
+				 fn->range_list[i].lower_bound_temperature,
+				 fn->range_list[i].upper_bound_temperature,
+				 fn->range_list[i].max_frequency, fn->range_list[i].flag);
+	}
+
+	mutex_lock(&tz->lock);
+	for_each_trip_desc(tz, td) {
+		const struct thermal_trip *trip = &td->trip;
+		bool any = false;
+
+		list_for_each_entry(ins, &td->thermal_instances, trip_node) {
+			unsigned int khz = 0, ect = 0;
+			const char *verdict = "";
+			int i;
+
+			any = true;
+			if (policy && !strncmp(ins->cdev->type, "thermal-cpufreq-", 16))
+				khz = acpm_tmu_state_khz(policy, ins->upper);
+			/* ECT range that starts at this trip temperature */
+			for (i = 0; fn && i < fn->num_of_range; i++)
+				if (fn->range_list[i].lower_bound_temperature * 1000 ==
+				    trip->temperature)
+					ect = fn->range_list[i].max_frequency;
+			if (ect && khz) {
+				checked++;
+				if (khz == ect) {
+					verdict = " = ECT";
+				} else if (khz < ect) {
+					verdict = " below ECT (more throttling)";
+				} else {
+					verdict = " ABOVE ECT";
+					worse++;
+				}
+			}
+			dev_info(s->dev, "%s: trip %d mC %s hyst %d -> %s state %lu..%lu = %u kHz (ECT %u kHz)%s\n",
+				 s->name, trip->temperature, thermal_trip_type_name(trip->type),
+				 trip->hysteresis, ins->cdev->type, ins->lower, ins->upper,
+				 khz, ect, verdict);
+		}
+		if (!any)
+			dev_info(s->dev, "%s: trip %d mC %s hyst %d (no cooling device)\n",
+				 s->name, trip->temperature,
+				 thermal_trip_type_name(trip->type), trip->hysteresis);
+	}
+	dev_info(s->dev, "%s: governor %s polling %u/%u ms, sustainable %u mW, k_po %d k_pu %d k_i %d integral_cutoff %d (FRAC_BITS 10); ECT ladder %u checked, %u above ECT\n",
+		 s->name, tz->governor ? tz->governor->name : "none",
+		 jiffies_to_msecs(tz->passive_delay_jiffies),
+		 jiffies_to_msecs(tz->polling_delay_jiffies),
+		 tz->tzp ? tz->tzp->sustainable_power : 0,
+		 tz->tzp ? tz->tzp->k_po : 0, tz->tzp ? tz->tzp->k_pu : 0,
+		 tz->tzp ? tz->tzp->k_i : 0, tz->tzp ? tz->tzp->integral_cutoff : 0,
+		 checked, worse);
+	mutex_unlock(&tz->lock);
+}
+
+/* 4.9 exynos_tmu.c: PID constants from the ECT PIDTM block (<< FRAC_BITS). */
+static void acpm_tmu_power_allocator(struct acpm_tmu_sensor *s)
+{
+	struct thermal_zone_device *tz = s->tzd;
+	struct ect_pidtm_block *b;
+	int k_po, k_pu, k_i, cutoff, p_control, ret;
+	char gov[] = "power_allocator";
+	void *block;
+
+	block = ect_get_block(BLOCK_PIDTM);
+	b = block ? ect_pidtm_get_block(block, (char *)s->ect_pidtm) : NULL;
+	if (!b) {
+		dev_err(s->dev, "%s: ECT PIDTM block %s not found: governor unchanged\n",
+			s->name, s->ect_pidtm);
+		return;
+	}
+	k_po = acpm_tmu_ect_param(b, "k_po");
+	k_pu = acpm_tmu_ect_param(b, "k_pu");
+	k_i = acpm_tmu_ect_param(b, "k_i");
+	cutoff = acpm_tmu_ect_param(b, "integral_cutoff");
+	p_control = acpm_tmu_ect_param(b, "p_control_t");
+	dev_info(s->dev, "%s: ECT PIDTM %s: k_po %d k_pu %d k_i %d i_max %d integral_cutoff %d p_control_t %d mW hotplug out/in %d/%d C limited_frequency %d\n",
+		 s->name, s->ect_pidtm, k_po, k_pu, k_i,
+		 acpm_tmu_ect_param(b, "i_max"), cutoff, p_control,
+		 acpm_tmu_ect_param(b, "hotplug_out_threshold"),
+		 acpm_tmu_ect_param(b, "hotplug_in_threshold"),
+		 acpm_tmu_ect_param(b, "limited_frequency"));
+	if (k_po < 0 || k_pu < 0 || k_i < 0 || cutoff < 0 || p_control <= 0 ||
+	    k_po > 10000 || k_pu > 10000 || k_i > 10000) {
+		dev_err(s->dev, "%s: ECT PID constants incomplete: governor unchanged\n", s->name);
+		return;
+	}
+	if (!tz->tzp || tz->tzp->sustainable_power != p_control) {
+		dev_err(s->dev, "%s: DT sustainable-power %u mW != ECT p_control_t %d mW: governor unchanged\n",
+			s->name, tz->tzp ? tz->tzp->sustainable_power : 0, p_control);
+		return;
+	}
+	/* writable: thermal_zone_device_set_policy() strim()s its argument */
+	ret = thermal_zone_device_set_policy(tz, gov);
+	if (ret) {
+		dev_err(s->dev, "%s: power_allocator not set (%d): governor unchanged\n",
+			s->name, ret);
+		return;
+	}
+	/* bind estimated them from sustainable power; 4.9 used the ECT ones */
+	mutex_lock(&tz->lock);
+	tz->tzp->k_po = k_po << 10;
+	tz->tzp->k_pu = k_pu << 10;
+	tz->tzp->k_i = k_i << 10;
+	tz->tzp->integral_cutoff = cutoff;
+	mutex_unlock(&tz->lock);
+	dev_info(s->dev, "%s: governor power_allocator, ECT PID constants applied\n", s->name);
+}
+
+static void acpm_tmu_parity_work(struct work_struct *work)
+{
+	struct acpm_tmu_sensor *s = container_of(to_delayed_work(work),
+						 struct acpm_tmu_sensor, parity_work);
+	struct thermal_zone_device *tz = s->tzd;
+	struct cpufreq_policy *policy = NULL;
+	unsigned int bound, actors;
+	bool last = ++s->parity_tries >= ACPM_TMU_PARITY_TRIES;
+
+	mutex_lock(&tz->lock);
+	acpm_tmu_count_actors(tz, &bound, &actors);
+	mutex_unlock(&tz->lock);
+	if (s->cooling_cpu >= 0)
+		policy = cpufreq_cpu_get(s->cooling_cpu);
+
+	/* wait for the cpufreq cooling device(s) to bind */
+	if ((!bound || (s->cooling_cpu >= 0 && !policy)) && !last) {
+		if (policy)
+			cpufreq_cpu_put(policy);
+		queue_delayed_work(system_long_wq, &s->parity_work,
+				   msecs_to_jiffies(ACPM_TMU_PARITY_PERIOD_MS));
+		return;
+	}
+	if (s->ect_pidtm && !s->pa_done) {
+		s->pa_done = true;
+		if (bound && actors == bound)
+			acpm_tmu_power_allocator(s);
+		else
+			dev_err(s->dev, "%s: power_allocator NOT enabled: %u of %u cooling devices on the control trip are power actors (energy model missing?); keeping %s\n",
+				s->name, actors, bound,
+				tz->governor ? tz->governor->name : "none");
+	}
+	acpm_tmu_report_trips(s, policy);
+	if (policy)
+		cpufreq_cpu_put(policy);
+}
+
+static void acpm_tmu_parity_init(struct acpm_tmu_sensor *s)
+{
+	struct device_node *np = s->dev->of_node, *cpu_np;
+
+	s->cooling_cpu = -1;
+	cpu_np = of_parse_phandle(np, "samsung,cooling-cpu", 0);
+	if (cpu_np) {
+		s->cooling_cpu = of_cpu_node_to_id(cpu_np);
+		of_node_put(cpu_np);
+	}
+	of_property_read_string(np, "samsung,ect-thermal", &s->ect_thermal);
+	of_property_read_string(np, "samsung,ect-pidtm", &s->ect_pidtm);
+	if (s->ect_pidtm && s->cooling_cpu < 0) {
+		dev_err(s->dev, "%s: samsung,ect-pidtm needs samsung,cooling-cpu; ignored\n", s->name);
+		s->ect_pidtm = NULL;
+	}
+	acpm_tmu_hp_init(s);
+	if (!s->ect_thermal && !s->ect_pidtm)
+		return;
+	INIT_DELAYED_WORK(&s->parity_work, acpm_tmu_parity_work);
+	queue_delayed_work(system_long_wq, &s->parity_work,
+			   msecs_to_jiffies(ACPM_TMU_PARITY_PERIOD_MS));
+}
 
 static void acpm_tmu_selftest(struct work_struct *work)
 {
@@ -468,6 +879,7 @@ static int acpm_tmu_sensor_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(s->tzd),
 					     "%s: thermal zone registration failed\n", s->name);
 		dev_info(dev, "%s tzid=%u thermal zone registered\n", s->name, s->id);
+		acpm_tmu_parity_init(s);
 	} else {
 		s->tzd = NULL;
 		dev_err(dev, "%s tzid=%u thermal zone NOT registered: %s\n", s->name, s->id,
