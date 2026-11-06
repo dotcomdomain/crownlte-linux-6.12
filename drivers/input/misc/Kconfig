@@ -956,4 +956,13 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config INPUT_CROWNLTE_BOOSTER
+	bool "crownlte touch input booster (CPU frequency QoS)"
+	depends on CPU_FREQ && OF
+	help
+	  The touch boost of the Galaxy Note9 (crownlte) 4.9 kernel's input
+	  booster: CPU frequency minimum requests for a short time after each
+	  touch-down, configured by a "samsung,crownlte-input-booster" DT
+	  node. Without that node it does nothing.
+
 endif
