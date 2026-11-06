@@ -39,6 +39,23 @@
  * samsung,max-freq-cap is an additional hard ceiling. It is not in 4.9; it
  * keeps big at 4.9's policy-max until thermal throttling has been verified.
  *
+ * Opt-in 4.9 performance parity (each one only with its DT property, see
+ * Documentation/crownlte/perf-tuning.md):
+ *  - samsung,dt-max-freq-above-cal (LITTLE only): DT max-freq replaces the
+ *    CAL maximum, as acme init_domain() does, for an ECT level that has an
+ *    FVMap voltage (cal_dfs_extend_max_freq()). Never for big, never above
+ *    1950 MHz (the 4.9 LITTLE maximum).
+ *  - samsung,schedutil-rate-limit-us: initial schedutil rate limit (4.9
+ *    freqvar-tune up/down_rate_limit 5000 us).
+ *  - samsung,boot-qos-ms + pm_qos-booting: 4.9 set_boot_qos(): min = max =
+ *    the table maximum, or pm_qos-booting if lower, for the first 40 s.
+ *  - an energy model: registered from the OPPs when the CPU DT nodes carry
+ *    dynamic-power-coefficient (4.9 EMS power-coefficient; the OPP formula
+ *    P = C * V^2 * f is the 4.9 EMS one), so EAS and the power_allocator
+ *    governor can use it.
+ *  - samsung,perf-report-ms: one boot report of capacities, EM tables and
+ *    the EAS preconditions.
+ *
  * Cooling devices keep the 4.9 names. 4.9 registered one cpufreq cooling
  * device per acme domain in DT order (domain@0 = cpus 0-3, domain@1 = cpus
  * 4-7) through cpu_cooling.c, which named them "thermal-cpufreq-<idr id>":
@@ -50,12 +67,14 @@
  * names them "cpufreq-cpu0"/"cpufreq-cpu4"). The device is still bound to
  * the policy CPU's DT node, so cooling-maps <&cpu4 ...> work unchanged.
  */
+#include <linux/arch_topology.h>
 #include <linux/cpu.h>
 #include <linux/cpu_cooling.h>
 #include <linux/cpufreq.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/devfreq.h>
+#include <linux/energy_model.h>
 #include <linux/device.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
@@ -64,6 +83,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
+#include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
@@ -83,6 +103,13 @@
 #define EXYNOS9810_TRANSITION_NS 500000
 #define EXYNOS9810_SELFTEST_UPTIME_MS 100000
 #define EXYNOS9810_SELFTEST_SETTLE_US 200000
+/*
+ * The highest rate 4.9 runs on LITTLE (DT max-freq of the flashed 4.9 boot
+ * image, acme lets it replace the CAL maximum). samsung,dt-max-freq-above-cal
+ * never allows more, and never applies to big.
+ */
+#define EXYNOS9810_LITTLE_49_MAX_KHZ 1950000
+#define EXYNOS9810_BOOT_QOS_MAX_MS 60000
 
 struct exynos9810_domain {
 	struct device *cpu_dev;
@@ -112,6 +139,14 @@ struct exynos9810_domain {
 	bool skew_short;	/* last transition ran below the request */
 	unsigned int retry_ms;	/* backoff of the re-request after a cap */
 	struct delayed_work retry_work;
+	/* opt-in 4.9 parity */
+	u32 ext_max_khz;	/* accepted DT max-freq above the CAL max, 0 = none */
+	unsigned int ext_max_uv;
+	u32 rate_limit_us;	/* initial schedutil rate limit, 0 = core default */
+	u32 boot_khz;		/* 4.9 boot QoS level, 0 = none */
+	bool boot_qos_done;	/* added once, never again (also not on re-online) */
+	struct freq_qos_request boot_min_req;
+	struct freq_qos_request boot_max_req;
 };
 
 struct exynos9810_cpufreq {
@@ -120,7 +155,14 @@ struct exynos9810_cpufreq {
 	u32 mif_cal_id;
 	unsigned long mif_static_khz;
 	struct exynos9810_domain domains[EXYNOS9810_DOMAINS];
+	u32 boot_qos_ms;	/* samsung,boot-qos-ms, 0 = off */
+	struct delayed_work boot_qos_work;
+	u32 report_ms;		/* samsung,perf-report-ms, 0 = off */
+	struct delayed_work report_work;
 };
+
+/* boot QoS requests: added in ->ready, removed by the work or by ->exit */
+static DEFINE_MUTEX(exynos9810_boot_qos_lock);
 
 static struct exynos9810_cpufreq *provider;
 
@@ -505,6 +547,9 @@ static int exynos9810_policy_init(struct cpufreq_policy *policy)
 	policy->cur = rate;
 	policy->suspend_freq = domain->resume_khz;
 	policy->cpuinfo.transition_latency = EXYNOS9810_TRANSITION_NS;
+	/* schedutil reads it when it starts; sysfs rate_limit_us still works */
+	if (domain->rate_limit_us)
+		policy->transition_delay_us = domain->rate_limit_us;
 	policy->dvfs_possible_from_any_cpu = true;
 	return 0;
 }
@@ -588,6 +633,13 @@ static void exynos9810_policy_exit(struct cpufreq_policy *policy)
 	}
 	if (!domain)
 		return;
+	/* the requests live on this policy's constraints, which go with it */
+	mutex_lock(&exynos9810_boot_qos_lock);
+	if (freq_qos_request_active(&domain->boot_min_req))
+		freq_qos_remove_request(&domain->boot_min_req);
+	if (freq_qos_request_active(&domain->boot_max_req))
+		freq_qos_remove_request(&domain->boot_max_req);
+	mutex_unlock(&exynos9810_boot_qos_lock);
 	exynos9810_domain_stop_retry(domain);
 	if (!provider->mif || !dev_pm_qos_request_active(&domain->mif_request))
 		return;
@@ -629,12 +681,67 @@ static void exynos9810_cooling_register(struct cpufreq_policy *policy,
 		 policy->cdev->id, max_state);
 }
 
+/*
+ * 4.9 set_boot_qos(): for the first boot_qos_ms the cluster runs at its
+ * boot level (min = max). Only once per boot; thermal MAX requests still
+ * win (the core clamps min to max).
+ */
+static void exynos9810_boot_qos_add(struct cpufreq_policy *policy,
+				    struct exynos9810_domain *domain)
+{
+	int r1, r2;
+
+	if (!domain->boot_khz || !provider->boot_qos_ms)
+		return;
+	mutex_lock(&exynos9810_boot_qos_lock);
+	if (domain->boot_qos_done) {
+		mutex_unlock(&exynos9810_boot_qos_lock);
+		return;
+	}
+	domain->boot_qos_done = true;
+	r1 = freq_qos_add_request(&policy->constraints, &domain->boot_max_req,
+				  FREQ_QOS_MAX, domain->boot_khz);
+	r2 = freq_qos_add_request(&policy->constraints, &domain->boot_min_req,
+				  FREQ_QOS_MIN, domain->boot_khz);
+	mutex_unlock(&exynos9810_boot_qos_lock);
+	dev_info(provider->dev, "perf: domain%u (cpus %*pbl) boot QoS min=max=%u kHz for %u ms (4.9 set_boot_qos) ret=%d/%d\n",
+		 domain->id, cpumask_pr_args(policy->related_cpus), domain->boot_khz,
+		 provider->boot_qos_ms, r1, r2);
+	if (r1 >= 0 || r2 >= 0)
+		schedule_delayed_work(&provider->boot_qos_work,
+				      msecs_to_jiffies(provider->boot_qos_ms));
+}
+
+static void exynos9810_boot_qos_end(struct work_struct *work)
+{
+	unsigned int i;
+
+	for (i = 0; i < EXYNOS9810_DOMAINS; i++) {
+		struct exynos9810_domain *d = &provider->domains[i];
+		bool had;
+
+		mutex_lock(&exynos9810_boot_qos_lock);
+		had = freq_qos_request_active(&d->boot_min_req) ||
+		      freq_qos_request_active(&d->boot_max_req);
+		if (freq_qos_request_active(&d->boot_min_req))
+			freq_qos_remove_request(&d->boot_min_req);
+		if (freq_qos_request_active(&d->boot_max_req))
+			freq_qos_remove_request(&d->boot_max_req);
+		mutex_unlock(&exynos9810_boot_qos_lock);
+		if (had)
+			dev_info(provider->dev, "perf: domain%u boot QoS %u kHz released after %u ms, cmu=%lu kHz\n",
+				 d->id, d->boot_khz, provider->boot_qos_ms,
+				 cal_dfs_get_rate(d->cal_id));
+	}
+}
+
 static void exynos9810_policy_ready(struct cpufreq_policy *policy)
 {
 	struct exynos9810_domain *domain = policy->driver_data;
 	int ret;
 
 	exynos9810_cooling_register(policy, domain);
+	exynos9810_boot_qos_add(policy, domain);
 
 	/*
 	 * acme set_policy(): policy-max is the initial user policy maximum.
@@ -670,6 +777,13 @@ static struct cpufreq_driver exynos9810_driver = {
 	.online = exynos9810_policy_online,
 	.offline = exynos9810_policy_offline,
 	.ready = exynos9810_policy_ready,
+	/*
+	 * Energy model from the OPPs (FVMap voltages) and the CPU node's
+	 * dynamic-power-coefficient; nothing is registered without one. The
+	 * core calls it before ->ready, so the cooling device registered there
+	 * gets power callbacks (power_allocator power actor).
+	 */
+	.register_em = cpufreq_register_em_with_opp,
 	.suspend = cpufreq_generic_suspend,
 	.attr = exynos9810_attrs,
 };
@@ -762,9 +876,32 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 	min_khz = max(domain->cal_min, domain->dt_min);
 	/*
 	 * acme lets DT max-freq replace the CAL max outright. cal_dfs_set_rate()
-	 * here refuses rates above the CAL max, so take the smaller one.
+	 * here refuses rates above the CAL max, so take the smaller one, unless
+	 * samsung,dt-max-freq-above-cal asks for the acme behaviour (LITTLE
+	 * only, at most the 4.9 LITTLE maximum, an ECT level with a voltage).
 	 */
 	max_khz = min(domain->cal_max, domain->dt_max);
+	if (of_property_read_bool(node, "samsung,dt-max-freq-above-cal") &&
+	    domain->dt_max > domain->cal_max) {
+		if (id != 0 || domain->dt_max > EXYNOS9810_LITTLE_49_MAX_KHZ) {
+			dev_err(dev, "perf: domain%u: DT max-freq %u kHz above CAL max %u kHz refused (LITTLE only, <= %u kHz)\n",
+				id, domain->dt_max, domain->cal_max,
+				EXYNOS9810_LITTLE_49_MAX_KHZ);
+		} else {
+			ret = cal_dfs_extend_max_freq(domain->cal_id, domain->dt_max,
+						      &domain->ext_max_uv);
+			if (ret) {
+				dev_err(dev, "perf: domain%u: DT max-freq %u kHz above CAL max %u kHz refused by CAL: %d\n",
+					id, domain->dt_max, domain->cal_max, ret);
+			} else {
+				domain->ext_max_khz = domain->dt_max;
+				max_khz = domain->dt_max;
+				dev_info(dev, "perf: domain%u: max %u kHz above CAL max %u kHz (DT samsung,dt-max-freq-above-cal, 4.9 acme), FVMap %u uV\n",
+					 id, domain->dt_max, domain->cal_max,
+					 domain->ext_max_uv);
+			}
+		}
+	}
 	if (!of_property_read_u32(node, "samsung,max-freq-cap", &domain->cap))
 		max_khz = min(max_khz, domain->cap);
 	if (!min_khz || min_khz > max_khz)
@@ -774,6 +911,20 @@ static int exynos9810_prepare_domain(struct exynos9810_cpufreq *state,
 			return -EINVAL;
 		if (domain->policy_max >= max_khz)
 			domain->policy_max = 0;	/* the table already stops there */
+	}
+	if (!of_property_read_u32(node, "samsung,schedutil-rate-limit-us",
+				  &domain->rate_limit_us) &&
+	    (!domain->rate_limit_us || domain->rate_limit_us > 100000))
+		return -EINVAL;
+	/* 4.9 set_boot_qos(): the table max, or pm_qos-booting if lower */
+	if (state->boot_qos_ms) {
+		u32 booting;
+
+		domain->boot_khz = max_khz;
+		if (!of_property_read_u32(node, "pm_qos-booting", &booting))
+			domain->boot_khz = min(domain->boot_khz, booting);
+		if (domain->policy_max)
+			domain->boot_khz = min(domain->boot_khz, domain->policy_max);
 	}
 
 	/* acme init_table(): cal_dfs_get_rate_table() + cal_dfs_get_asv_table(). */
@@ -1128,6 +1279,108 @@ static void exynos9810_selftest_arm(struct device *dev)
 }
 
 /* ---------------------------------------------------------------------- */
+/* DT-gated boot report (samsung,perf-report-ms). Every line is prefixed. */
+
+static void exynos9810_report_em(struct exynos9810_domain *d)
+{
+	struct em_perf_domain *pd = em_cpu_get(cpumask_first(&d->cpus));
+	struct em_perf_state *table;
+	char buf[256];
+	unsigned int i, len;
+
+	if (!pd) {
+		pr_info("perf report: domain%u em: none (no dynamic-power-coefficient on the CPU nodes)\n",
+			d->id);
+		return;
+	}
+	pr_info("perf report: domain%u em: cpus %*pbl, %d states, %s, artificial=%d\n",
+		d->id, cpumask_pr_args(em_span_cpus(pd)), pd->nr_perf_states,
+		(pd->flags & EM_PERF_DOMAIN_MICROWATTS) ? "uW" : "abstract",
+		!!(pd->flags & EM_PERF_DOMAIN_ARTIFICIAL));
+	rcu_read_lock();
+	table = em_perf_state_from_pd(pd);
+	for (i = 0; i < pd->nr_perf_states; i += 4) {
+		unsigned int k;
+
+		len = 0;
+		for (k = i; k < pd->nr_perf_states && k < i + 4; k++)
+			len += scnprintf(buf + len, sizeof(buf) - len,
+					 " %lukHz/%luuW/perf%lu/cost%lu%s",
+					 table[k].frequency, table[k].power,
+					 table[k].performance, table[k].cost,
+					 (table[k].flags & EM_PERF_STATE_INEFFICIENT) ?
+					 "/ineff" : "");
+		pr_info("perf report: domain%u em[%u..]%s\n", d->id, i, buf);
+	}
+	rcu_read_unlock();
+}
+
+static void exynos9810_report(struct work_struct *work)
+{
+	unsigned int i, cpu, em = 0, sugov = 0;
+	unsigned long cap_min = ULONG_MAX, cap_max = 0;
+
+	for_each_possible_cpu(cpu) {
+		struct device_node *np = of_cpu_device_node_get(cpu);
+		u32 dmips = 0;
+		unsigned long cap = topology_get_cpu_scale(cpu);
+
+		if (np)
+			of_property_read_u32(np, "capacity-dmips-mhz", &dmips);
+		of_node_put(np);
+		cap_min = min(cap_min, cap);
+		cap_max = max(cap_max, cap);
+		pr_info("perf report: cpu%u cluster%d core%d online=%d capacity=%lu capacity-dmips-mhz=%u freq_ref=%lu kHz\n",
+			cpu, topology_cluster_id(cpu), topology_core_id(cpu),
+			cpu_online(cpu), cap, dmips, topology_get_freq_ref(cpu));
+	}
+	for (i = 0; i < EXYNOS9810_DOMAINS; i++) {
+		struct exynos9810_domain *d = &provider->domains[i];
+		struct cpufreq_policy *policy;
+
+		cpu = cpumask_first_and(&d->cpus, cpu_online_mask);
+		policy = cpu < nr_cpu_ids ? cpufreq_cpu_get(cpu) : NULL;
+		if (policy) {
+			bool is_sugov = policy->governor &&
+					!strcmp(policy->governor->name, "schedutil");
+
+			sugov += is_sugov;
+			pr_info("perf report: policy%u domain%u gov=%s rate_limit=%uus (dt %u) cpuinfo=%u-%u limits=%u-%u cur=%u cmu=%lu ext_max=%u boot_qos=%u%s cdev=%s\n",
+				policy->cpu, d->id,
+				policy->governor ? policy->governor->name : "none",
+				cpufreq_policy_transition_delay_us(policy), d->rate_limit_us,
+				policy->cpuinfo.min_freq, policy->cpuinfo.max_freq,
+				policy->min, policy->max, policy->cur,
+				cal_dfs_get_rate(d->cal_id), d->ext_max_khz, d->boot_khz,
+				freq_qos_request_active(&d->boot_min_req) ? "(active)" : "",
+				policy->cdev ? policy->cdev->type : "none");
+			cpufreq_cpu_put(policy);
+		} else {
+			pr_info("perf report: domain%u no online policy\n", d->id);
+		}
+		if (em_cpu_get(cpumask_first(&d->cpus)))
+			em++;
+		exynos9810_report_em(d);
+	}
+	pr_info("perf report: EAS preconditions: asymmetric capacity %s (%lu..%lu), EM %u/%u, schedutil %u/%u, freq-invariant %s\n",
+		cap_min != cap_max ? "yes" : "NO", cap_min, cap_max,
+		em, EXYNOS9810_DOMAINS, sugov, EXYNOS9810_DOMAINS,
+		cpufreq_supports_freq_invariance() ? "yes" : "NO");
+}
+
+static void exynos9810_report_arm(struct exynos9810_cpufreq *state)
+{
+	s64 uptime_ms;
+
+	if (!state->report_ms)
+		return;
+	uptime_ms = ktime_to_ms(ktime_get_boottime());
+	INIT_DELAYED_WORK(&state->report_work, exynos9810_report);
+	schedule_delayed_work(&state->report_work,
+			      msecs_to_jiffies(max_t(s64, state->report_ms - uptime_ms, 0)));
+}
+
+/* ---------------------------------------------------------------------- */
 
 static int exynos9810_cpufreq_probe(struct platform_device *pdev)
 {
@@ -1174,6 +1427,13 @@ static int exynos9810_cpufreq_probe(struct platform_device *pdev)
 
 	for (id = 0; id < EXYNOS9810_DOMAINS; id++)
 		INIT_DELAYED_WORK(&state->domains[id].retry_work, exynos9810_retry_work);
+	if (!of_property_read_u32(dev->of_node, "samsung,boot-qos-ms", &state->boot_qos_ms) &&
+	    state->boot_qos_ms > EXYNOS9810_BOOT_QOS_MAX_MS) {
+		exynos9810_note(-EINVAL, "samsung,boot-qos-ms");
+		return -EINVAL;
+	}
+	INIT_DELAYED_WORK(&state->boot_qos_work, exynos9810_boot_qos_end);
+	of_property_read_u32(dev->of_node, "samsung,perf-report-ms", &state->report_ms);
 	if (of_property_present(dev->of_node, "samsung,mif-devfreq")) {
 		ret = exynos9810_get_mif_supplier(state);
 		if (ret) {
@@ -1212,6 +1472,7 @@ static int exynos9810_cpufreq_probe(struct platform_device *pdev)
 		exynos9810_note(ret, "cpufreq_register_driver");
 		return dev_err_probe(dev, ret, "cpufreq registration failed\n");
 	}
+	exynos9810_report_arm(state);
 	exynos9810_note(0, "registered mif=%s levels=%u+%u",
 			state->mif ? "devfreq" : "static",
 			state->domains[0].levels, state->domains[1].levels);
