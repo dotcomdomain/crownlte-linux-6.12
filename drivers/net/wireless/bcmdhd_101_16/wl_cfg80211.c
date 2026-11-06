@@ -1259,9 +1259,6 @@ bool fw_assoc_watchdog_started = 0;
 
 int wl_channel_to_frequency(u32 chan, chanspec_band_t band)
 {
-#ifdef DHD_CROWNLTE_612
-	{ extern void wl_cfgscan_crownlte_note_user_ext(void); wl_cfgscan_crownlte_note_user_ext(); }
-#endif
 	if (chan == 0) {
 		return 0; /* not supported */
 	}
@@ -6022,6 +6019,9 @@ static s32
 wl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
 	struct cfg80211_connect_params *sme)
 {
+#ifdef DHD_CROWNLTE_612
+	{ extern void wl_cfgscan_crownlte_note_user_ext(void); wl_cfgscan_crownlte_note_user_ext(); }
+#endif
 	s32 err = BCME_OK;
 	struct bcm_cfg80211 *cfg = wiphy_priv(wiphy);
 	wlcfg_assoc_info_t assoc_info;
