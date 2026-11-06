@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * crownlte (SM-N960F) 4.9 performance/efficiency parity, opt-in.
+ *
+ * Include it at the end of a crownlte board DTS (the delayed-ufs board DT or
+ * a flattened ROM-in-RAM DTS): it only uses node paths, no labels. Every
+ * value and its 4.9 source is in Documentation/crownlte/perf-tuning.md.
+ * Without this file none of these behaviours is enabled.
+ */
+
+/*
+ * Scheduler topology and energy model (4.9 EMS DT: capacity-mips 272/785,
+ * power-coefficient 160/800; P[mW] = C * f[MHz] * V[mV]^2 / 10^9, the same
+ * formula as the OPP dynamic-power-coefficient path).
+ */
+&{/cpus/cpu@0} { capacity-dmips-mhz = <272>; dynamic-power-coefficient = <160>; };
+&{/cpus/cpu@1} { capacity-dmips-mhz = <272>; dynamic-power-coefficient = <160>; };
+&{/cpus/cpu@2} { capacity-dmips-mhz = <272>; dynamic-power-coefficient = <160>; };
+&{/cpus/cpu@3} { capacity-dmips-mhz = <272>; dynamic-power-coefficient = <160>; };
+&{/cpus/cpu@100} { capacity-dmips-mhz = <785>; dynamic-power-coefficient = <800>; };
+&{/cpus/cpu@101} { capacity-dmips-mhz = <785>; dynamic-power-coefficient = <800>; };
+&{/cpus/cpu@102} { capacity-dmips-mhz = <785>; dynamic-power-coefficient = <800>; };
+&{/cpus/cpu@103} { capacity-dmips-mhz = <785>; dynamic-power-coefficient = <800>; };
+
+&{/cpufreq} {
+	/* 4.9 set_boot_qos(): min = max for 40 s (LITTLE table max, big 1794) */
+	samsung,boot-qos-ms = <40000>;
+	/* capacities, EM tables, EAS preconditions at 60 s uptime */
+	samsung,perf-report-ms = <60000>;
+};
+
+&{/cpufreq/cluster0} {
+	/* 4.9 acme: DT max-freq 1950000 replaces the CAL max 1794000 */
+	samsung,dt-max-freq-above-cal;
+	/* 4.9 freqvar-tune up/down_rate_limit */
+	samsung,schedutil-rate-limit-us = <5000>;
+};
+
+&{/cpufreq/cluster1} {
+	/* 4.9 pm_qos-booting; samsung,max-freq-cap 1794000 stays */
+	pm_qos-booting = <1794000>;
+	samsung,schedutil-rate-limit-us = <5000>;
+};
+
+/*
+ * Thermal parity with the device ECT (bootloader copy, "PARA" 004x):
+ *  THERMAL LITTLE: 20-75 C 1950, 76 1690, 81 1456, 86 1248, 91 1053,
+ *                  96+ 455 MHz (4.9 step ladder, hysteresis 5 C).
+ *  PIDTM BIG: switch-on 60 C, control 83 C, k_po 100, k_pu 300, k_i 20,
+ *             integral_cutoff 23, p_control_t 2000 mW, hotplug 96/91 C.
+ * Cooling states are positions in the LITTLE table 1950, 1794, 1690, 1456,
+ * 1248, 1053, 949, 832, 715, 598, 455 MHz (state 0 = 1950). If 1950 is not
+ * available the same state is one level lower (more throttling); the TMU
+ * driver logs the resulting frequency of every trip next to the ECT value.
+ */
+&{/tmu-big@10070000} {
+	samsung,cooling-cpu = <&{/cpus/cpu@100}>;
+	samsung,ect-pidtm = "BIG";
+	samsung,hotplug-temps = <96000 91000>;
+};
+
+&{/tmu-little@10070000} {
+	samsung,cooling-cpu = <&{/cpus/cpu@0}>;
+	samsung,ect-thermal = "LITTLE";
+};
+
+&{/thermal-zones/BIG} {
+	sustainable-power = <2000>;
+
+	trips {
+		/* power_allocator switch-on: the last active trip before control */
+		big-switch-on {
+			temperature = <60000>;
+			hysteresis = <2000>;
+			type = "active";
+		};
+	};
+};
+
+&{/thermal-zones/LITTLE} {
+	polling-delay-passive = <250>;
+
+	trips {
+		little_76: little-throttle-76 {
+			temperature = <76000>;
+			hysteresis = <5000>;
+			type = "passive";
+		};
+		little_81: little-throttle-81 {
+			temperature = <81000>;
+			hysteresis = <5000>;
+			type = "passive";
+		};
+		little_86: little-throttle-86 {
+			temperature = <86000>;
+			hysteresis = <5000>;
+			type = "passive";
+		};
+		little_91: little-throttle-91 {
+			temperature = <91000>;
+			hysteresis = <5000>;
+			type = "passive";
+		};
+		little_96: little-throttle-96 {
+			temperature = <96000>;
+			hysteresis = <5000>;
+			type = "passive";
+		};
+	};
+
+	cooling-maps {
+		map76 {	/* 1690 MHz */
+			trip = <&little_76>;
+			cooling-device = <&{/cpus/cpu@0} 2 2>, <&{/cpus/cpu@1} 2 2>,
+					 <&{/cpus/cpu@2} 2 2>, <&{/cpus/cpu@3} 2 2>;
+		};
+		map81 {	/* 1456 MHz */
+			trip = <&little_81>;
+			cooling-device = <&{/cpus/cpu@0} 3 3>, <&{/cpus/cpu@1} 3 3>,
+					 <&{/cpus/cpu@2} 3 3>, <&{/cpus/cpu@3} 3 3>;
+		};
+		map86 {	/* 1248 MHz */
+			trip = <&little_86>;
+			cooling-device = <&{/cpus/cpu@0} 4 4>, <&{/cpus/cpu@1} 4 4>,
+					 <&{/cpus/cpu@2} 4 4>, <&{/cpus/cpu@3} 4 4>;
+		};
+		map91 {	/* 1053 MHz */
+			trip = <&little_91>;
+			cooling-device = <&{/cpus/cpu@0} 5 5>, <&{/cpus/cpu@1} 5 5>,
+					 <&{/cpus/cpu@2} 5 5>, <&{/cpus/cpu@3} 5 5>;
+		};
+		map96 {	/* 455 MHz */
+			trip = <&little_96>;
+			cooling-device = <&{/cpus/cpu@0} 10 10>, <&{/cpus/cpu@1} 10 10>,
+					 <&{/cpus/cpu@2} 10 10>, <&{/cpus/cpu@3} 10 10>;
+		};
+	};
+};
+
+/* UFS clock gating with hibern8, 4.9 gate delay LINK_H8_DELAY 20 ms */
+&{/soc@0/ufs@11120000} {
+	samsung,clk-gating;
+	samsung,clkgate-delay-ms = <20>;
+};
+
+&{/} {
+	/*
+	 * 4.9 input_booster TOUCH, default level 2: head 130 ms big 1066 /
+	 * LITTLE 832 MHz, tail 500 ms after release big 858 / LITTLE 832 MHz.
+	 */
+	input-booster {
+		compatible = "samsung,crownlte-input-booster";
+		samsung,cpus = <&{/cpus/cpu@100}>, <&{/cpus/cpu@0}>;
+		samsung,touch-head = <130 1066000 832000>;
+		samsung,touch-tail = <500 858000 832000>;
+		samsung,booster-selftest-ms = <95000>;
+	};
+};

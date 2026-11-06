@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ROM-in-RAM v23a with the 4.9 performance/efficiency parity enabled
+ * (branch crownlte-perf, Documentation/crownlte/perf-tuning.md).
+ *
+ * Build with rom-ram/src/build-dtb.sh (KSRC = this tree, KO = its build
+ * directory); kbuild does not build the flattened ROM-in-RAM DTBs.
+ * sched_verbose makes the scheduler log "sched_energy_set: starting EAS"
+ * and the perf domains when it builds the sched domains.
+ */
+#include "exynos9810-crownlte-romram-v23a.dts"
+#include "exynos9810-crownlte-perf.dtsi"
+
+&{/} {
+	model = "Samsung Note9 ROM-in-RAM v23a + 4.9 perf parity (crownlte-perf)";
+};
+
+&{/chosen} {
+	bootargs = "panic=30 ro sched_verbose";
+};

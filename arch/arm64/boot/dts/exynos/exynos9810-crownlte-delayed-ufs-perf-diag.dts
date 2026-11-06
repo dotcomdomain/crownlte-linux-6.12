@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * The delayed-UFS board DT with the 4.9 performance/efficiency parity
+ * enabled (Documentation/crownlte/perf-tuning.md). Mainly a kbuild check
+ * that exynos9810-crownlte-perf.dtsi applies to the board DT.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+#include "exynos9810-crownlte-perf.dtsi"
+
+&{/} {
+	model = "Samsung Note9 delayed-UFS diagnostic + 4.9 perf parity";
+};

@@ -117,7 +117,11 @@
 	 * (cooling-device <&domain1 NO_LIMIT NO_LIMIT>). Without an energy model
 	 * power_allocator cannot drive cpufreq cooling here, so BIG uses the
 	 * default step_wise governor on the same trip and cooling range.
-	 * 4.9's LITTLE maps were all <0 0> (never throttle) and are omitted;
+	 * 4.9's DT LITTLE maps were <0 0> placeholders, but 4.9 replaced them
+	 * at probe with the ECT THERMAL "LITTLE" ladder (76 C 1690 MHz ...
+	 * 96 C 455 MHz), so LITTLE did throttle on 4.9. That ladder, the BIG
+	 * power_allocator and the 96/91 C big cap are opt-in through
+	 * exynos9810-crownlte-perf.dtsi (Documentation/crownlte/perf-tuning.md).
 	 * G3D throttles the Mali levels through the kbase platform cooling
 	 * device "thermal-gpufreq-0" (step_wise, 4.9 gpu_temp_throttling).
 	 * 4.9 LITTLE/ISP/G3D relied on TMU interrupts; here everything polls.
