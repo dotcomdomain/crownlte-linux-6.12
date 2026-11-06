@@ -32,26 +32,6 @@ void dhd_crownlte_get_plat_status(struct dhd_crownlte_plat_status *st);
 /* dhd_crownlte_selftest.c */
 void dhd_crownlte_selftest_arm(struct device *dev, u32 delay_ms, bool keep_up);
 
-/* wl_cfgscan.c: one firmware escan without a cfg80211 request */
-#define DHD_CROWNLTE_SCAN_TOP	5
-struct dhd_crownlte_scan_report {
-	int ret;
-	bool timed_out;
-	bool preempted;
-	s32 status;		/* terminal escan status of OUR sync id, -1: none */
-	u32 channels;		/* channels requested */
-	u32 elapsed_ms;
-	u32 count;		/* BSS entries in the escan buffer */
-	u32 n2g;
-	u32 n5g;
-	u32 ntop;
-	u8 top_oui[DHD_CROWNLTE_SCAN_TOP][3];
-	s16 top_rssi[DHD_CROWNLTE_SCAN_TOP];
-	u16 top_chan[DHD_CROWNLTE_SCAN_TOP];
-};
-
-int wl_cfgscan_crownlte_selftest_scan(struct net_device *ndev,
-	unsigned int timeout_ms, struct dhd_crownlte_scan_report *rep);
 /* watch window: any cfg80211 scan/sched-scan/connect while armed = userspace took over */
 void wl_cfgscan_crownlte_watch(bool on);
 bool wl_cfgscan_crownlte_userspace_seen(void);

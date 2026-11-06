@@ -75,17 +75,15 @@ static int crownlte_selftest_fn(void *arg)
 {
 	struct dhd_crownlte_plat_status ps;
 	struct exynos_pcie_status rc;
-	struct dhd_crownlte_scan_report sr;
 	struct pci_dev *pdev = NULL;
 	struct net_device *ndev = NULL;
 	dhd_pub_t *dhdp;
 	const char *fail = NULL;
-	bool opened = false, shared = false, scanned = false, nofw = false;
+	bool opened = false, shared = false, nofw = false;
 	u64 t0;
 	u32 chip = 0, rev = 0;
 	int ret, i;
 
-	memset(&sr, 0, sizeof(sr));
 	while (!kthread_should_stop()) {
 		u64 now = ktime_get_boottime_ns() / NSEC_PER_MSEC;
 
@@ -203,22 +201,11 @@ static int crownlte_selftest_fn(void *arg)
 			m[0], m[1], m[2], !!(m[0] & 0x02));
 	}
 
-	/* 6. one passive escan, never handed to cfg80211 */
-	if (!shared) {
-		ret = wl_cfgscan_crownlte_selftest_scan(ndev, ST_SCAN_TIMEOUT_MS, &sr);
-		pr_info(WST "scan ret=%d status=%d channels=%u elapsed=%u ms timed_out=%d preempted=%d bss=%u (2.4G %u, 5G %u)\n",
-			sr.ret, sr.status, sr.channels, sr.elapsed_ms, sr.timed_out,
-			sr.preempted, sr.count, sr.n2g, sr.n5g);
-		for (i = 0; i < sr.ntop; i++)
-			pr_info(WST "scan top%d oui %02x:%02x:%02x ch %u rssi %d\n",
-				i + 1, sr.top_oui[i][0], sr.top_oui[i][1],
-				sr.top_oui[i][2], sr.top_chan[i], sr.top_rssi[i]);
-		if (ret) {
-			fail = sr.preempted ? "scan-preempted" : "scan";
-			goto out;
-		}
-		scanned = true;
-	}
+	/*
+	 * 6. no kernel scan: the vendor driver has several scan owners (cfg80211,
+	 * PNO, P2P, ACS) without a common lock, so a self-test scan cannot be made
+	 * safe against them. Scanning is verified through the Wi-Fi HAL (adb).
+	 */
 
 out:
 	/* 7. leave wlan0 as we found it */
@@ -234,7 +221,7 @@ out:
 		rtnl_lock();
 		if (wiphy)
 			wiphy_lock(wiphy);
-		user = wl_cfgscan_crownlte_userspace_seen() || sr.preempted;
+		user = wl_cfgscan_crownlte_userspace_seen();
 		wl_cfgscan_crownlte_watch(false);
 		if (wiphy)
 			wiphy_unlock(wiphy);
@@ -259,11 +246,9 @@ out:
 	else if (shared)
 		pr_info(WST "RESULT PASS-SHARED chip=0x%04x rev=%u (wlan0 owned by userspace, scan skipped)\n",
 			chip, rev);
-	else if (scanned && sr.count == 0)
-		pr_info(WST "RESULT PASS-NO-BSS chip=0x%04x rev=%u (scan completed, nothing heard)\n",
-			chip, rev);
 	else
-		pr_info(WST "RESULT PASS chip=0x%04x rev=%u bss=%u\n", chip, rev, sr.count);
+		pr_info(WST "RESULT PASS chip=0x%04x rev=%u (power, link, chip id, firmware, wlan0 up; scan via HAL)\n",
+			chip, rev);
 	return 0;
 }
 

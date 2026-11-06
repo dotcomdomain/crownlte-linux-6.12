@@ -253,3 +253,16 @@ waits up to 60 s for userspace. Accepted for now because:
   request Wi-Fi firmware.
 To revisit before the real boot: scope the fallback to DHD (request_firmware_nowait with
 uevent, or firmware_class.path pointing at the vendor firmware directory).
+
+## Change after review round 4: no kernel scan in the self-test
+
+Review rounds 1-4 kept finding scan owners in the vendor driver that start
+firmware scans without a common lock (cfg80211 scans, PNO targeted escans, P2P
+action-frame search, ACS via WLC_START_CHANNEL_SEL). A self-test scan cannot be
+made safe against all of them without restructuring the vendor driver, so the
+self-test no longer scans. It still checks power, PCIe link, enumeration, chip
+id, firmware download and wlan0 bring-up (ownership decided under RTNL + the
+wiphy mutex, relinquished on any cfg80211 activity). RESULT PASS now means that.
+Scanning is verified on hardware through the normal userspace path over adb in
+the ROM-RAM trial: cmd wifi set-wifi-enabled enabled, then cmd wifi start-scan
+and cmd wifi list-scan-results (or iw/wpa_cli if present).
