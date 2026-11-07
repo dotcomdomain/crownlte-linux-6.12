@@ -160,7 +160,7 @@ config EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET
 	  available owner are still required. Never enable for Android production.
 
 config EXYNOS9810_PM
-	bool "crownlte system suspend, stage S0 (no firmware sleep)"
+	bool "crownlte system suspend, stages S0 and S1a/S1b (no firmware sleep)"
 	depends on EXYNOS9810_LEGACY_CAL && OF && ARM64
 	depends on SUSPEND && HOTPLUG_CPU
 	help
@@ -171,3 +171,8 @@ config EXYNOS9810_PM
 	  samsung,exynos9810-pm node and list samsung,suspend-s0 stages use
 	  it. The S0c pm_test stage needs PM_DEBUG.
 	  See Documentation/crownlte/suspend-s0.md.
+
+	  DT samsung,suspend-s1 = "a", "b" adds S1a (read-only probe of the
+	  SoC's AP RTC at 0x141E0000) and S1b (a seconds alarm on that RTC
+	  while awake, disarmed and restored). Still no sleep and no firmware
+	  call. See Documentation/crownlte/suspend-s1.md.

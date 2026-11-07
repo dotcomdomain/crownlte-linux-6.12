@@ -52,10 +52,21 @@
  * before any cross-CPU request, inside the watchdog's ping path: after it
  * no CPU can reload the counter. S0b and S0c/S0d start only with a live,
  * reset-enabled, still-petted watchdog carrying that deadline.
+ *
+ * Stage S1, first half (DT samsung,suspend-s1 = "a", "b"; design gekko
+ * roadmap/suspend-s1-design.md section 5; Documentation/crownlte/
+ * suspend-s1.md): still no sleep and no firmware call. S1a reads the SoC's
+ * own RTC (AP RTC, 0x141E0000; 4.9 never touches it), its CMU_APM Q-channel
+ * and the PMU watchdog/reset registers; S1b arms a seconds-only AP RTC alarm
+ * while awake, waits for INTP.ALM, disarms it and restores every RTC
+ * register it wrote. Their only writes are AP RTC INTP, ALMSEC, RTCALM and,
+ * only if a write does not read back, a RTCCON.RTCEN set and restore. They
+ * run after S0a, before S0b, under the same watchdog deadline.
  */
 
 #define pr_fmt(fmt) "suspend s0: " fmt
 
+#include <linux/bcd.h>
 #include <linux/cpu.h>
 #include <linux/cpuhotplug.h>
 #include <linux/cpumask.h>
@@ -109,6 +120,10 @@
 #define PMU_NR_IDLE_IP			4
 /* 4.9 SYS_SLEEP idle_ip_mask: init_idle_ip(), no fix-idle-ip on crownlte */
 #define E9810_IDLE_IP_MASK_SLEEP	0xffffffff
+#define PMU_RST_STAT			0x0404
+#define PMU_WDT_AUTO_DISABLE		0x0408	/* bit 24: CL0 WDT */
+#define PMU_WDT_MASK_RESET		0x040c	/* bit 24: CL0 WDT */
+#define PMU_WDT_CL0_BIT			BIT(24)
 #define PMU_RESET_SEQUENCER_CFG		0x0500	/* bit 0: DFD EDPCSR dump */
 #define PMU_WAKEUP_STAT			0x0600
 #define PMU_EINT_WAKEUP_MASK		0x060c
@@ -152,8 +167,36 @@ static const u8 intr_gen_grp[] = { 1, 2, 4 };
  * ISPENDR0 bits 0-15 show a pending SGI from any source, so the S0d
  * self-IPI check needs no GICD_SPENDSGIRn (4.9 never reads those on 9810).
  */
+#define GICD_ISENABLER(n)		(0x100 + 4 * (n))
 #define GICD_ISPENDR(n)			(0x200 + 4 * (n))
 #define GICD_NR_ISPENDR			16
+/* AP RTC alarm: SPI 31 = INTID 63 (4.9 DT rtc node interrupts <0 31 0>) */
+#define APRTC_GICD_REG			1
+#define APRTC_GICD_BIT			BIT(31)
+
+/*
+ * AP RTC (0x141E0000), upstream/4.9 rtc-s3c.h layout. 32-bit accesses
+ * only: the block sits on APB, and its upper bits are reserved.
+ */
+#define APRTC_INTP			0x30	/* write 1 to clear */
+#define APRTC_INTP_ALM			BIT(1)
+#define APRTC_INTP_TIC			BIT(0)
+#define APRTC_RTCCON			0x40
+#define APRTC_RTCCON_RTCEN		BIT(0)
+#define APRTC_RTCCON_CNTSEL		BIT(2)
+#define APRTC_RTCCON_CLKRST		BIT(3)
+#define APRTC_RTCCON_TICEN		BIT(8)
+#define APRTC_TICCNT			0x44
+#define APRTC_RTCALM			0x50
+#define APRTC_RTCALM_ALMEN		BIT(6)
+#define APRTC_RTCALM_SECEN		BIT(0)
+#define APRTC_RTCALM_ARM		0x41U	/* ALMEN | SECEN */
+#define APRTC_ALM(i)			(0x54 + 4 * (i)) /* sec min hour date mon year */
+#define APRTC_NR_ALM			6
+#define APRTC_BCD(i)			(0x70 + 4 * (i)) /* sec min hour date day mon year */
+#define APRTC_NR_BCD			7
+#define APRTC_CURTICCNT			0x90
+enum { BCD_SEC, BCD_MIN, BCD_HOUR, BCD_DATE, BCD_DAY, BCD_MON, BCD_YEAR };
 
 /* MCT global free-running counter */
 #define MCT_G_CNT_L			0x100
@@ -298,6 +341,14 @@ static struct e9810_pm {
 	bool lost_online;
 	struct hrtimer deadline;	/* supplement to the WDT ping-path check */
 	struct task_struct *task;
+
+	/* S1a/S1b (DT samsung,suspend-s1) */
+	bool s1_want[2];
+	void __iomem *aprtc, *apm_qch;
+	phys_addr_t aprtc_phys;
+	enum s0_result s1_res[2];
+	char s1_why[2][96];
+	bool s1_spi31_enabled;		/* S1a: GICD ISENABLER1 bit 31 */
 } e9pm;
 
 static DEFINE_PER_CPU(struct e9810_hp, e9810_hp);
@@ -1766,6 +1817,472 @@ static void s0a_run(void)
 	pr_info("S0a PASS (read-only) CP_STAT=%#x\n", s->cp_stat);
 }
 
+/* ------------------------------------------------------------------------ */
+/* S1a/S1b: AP RTC read probe and a seconds alarm while awake               */
+/* ------------------------------------------------------------------------ */
+
+#define s1_info(fmt, ...)	printk(KERN_INFO "suspend s1: " fmt, ##__VA_ARGS__)
+#define s1_err(fmt, ...)	printk(KERN_ERR "suspend s1: " fmt, ##__VA_ARGS__)
+
+#define S1A_GAP_MS		2100	/* between the two S1a reads */
+#define S1B_POLL_MS		50
+#define S1B_SEC_MAX		57	/* arm only at BCDSEC <= 57 (design 3.1) */
+
+struct e9810_aprtc {
+	u32 intp, rtccon, ticcnt, rtcalm, curticcnt;
+	u32 alm[APRTC_NR_ALM];
+	u32 bcd[APRTC_NR_BCD];
+	u64 t_ns;			/* ktime_get_ns() at the time read */
+	bool torn;			/* BCDSEC moved during 3 time reads */
+};
+
+static u32 aprtc_rd(u32 off)
+{
+	return readl(e9pm.aprtc + off);
+}
+
+static void aprtc_wr(u32 off, u32 v)
+{
+	writel(v, e9pm.aprtc + off);
+}
+
+/* BCD time, re-read while BCDSEC moves under it (at most 3 tries). */
+static void aprtc_read_time(u32 *bcd, u64 *t_ns, bool *torn)
+{
+	unsigned int i, k;
+	u32 s0;
+
+	*torn = true;
+	for (k = 0; k < 3; k++) {
+		s0 = aprtc_rd(APRTC_BCD(BCD_SEC));
+		*t_ns = ktime_get_ns();
+		for (i = 0; i < APRTC_NR_BCD; i++)
+			bcd[i] = aprtc_rd(APRTC_BCD(i));
+		if (bcd[BCD_SEC] == s0) {
+			*torn = false;
+			return;
+		}
+	}
+}
+
+/* Read only: every register of design 3.1. */
+static void aprtc_snapshot(struct e9810_aprtc *r)
+{
+	unsigned int i;
+
+	r->intp = aprtc_rd(APRTC_INTP);
+	r->rtccon = aprtc_rd(APRTC_RTCCON);
+	r->ticcnt = aprtc_rd(APRTC_TICCNT);
+	r->rtcalm = aprtc_rd(APRTC_RTCALM);
+	for (i = 0; i < APRTC_NR_ALM; i++)
+		r->alm[i] = aprtc_rd(APRTC_ALM(i));
+	aprtc_read_time(r->bcd, &r->t_ns, &r->torn);
+	r->curticcnt = aprtc_rd(APRTC_CURTICCNT);
+}
+
+/* One BCD byte (what 4.9's readb() sees) in [lo, hi]. */
+static bool aprtc_bcd_ok(u32 v, u32 lo, u32 hi)
+{
+	v &= 0xff;
+	if ((v & 0xf) > 9 || (v >> 4) > 9)
+		return false;
+	v = bcd2bin(v);
+	return v >= lo && v <= hi;
+}
+
+static bool aprtc_time_ok(const u32 *b)
+{
+	return aprtc_bcd_ok(b[BCD_SEC], 0, 59) &&
+	       aprtc_bcd_ok(b[BCD_MIN], 0, 59) &&
+	       aprtc_bcd_ok(b[BCD_HOUR], 0, 23) &&
+	       aprtc_bcd_ok(b[BCD_DATE], 1, 31) &&
+	       aprtc_bcd_ok(b[BCD_MON], 1, 12) &&
+	       aprtc_bcd_ok(b[BCD_YEAR], 0, 99);
+}
+
+static unsigned int aprtc_sod(const u32 *b)
+{
+	return bcd2bin(b[BCD_HOUR] & 0xff) * 3600 +
+	       bcd2bin(b[BCD_MIN] & 0xff) * 60 + bcd2bin(b[BCD_SEC] & 0xff);
+}
+
+static unsigned int aprtc_sec(void)
+{
+	return bcd2bin(aprtc_rd(APRTC_BCD(BCD_SEC)) & 0x7f);
+}
+
+static void s1_set(int stage, enum s0_result r, const char *fmt, ...)
+{
+	va_list ap;
+
+	e9pm.s1_res[stage] = r;
+	va_start(ap, fmt);
+	vsnprintf(e9pm.s1_why[stage], sizeof(e9pm.s1_why[stage]), fmt, ap);
+	va_end(ap);
+}
+
+static void s1_print_regs(const char *tag, const struct e9810_aprtc *r)
+{
+	s1_info("%s ap-rtc RTCCON=%#x (rtcen=%d cntsel=%d clkrst=%d ticen=%d) INTP=%#x RTCALM=%#x TICCNT=%#x CURTICCNT=%#x\n",
+		tag, r->rtccon, !!(r->rtccon & APRTC_RTCCON_RTCEN),
+		!!(r->rtccon & APRTC_RTCCON_CNTSEL),
+		!!(r->rtccon & APRTC_RTCCON_CLKRST),
+		!!(r->rtccon & APRTC_RTCCON_TICEN), r->intp, r->rtcalm,
+		r->ticcnt, r->curticcnt);
+	s1_info("%s ap-rtc ALMSEC..ALMYEAR=%#x %#x %#x %#x %#x %#x BCDSEC..BCDYEAR=%#x %#x %#x %#x %#x %#x %#x%s\n",
+		tag, r->alm[0], r->alm[1], r->alm[2], r->alm[3], r->alm[4],
+		r->alm[5], r->bcd[0], r->bcd[1], r->bcd[2], r->bcd[3],
+		r->bcd[4], r->bcd[5], r->bcd[6], r->torn ? " (TORN read)" : "");
+}
+
+/*
+ * S1a, read only. 4.9 never maps this block, so whether a non-secure read
+ * works is what this stage finds out: a synchronous external abort panics
+ * (pstore dmesg-ramoops, panic=30, then the shim bounce to Lineage), an
+ * APB stall ends in the watchdog deadline installed at probe.
+ */
+static void s1a_run(void)
+{
+	struct e9810_aprtc a, b;
+	u32 qch, rst, adis, mrst, gen1, gpend1;
+	bool alm_moved = false;
+	const char *bad = NULL;
+	int adv = 0;
+	u64 dt_ms;
+	unsigned int i;
+
+	s1_info("S1a start: read-only AP RTC probe at %pa (+0x30..+0x90), CMU_APM QCH_CON_APBIF_RTC, PMU 0x404/0x408/0x40c, GICD SPI31; first read follows\n",
+		&e9pm.aprtc_phys);
+	aprtc_snapshot(&a);
+	s1_info("S1a ap-rtc first read survived (no abort, no stall)\n");
+	qch = readl(e9pm.apm_qch);
+	rst = pmu_rd(PMU_RST_STAT);
+	adis = pmu_rd(PMU_WDT_AUTO_DISABLE);
+	mrst = pmu_rd(PMU_WDT_MASK_RESET);
+	gen1 = readl(e9pm.gicd + GICD_ISENABLER(APRTC_GICD_REG));
+	gpend1 = readl(e9pm.gicd + GICD_ISPENDR(APRTC_GICD_REG));
+	e9pm.s1_spi31_enabled = !!(gen1 & APRTC_GICD_BIT);
+
+	msleep(S1A_GAP_MS);
+	aprtc_snapshot(&b);
+	dt_ms = div_u64(b.t_ns - a.t_ns, NSEC_PER_MSEC);
+
+	s1_print_regs("S1a #1", &a);
+	s1_print_regs("S1a #2", &b);
+	s1_info("S1a ap-rtc RTCCON=%#x (rtcen=%d clkrst=%d ticen=%d) INTP=%#x RTCALM=%#x TICCNT=%#x QCH_APBIF_RTC=%#x\n",
+		b.rtccon, !!(b.rtccon & APRTC_RTCCON_RTCEN),
+		!!(b.rtccon & APRTC_RTCCON_CLKRST),
+		!!(b.rtccon & APRTC_RTCCON_TICEN), b.intp, b.rtcalm, b.ticcnt,
+		qch);
+
+	if (a.torn || b.torn)
+		bad = "time read torn 3 times (bcd invalid)";
+	else if (!aprtc_time_ok(a.bcd) || !aprtc_time_ok(b.bcd))
+		bad = "bcd invalid";
+	if (!bad) {
+		adv = (int)aprtc_sod(b.bcd) - (int)aprtc_sod(a.bcd);
+		if (adv < 0)
+			adv += 86400;
+		/* 2100 ms between the reads: 2 or 3 whole-second steps */
+		if (adv < 2 || adv > 3)
+			bad = "not counting";
+	}
+	s1_info("S1a ap-rtc t1=%02x-%02x-%02x %02x:%02x:%02x t2=%02x-%02x-%02x %02x:%02x:%02x advance %d s over %llu ms (bcd %s) -> %s\n",
+		a.bcd[BCD_YEAR] & 0xff, a.bcd[BCD_MON] & 0xff,
+		a.bcd[BCD_DATE] & 0xff, a.bcd[BCD_HOUR] & 0xff,
+		a.bcd[BCD_MIN] & 0xff, a.bcd[BCD_SEC] & 0xff,
+		b.bcd[BCD_YEAR] & 0xff, b.bcd[BCD_MON] & 0xff,
+		b.bcd[BCD_DATE] & 0xff, b.bcd[BCD_HOUR] & 0xff,
+		b.bcd[BCD_MIN] & 0xff, b.bcd[BCD_SEC] & 0xff, adv, dt_ms,
+		aprtc_time_ok(a.bcd) && aprtc_time_ok(b.bcd) ? "ok" : "INVALID",
+		bad ? bad : "counting");
+	s1_info("S1a pmu RST_STAT=%#x WDT_AUTO_DISABLE=%#x WDT_MASK_RESET=%#x (bit24 %d/%d, both 0 = WDT reset reaches the SoC)\n",
+		rst, adis, mrst, !!(adis & PMU_WDT_CL0_BIT),
+		!!(mrst & PMU_WDT_CL0_BIT));
+	s1_info("S1a gic SPI31 (INTID 63) ISENABLER1 bit31=%d ISPENDR1 bit31=%d (ISENABLER1=%#x ISPENDR1=%#x)\n",
+		e9pm.s1_spi31_enabled, !!(gpend1 & APRTC_GICD_BIT), gen1, gpend1);
+
+	/* Nobody else may own or touch the block: control registers stable. */
+	for (i = 0; i < APRTC_NR_ALM; i++)
+		alm_moved |= a.alm[i] != b.alm[i];
+	if (!bad && (a.rtccon & APRTC_RTCCON_CLKRST || b.rtccon & APRTC_RTCCON_CLKRST))
+		bad = "CLKRST set";
+	if (!bad && (a.rtcalm & APRTC_RTCALM_ALMEN || b.rtcalm & APRTC_RTCALM_ALMEN))
+		bad = "RTCALM.ALMEN=1 (another owner)";
+	if (!bad && (a.rtccon & APRTC_RTCCON_TICEN || b.rtccon & APRTC_RTCCON_TICEN))
+		bad = "TICEN=1 (another owner)";
+	if (!bad && (a.intp || b.intp))
+		bad = "INTP not 0";
+	if (!bad && (a.rtccon != b.rtccon || a.rtcalm != b.rtcalm ||
+		     a.ticcnt != b.ticcnt || alm_moved))
+		bad = "control registers changed between reads (another owner)";
+
+	if (bad) {
+		s1_set(0, S0_FAIL, "%s", bad);
+		s1_err("S1a FAIL: %s (AP RTC route not usable as is: do not write it without a new review)\n",
+		       bad);
+		return;
+	}
+	s1_set(0, S0_PASS, "counting +%d s/%llu ms rtcen=%d qch=%#x", adv, dt_ms,
+	       !!(b.rtccon & APRTC_RTCCON_RTCEN), qch);
+	s1_info("S1a PASS (read-only)\n");
+}
+
+/*
+ * Write @val to AP RTC @off and check it under @mask. If it does not read
+ * back, once more with RTCCON.RTCEN set (S3C RTC write gate; upstream sets
+ * it at probe), then RTCCON is restored to the value read just before.
+ */
+static bool aprtc_write_checked(u32 off, u32 val, u32 mask, bool *rtcen_used)
+{
+	u32 con;
+	bool ok;
+
+	aprtc_wr(off, val);
+	if ((aprtc_rd(off) & mask) == (val & mask))
+		return true;
+	con = aprtc_rd(APRTC_RTCCON);
+	aprtc_wr(APRTC_RTCCON, con | APRTC_RTCCON_RTCEN);
+	aprtc_wr(off, val);
+	ok = (aprtc_rd(off) & mask) == (val & mask);
+	aprtc_wr(APRTC_RTCCON, con);
+	*rtcen_used = true;
+	return ok;
+}
+
+/* INTP.ALM write-1-to-clear, with the same RTCEN rule. */
+static bool aprtc_clear_alm(bool *rtcen_used)
+{
+	u32 con;
+	bool ok;
+
+	aprtc_wr(APRTC_INTP, APRTC_INTP_ALM);
+	if (!(aprtc_rd(APRTC_INTP) & APRTC_INTP_ALM))
+		return true;
+	con = aprtc_rd(APRTC_RTCCON);
+	aprtc_wr(APRTC_RTCCON, con | APRTC_RTCCON_RTCEN);
+	aprtc_wr(APRTC_INTP, APRTC_INTP_ALM);
+	ok = !(aprtc_rd(APRTC_INTP) & APRTC_INTP_ALM);
+	aprtc_wr(APRTC_RTCCON, con);
+	*rtcen_used = true;
+	return ok;
+}
+
+/* Disarm: RTCALM = 0, then INTP.ALM cleared. */
+static bool aprtc_disarm(bool *rtcen_used)
+{
+	bool ok = aprtc_write_checked(APRTC_RTCALM, 0, 0xff, rtcen_used);
+
+	return aprtc_clear_alm(rtcen_used) && ok;
+}
+
+static u32 gicd_spi31_pending(void)
+{
+	return !!(readl(e9pm.gicd + GICD_ISPENDR(APRTC_GICD_REG)) &
+		  APRTC_GICD_BIT);
+}
+
+/* One alarm at +@d s. 0, or an error already logged (disarmed either way). */
+static int s1b_round(unsigned int n, unsigned int d, bool *rtcen_any)
+{
+	u32 target, sec, intp = 0, rb_sec, rb_alm, ws0, ws20, ws, ws2;
+	u32 pend0, pend1 = 0, pend2, sec_fire = 0;
+	unsigned int lo_ms = (d - 1) * 1000 - 100, hi_ms = d * 1000 + 999;
+	unsigned int limit_ms = (d + 2) * 1000, waited = 0;
+	bool rtcen = false, fired = false, disarmed;
+	u64 t0, el_ms = 0;
+	const char *bad = NULL;
+
+	/* No seconds carry between reading BCDSEC and arming (design 3.1). */
+	while ((sec = aprtc_sec()) > S1B_SEC_MAX && waited < 4000) {
+		msleep(100);
+		waited += 100;
+	}
+	if (sec > S1B_SEC_MAX) {
+		s1_err("S1b arm #%u +%u s: BCDSEC stuck at %u for 4 s FAIL\n", n,
+		       d, sec);
+		return -EIO;
+	}
+	if (aprtc_rd(APRTC_INTP) & APRTC_INTP_ALM) {
+		bool ok = aprtc_clear_alm(&rtcen);
+
+		s1_info("S1b arm #%u: stale INTP.ALM %s before arming\n", n,
+			ok ? "cleared" : "NOT cleared");
+		if (!ok) {
+			*rtcen_any |= rtcen;
+			s1_err("S1b arm #%u: INTP not cleared FAIL\n", n);
+			return -EIO;
+		}
+	}
+	pend0 = gicd_spi31_pending();
+	ws0 = pmu_rd(PMU_WAKEUP_STAT);
+	ws20 = pmu_rd(PMU_WAKEUP_STAT2);
+
+	sec = aprtc_sec();
+	target = bin2bcd((sec + d) % 60);
+	if (!aprtc_write_checked(APRTC_ALM(0), target, 0x7f, &rtcen) ||
+	    !aprtc_write_checked(APRTC_RTCALM, APRTC_RTCALM_ARM, 0x7f, &rtcen)) {
+		rb_sec = aprtc_rd(APRTC_ALM(0));
+		rb_alm = aprtc_rd(APRTC_RTCALM);
+		aprtc_disarm(&rtcen);
+		*rtcen_any |= rtcen;
+		s1_err("S1b arm #%u +%u s: readback wrong even with RTCEN: ALMSEC=%#x (want %#x) RTCALM=%#x (want %#x) FAIL\n",
+		       n, d, rb_sec, target, rb_alm, APRTC_RTCALM_ARM);
+		return -EIO;
+	}
+	t0 = ktime_get_ns();
+	rb_sec = aprtc_rd(APRTC_ALM(0));
+	rb_alm = aprtc_rd(APRTC_RTCALM);
+	s1_info("S1b arm +%u s: BCDSEC=%#x ALMSEC=%#x RTCALM=%#x readback ok rtcen-needed=%d\n",
+		d, bin2bcd(sec), rb_sec, rb_alm, rtcen);
+
+	for (;;) {
+		intp = aprtc_rd(APRTC_INTP);
+		el_ms = div_u64(ktime_get_ns() - t0, NSEC_PER_MSEC);
+		if (intp & APRTC_INTP_ALM) {
+			fired = true;
+			break;
+		}
+		if (el_ms > limit_ms)
+			break;
+		msleep(S1B_POLL_MS);
+	}
+	if (fired) {
+		pend1 = gicd_spi31_pending();
+		sec_fire = aprtc_rd(APRTC_BCD(BCD_SEC));
+	}
+	ws = pmu_rd(PMU_WAKEUP_STAT);
+	ws2 = pmu_rd(PMU_WAKEUP_STAT2);
+
+	disarmed = aprtc_disarm(&rtcen);
+	*rtcen_any |= rtcen;
+	pend2 = gicd_spi31_pending();
+
+	if (!fired)
+		bad = "INTP.ALM not set within the window";
+	else if (el_ms < lo_ms || el_ms > hi_ms)
+		bad = "INTP.ALM set outside the expected time";
+	else if (!disarmed || (aprtc_rd(APRTC_RTCALM) & 0xff))
+		bad = "RTCALM not disarmed";
+	else if (aprtc_rd(APRTC_INTP))
+		bad = "INTP not cleared";
+
+	s1_info("S1b alarm #%u INTP.ALM %s after %llu ms (expected %u..%u) at BCDSEC=%#x, GICD SPI31 pending=%d (before arm %d, after disarm %d), WAKEUP_STAT=%#x/%#x (before %#x/%#x) -> disarmed RTCALM=%#x, INTP=%#x%s%s\n",
+		n, fired ? "set" : "NOT set", el_ms, lo_ms, hi_ms, sec_fire, pend1,
+		pend0, pend2, ws, ws2, ws0, ws20, aprtc_rd(APRTC_RTCALM),
+		aprtc_rd(APRTC_INTP), bad ? " FAIL: " : "", bad ? bad : "");
+	return bad ? -EIO : 0;
+}
+
+/*
+ * S1b: the alarm while awake, +3 s then +7 s (design 5 S1b). Writes AP RTC
+ * INTP, ALMSEC, RTCALM (and RTCCON.RTCEN, set and restored, only if a write
+ * does not read back); every register it wrote is restored and printed
+ * before -> after. SPI 31 stays disabled at the GIC (no handler exists):
+ * the line is only seen in GICD_ISPENDR1.
+ */
+static void s1b_run(void)
+{
+	static const unsigned int delta[] = { 3, 7 };
+	struct e9810_aprtc pre, post;
+	unsigned int i, ok = 0;
+	bool rtcen = false, restored;
+	const char *why;
+	int ret = 0;
+
+	if (e9pm.s1_res[0] != S0_PASS) {
+		s1_set(1, S0_SKIPPED, "S1a did not pass");
+		s1_err("S1b refused: S1a did not pass (no AP RTC write)\n");
+		return;
+	}
+	why = s0_recovery_refused(true, false);
+	if (!why && e9pm.s1_spi31_enabled)
+		why = "SPI31 enabled at the GIC by someone else (an alarm would be an unhandled IRQ)";
+	if (!why && (readl(e9pm.gicd + GICD_ISENABLER(APRTC_GICD_REG)) &
+		     APRTC_GICD_BIT))
+		why = "SPI31 enabled at the GIC now";
+	if (why) {
+		s1_set(1, S0_SKIPPED, "refused: %s", why);
+		s1_err("S1b refused (no AP RTC write): %s\n", why);
+		return;
+	}
+
+	aprtc_snapshot(&pre);
+	if (pre.intp || (pre.rtcalm & APRTC_RTCALM_ALMEN) ||
+	    (pre.rtccon & (APRTC_RTCCON_TICEN | APRTC_RTCCON_CLKRST))) {
+		s1_set(1, S0_SKIPPED, "AP RTC state moved since S1a");
+		s1_err("S1b refused (no AP RTC write): INTP=%#x RTCALM=%#x RTCCON=%#x moved since S1a\n",
+		       pre.intp, pre.rtcalm, pre.rtccon);
+		return;
+	}
+	s1_print_regs("S1b before", &pre);
+
+	for (i = 0; i < ARRAY_SIZE(delta) && !ret; i++) {
+		ret = s1b_round(i + 1, delta[i], &rtcen);
+		if (!ret)
+			ok++;
+	}
+
+	/* Restore what this stage wrote: ALMSEC (RTCALM/INTP disarmed above). */
+	if ((aprtc_rd(APRTC_ALM(0)) & 0xff) != (pre.alm[0] & 0xff))
+		aprtc_write_checked(APRTC_ALM(0), pre.alm[0], 0xff, &rtcen);
+	if (aprtc_rd(APRTC_RTCALM) != pre.rtcalm)
+		aprtc_write_checked(APRTC_RTCALM, pre.rtcalm, 0xff, &rtcen);
+	if (aprtc_rd(APRTC_INTP) & APRTC_INTP_ALM)
+		aprtc_clear_alm(&rtcen);
+	if (aprtc_rd(APRTC_RTCCON) != pre.rtccon)
+		aprtc_wr(APRTC_RTCCON, pre.rtccon);
+	aprtc_snapshot(&post);
+	s1_print_regs("S1b after", &post);
+	restored = post.intp == pre.intp && post.rtccon == pre.rtccon &&
+		   post.rtcalm == pre.rtcalm &&
+		   (post.alm[0] & 0xff) == (pre.alm[0] & 0xff);
+	for (i = 1; i < APRTC_NR_ALM; i++)
+		restored &= post.alm[i] == pre.alm[i];
+	s1_info("S1b restore: INTP %#x -> %#x, RTCCON %#x -> %#x, RTCALM %#x -> %#x, ALMSEC %#x -> %#x, ALMMIN..ALMYEAR %s, rtcen-needed=%d -> %s\n",
+		pre.intp, post.intp, pre.rtccon, post.rtccon, pre.rtcalm,
+		post.rtcalm, pre.alm[0], post.alm[0],
+		restored ? "unchanged" : "see before/after lines", rtcen,
+		restored ? "restored" : "NOT RESTORED");
+
+	if (ret)
+		s1_set(1, S0_FAIL, "%u/%u alarms, rtcen=%d, %s", ok,
+		       (unsigned int)ARRAY_SIZE(delta), rtcen,
+		       restored ? "restored" : "NOT restored");
+	else if (!restored)
+		s1_set(1, S0_FAIL, "%u/%u alarms but registers not restored", ok,
+		       (unsigned int)ARRAY_SIZE(delta));
+	else
+		s1_set(1, S0_PASS, "%u/%u alarms, rtcen-needed=%d", ok,
+		       (unsigned int)ARRAY_SIZE(delta), rtcen);
+	s1_info("S1b %s %u/%u\n", s0_result_name[e9pm.s1_res[1]], ok,
+		(unsigned int)ARRAY_SIZE(delta));
+}
+
+static void s1_run(void)
+{
+	/* S1a 2.1 s, S1b up to 2 x (4 s wait + 9 s window) */
+	if (boot_ms() + 30000 > e9pm.end_by_ms) {
+		s1_set(0, S0_SKIPPED, "less than 30 s left before %u ms",
+		       e9pm.end_by_ms);
+		s1_err("S1a skipped: %s\n", e9pm.s1_why[0]);
+		return;
+	}
+	s1a_run();
+	if (e9pm.s1_want[1])
+		s1b_run();
+}
+
+static void s1_summary(void)
+{
+	if (!e9pm.s1_want[0])
+		return;
+	s1_info("SUMMARY S1a=%s [%s] S1b=%s [%s]\n",
+		s0_result_name[e9pm.s1_res[0]], e9pm.s1_why[0],
+		e9pm.s1_want[1] ? s0_result_name[e9pm.s1_res[1]] : "not-wanted",
+		e9pm.s1_why[1]);
+}
+
 static void s0_summary(void)
 {
 	pr_info("SUMMARY S0a=%s [%s] S0b=%s [%s] S0c=%s [%s] S0d=%s [%s] lost=%*pbl\n",
@@ -1801,6 +2318,9 @@ static int s0_thread(void *unused)
 		e9pm.deadline_ms);
 
 	s0a_run();
+	/* S1a/S1b first: the new reads; S0b then runs as the regression base. */
+	if (e9pm.s1_want[0])
+		s1_run();
 
 	if (e9pm.want[1]) {
 		const char *why = s0_recovery_refused(true, false);
@@ -1829,6 +2349,7 @@ static int s0_thread(void *unused)
 
 	for (i = 0; i < S0_REMINDERS; i++) {
 		s0_summary();
+		s1_summary();
 		if (!cpumask_empty(&e9pm.lost))
 			pr_emerg("CPU-LOST %*pbl%s\n", cpumask_pr_args(&e9pm.lost),
 				 e9pm.lost_online ?
@@ -1893,6 +2414,14 @@ static int e9810_pm_parse(struct device_node *np)
 		if (strlen(st) == 1 && st[0] >= 'a' && st[0] <= 'd')
 			e9pm.want[st[0] - 'a'] = true;
 	}
+	/* S1: only a and b exist in this build; anything else is refused. */
+	of_property_for_each_string(np, "samsung,suspend-s1", prop, st) {
+		if (strlen(st) != 1 || st[0] < 'a' || st[0] > 'b')
+			return -EINVAL;
+		e9pm.s1_want[st[0] - 'a'] = true;
+	}
+	if (e9pm.s1_want[1] && !e9pm.s1_want[0])
+		return -EINVAL;		/* S1b needs S1a's result */
 	e9pm.start_ms = S0_START_MS_DEFAULT;
 	e9pm.end_by_ms = S0_END_BY_MS_DEFAULT;
 	e9pm.hp_cycles = S0_HP_CYCLES_DEFAULT;
@@ -1978,6 +2507,21 @@ static int e9810_pm_probe(struct platform_device *pdev)
 	if (!e9pm.intr_gen || !e9pm.alive || !e9pm.gicd || !e9pm.mct || !e9pm.fdbg ||
 	    !e9pm.mbox)
 		return e9810_probe_fail(pdev, -ENOMEM, "register maps");
+	if (e9pm.s1_want[0]) {
+		/* Mapped only: the first AP RTC read is S1a's, after the deadline. */
+		struct resource *res = platform_get_resource_byname(pdev,
+						IORESOURCE_MEM, "ap-rtc");
+
+		if (!res || res->start != 0x141e0000 || resource_size(res) < 0x100)
+			return e9810_probe_fail(pdev, -EINVAL,
+						"S1 needs reg \"ap-rtc\" 0x141e0000 size 0x100");
+		e9pm.aprtc_phys = res->start;
+		e9pm.aprtc = e9810_map(pdev, "ap-rtc");
+		e9pm.apm_qch = e9810_map(pdev, "apm-qch-rtc");
+		if (!e9pm.aprtc || !e9pm.apm_qch)
+			return e9810_probe_fail(pdev, -ENOMEM,
+						"S1 register maps (ap-rtc, apm-qch-rtc)");
+	}
 	if (!cal_if_is_initialized())
 		return e9810_probe_fail(pdev, -EPROBE_DEFER, "CAL not ready");
 	/* Optional: without it the APM ring is just not printed. */
@@ -2035,6 +2579,10 @@ static int e9810_pm_probe(struct platform_device *pdev)
 		e9pm.psci_fn, e9pm.psci_state,
 		(unsigned long)__pa_symbol(cpu_resume), e9pm.nr_wmask,
 		e9pm.sleep_with_cp_off ? "allowed" : "refused");
+	if (e9pm.s1_want[0])
+		s1_info("probe: stages %s%s (no sleep, no SMC, no PMIC write; AP RTC at %pa mapped, not yet read)\n",
+			e9pm.s1_want[0] ? "a" : "", e9pm.s1_want[1] ? "b" : "",
+			&e9pm.aprtc_phys);
 
 	e9pm.task = kthread_create(s0_thread, NULL, "suspend-s0");
 	if (IS_ERR(e9pm.task)) {
