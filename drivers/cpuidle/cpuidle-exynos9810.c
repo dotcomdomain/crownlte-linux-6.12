@@ -62,7 +62,7 @@
  *    disarmed, the watchdog's one shared final stop
  *    (s3c2410wdt_crownlte_stop_petting(): never reloaded again, reset
  *    within its timeout), then orderly_reboot().
- *  - Quarantine record (v3): one 4 KB no-map reserved-memory page (DT
+ *  - Quarantine record (v4; v3 slots are still read): one 4 KB no-map reserved-memory page (DT
  *    memory-region of this node) that survives a watchdog reset, two
  *    alternating sequenced slots, trusted only when both are valid and
  *    chained. Fail closed: no trusted record, an armed session that never
@@ -88,6 +88,12 @@
  * online.
  * S2 (samsung,c2-little-local-timer): LITTLE C2 only on CPUs whose tick runs
  * on their own MCT local timer, as on 4.9 (Documentation/crownlte/c2-s2.md).
+ * The takeover of those timers is part of the trial: the boot arming work
+ * persists a local-timer session (LT_ARMED) before it asks exynos9810-mct-bc
+ * to take over the LITTLE CPUs it arms (never CPU0 or the big cores), and
+ * only the last controlled point of a clean shutdown closes it. An unclosed
+ * local-timer session or a recorded local timer fault (E9810_QF_LTIMER)
+ * means no takeover and no LITTLE C2 on later boots, until a clear.
  */
 
 #define pr_fmt(fmt) "exynos9810-cpuidle: " fmt
@@ -335,9 +341,29 @@ static bool e9810_little_ltimer;
 #define E9810_QF_DRILL			BIT(2)	/* recorded by a drill */
 #define E9810_QF_UNCLEAN		BIT(3)	/* armed session, no clean restart */
 #define E9810_QF_UNINIT			BIT(4)	/* no valid record, never cleared */
+/*
+ * Record v4: an MCT local timer fault was recorded, or a local-timer
+ * session (LT_ARMED/LT_SHUTDOWN) was not closed. No local timer takeover,
+ * LITTLE C2 off.
+ */
+#define E9810_QF_LTIMER			BIT(5)
 /* Flags that keep every CPU out of C2. */
 #define E9810_QF_ALL_OFF	(E9810_QF_BIG | E9810_QF_UNCLEAN | E9810_QF_UNINIT)
+/* Flags that keep the LITTLE cluster out of C2 (and its timers on the arch timer). */
+#define E9810_QF_LITTLE_OFF	(E9810_QF_LITTLE | E9810_QF_LTIMER)
 static u32 e9810_quarantine = E9810_QF_UNINIT;
+
+/*
+ * Local-timer trial state of this boot. e9810_lt_busy: the takeover is
+ * running (the final point does not close the session meanwhile).
+ * e9810_lt_faulted: a local timer fault was reported (LITTLE C2 off for the
+ * rest of the boot). e9810_lt_block_close: the fault could not be recorded,
+ * or the fatal path was taken: the session is never closed on this boot.
+ */
+static bool e9810_lt_tried;
+static bool e9810_lt_busy;
+static bool e9810_lt_faulted;
+static atomic_t e9810_lt_block_close = ATOMIC_INIT(0);
 
 /* Compared by address: the refusals the boot arming retries. */
 static const char e9810_why_no_mct[] = "MCT tick broadcast not active";
@@ -743,6 +769,12 @@ static const char *e9810_arm_refused(unsigned int cpu)
 		return "C2 quarantined (all): a big core was lost on an earlier boot";
 	if (e9810_cluster_of[cpu] == 0 && (e9810_quarantine & E9810_QF_LITTLE))
 		return "C2 quarantined (LITTLE): a LITTLE core was lost on an earlier boot";
+	if (e9810_cluster_of[cpu] == 0 && (e9810_quarantine & E9810_QF_LTIMER))
+		return "C2 quarantined (LITTLE, local timers): an MCT local timer fault, or a local-timer session that was not closed, on an earlier boot";
+	/* The fault count rises at the latch, before the fault work runs. */
+	if (e9810_cluster_of[cpu] == 0 && (READ_ONCE(e9810_lt_faulted) ||
+					   exynos9810_mct_local_faults()))
+		return "LITTLE C2 off: an MCT local timer failed on this boot";
 	if (e9810_cluster_of[cpu] == 0 && !e9810_little_c2)
 		return "LITTLE C2 disabled (cores lost in EL3 in q22b/q40/q43; DT samsung,c2-little-enable)";
 	if (!cpu_online(cpu))
@@ -751,7 +783,7 @@ static const char *e9810_arm_refused(unsigned int cpu)
 		return "deep idle disabled";
 	if (!exynos9810_mct_bc_ready())
 		return e9810_why_no_mct;
-	/* Final: mct-bc sets up the local timers before it reports ready. */
+	/* Final: the takeover ran (e9810_lt_takeover()) before this arming. */
 	if (e9810_cluster_of[cpu] == 0 && e9810_little_ltimer &&
 	    !exynos9810_mct_local_active(cpu))
 		return "LITTLE C2 needs the CPU's tick on its MCT local timer (DT samsung,c2-little-local-timer), and it is not (see the exynos9810-mct-bc local timer lines)";
@@ -1756,6 +1788,15 @@ static void e9810_log_setup(void)
  * or SHUTDOWN means the boot that armed C2 never reached the last
  * controlled point of a restart, halt or power-off: all C2 off
  * (E9810_QF_UNCLEAN).
+ *
+ * v4 (same 14-word layout; v3 slots are still read and chain with v4
+ * ones, every write is v4, a v3 kernel treats v4 slots as invalid and
+ * fails closed): two more session words for a local-timer trial,
+ * LT_ARMED (persisted before the MCT local timers take over; covers an
+ * armed C2 session too) and LT_SHUTDOWN (its drained form), flag
+ * E9810_QF_LTIMER and reason E9810_QR_LTIMER (a local timer fault
+ * recorded at runtime). A session found LT_ARMED or LT_SHUTDOWN at boot
+ * adds E9810_QF_LTIMER to E9810_QF_UNCLEAN.
  */
 enum {
 	QM_MAGIC, QM_VERSION, QM_SLOT, QM_SEQ, QM_FLAGS, QM_SESSION, QM_BOOTS,
@@ -1763,7 +1804,8 @@ enum {
 	QM_CRC, QM_WORDS
 };
 #define E9810_QM_MAGIC			0x51324339	/* "9C2Q" */
-#define E9810_QM_VERSION		3
+#define E9810_QM_VERSION		4
+#define E9810_QM_VERSION_V3		3	/* read only */
 #define E9810_QM_SLOTS			2
 #define E9810_QM_SLOT_BYTES		2048
 /* QM_SESSION: C2 may be armed on the boot that wrote it, or not. */
@@ -1771,6 +1813,10 @@ enum {
 #define E9810_QS_ARMED			0x41524d44	/* "DMRA" */
 /* Drained at the start of a shutdown, last controlled point not reached. */
 #define E9810_QS_SHUTDOWN		0x5348444e	/* "NDHS" */
+/* v4: MCT local timers may run CPU ticks (and C2 may be armed). */
+#define E9810_QS_LT_ARMED		0x4c41524d	/* "MRAL" */
+/* v4: LT_ARMED, drained at the start of a shutdown. */
+#define E9810_QS_LT_SHUTDOWN		0x4c534844	/* "DHSL" */
 /*
  * QM_TRIAL: the trial floor. A DT trial token clears only if it is above it
  * (and the record is trusted); then it becomes the floor. Tokens are one
@@ -1795,6 +1841,8 @@ enum {
 	E9810_QR_INVALID,	/* no valid record found at boot */
 	E9810_QR_SHUTDOWN,	/* drained, last controlled point not reached */
 	E9810_QR_AMBIGUOUS,	/* one valid slot, or two that do not chain */
+	E9810_QR_COUNT_V3,
+	E9810_QR_LTIMER = E9810_QR_COUNT_V3,	/* v4: an MCT local timer fault */
 	E9810_QR_COUNT
 };
 
@@ -1807,6 +1855,7 @@ static const char * const e9810_qr_name[] = {
 	[E9810_QR_INVALID]	= "invalid",
 	[E9810_QR_SHUTDOWN]	= "shutdown",
 	[E9810_QR_AMBIGUOUS]	= "ambiguous",
+	[E9810_QR_LTIMER]	= "ltimer",
 };
 
 static void *e9810_qm;			/* mapped page, NULL if none */
@@ -1881,20 +1930,31 @@ static void e9810_qm_read(unsigned int slot, u32 *w)
 		w[i] = READ_ONCE(p[i]);
 }
 
-#define E9810_QF_KNOWN	(E9810_QF_LITTLE | E9810_QF_BIG | E9810_QF_DRILL | \
-			 E9810_QF_UNCLEAN | E9810_QF_UNINIT)
+#define E9810_QF_KNOWN_V3 (E9810_QF_LITTLE | E9810_QF_BIG | E9810_QF_DRILL | \
+			   E9810_QF_UNCLEAN | E9810_QF_UNINIT)
+#define E9810_QF_KNOWN	(E9810_QF_KNOWN_V3 | E9810_QF_LTIMER)
 
+static bool e9810_qs_lt(u32 session)
+{
+	return session == E9810_QS_LT_ARMED || session == E9810_QS_LT_SHUTDOWN;
+}
+
+/* v4, or a v3 slot (the v3 subset of sessions, flags and reasons). */
 static bool e9810_qm_valid(const u32 *w, unsigned int slot)
 {
+	bool v4 = w[QM_VERSION] == E9810_QM_VERSION;
+
+	if (!v4 && w[QM_VERSION] != E9810_QM_VERSION_V3)
+		return false;
 	return w[QM_MAGIC] == E9810_QM_MAGIC &&
-	       w[QM_VERSION] == E9810_QM_VERSION &&
 	       w[QM_SLOT] == slot && (w[QM_SEQ] & 1) == slot &&
 	       (w[QM_SESSION] == E9810_QS_IDLE ||
 		w[QM_SESSION] == E9810_QS_ARMED ||
-		w[QM_SESSION] == E9810_QS_SHUTDOWN) &&
-	       !(w[QM_FLAGS] & ~E9810_QF_KNOWN) &&
+		w[QM_SESSION] == E9810_QS_SHUTDOWN ||
+		(v4 && e9810_qs_lt(w[QM_SESSION]))) &&
+	       !(w[QM_FLAGS] & ~(v4 ? E9810_QF_KNOWN : E9810_QF_KNOWN_V3)) &&
 	       !(w[QM_DRILLS] & ~E9810_QD_ALL) &&
-	       w[QM_REASON] < E9810_QR_COUNT &&
+	       w[QM_REASON] < (v4 ? E9810_QR_COUNT : E9810_QR_COUNT_V3) &&
 	       w[QM_CRC] == e9810_qm_crc(w);
 }
 
@@ -1907,6 +1967,10 @@ static const char *e9810_qs_str(u32 session)
 		return "armed";
 	case E9810_QS_SHUTDOWN:
 		return "shutdown";
+	case E9810_QS_LT_ARMED:
+		return "ltimer-armed";
+	case E9810_QS_LT_SHUTDOWN:
+		return "ltimer-shutdown";
 	}
 	return "?";
 }
@@ -1946,7 +2010,7 @@ static const char *e9810_qm_flags_str(u32 flags)
 {
 	if (flags & E9810_QF_ALL_OFF)
 		return "all";
-	if (flags & E9810_QF_LITTLE)
+	if (flags & E9810_QF_LITTLE_OFF)
 		return "LITTLE";
 	return "none";
 }
@@ -2005,6 +2069,8 @@ static int e9810_qm_pick(u32 *w, u32 *seq_base, const char **why)
 		w[QM_FLAGS] |= s[i][QM_FLAGS];
 		if (s[i][QM_SESSION] != E9810_QS_IDLE)
 			w[QM_FLAGS] |= E9810_QF_UNCLEAN;
+		if (e9810_qs_lt(s[i][QM_SESSION]))
+			w[QM_FLAGS] |= E9810_QF_LTIMER;
 		w[QM_CPUS] |= s[i][QM_CPUS];
 		w[QM_DRILLS] |= s[i][QM_DRILLS];
 		w[QM_BOOTS] = max(w[QM_BOOTS], s[i][QM_BOOTS]);
@@ -2066,9 +2132,13 @@ static void e9810_qm_init(struct device *dev)
 	if (state == E9810_QM_TRUSTED) {
 		if (w[QM_SESSION] != E9810_QS_IDLE) {
 			w[QM_FLAGS] |= E9810_QF_UNCLEAN;
+			/* The local timers may have caused it: none next time. */
+			if (e9810_qs_lt(w[QM_SESSION]))
+				w[QM_FLAGS] |= E9810_QF_LTIMER;
 			if (w[QM_REASON] == E9810_QR_NONE)
 				w[QM_REASON] =
-					w[QM_SESSION] == E9810_QS_SHUTDOWN ?
+					(w[QM_SESSION] == E9810_QS_SHUTDOWN ||
+					 w[QM_SESSION] == E9810_QS_LT_SHUTDOWN) ?
 					E9810_QR_SHUTDOWN : E9810_QR_UNCLEAN;
 		}
 		/* Explicit one-shot clear by a trial DTB: a token above the floor. */
@@ -2117,7 +2187,7 @@ static void e9810_qm_init(struct device *dev)
 		       &e9810_qm_phys);
 		return;
 	}
-	e9810_quarantine = w[QM_FLAGS] & (E9810_QF_LITTLE | E9810_QF_ALL_OFF);
+	e9810_quarantine = w[QM_FLAGS] & (E9810_QF_LITTLE_OFF | E9810_QF_ALL_OFF);
 
 	if (state == E9810_QM_NONE)
 		pr_warn("C2 quarantined (all): no valid record at %pa (%s): fail closed, a new UNINIT record (seq %u, both slots) was written; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB with a token above %#x on a later boot\n",
@@ -2131,10 +2201,11 @@ static void e9810_qm_init(struct device *dev)
 			w[QM_SEQ], dev_name(dev),
 			max_t(u32, w[QM_TRIAL], E9810_QM_TRIAL_RETIRED));
 	else if (e9810_quarantine)
-		pr_warn("C2 quarantined (%s): flags %#x%s%s%s, cpus %#x lost at %u ms (%s), %u losses, %u boots counted (seq %u); %s; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB with a token above %#x\n",
+		pr_warn("C2 quarantined (%s): flags %#x%s%s%s%s, cpus %#x lost at %u ms (%s), %u losses, %u boots counted (seq %u); %s; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB with a token above %#x\n",
 			e9810_qm_flags_str(e9810_quarantine), w[QM_FLAGS],
 			(w[QM_FLAGS] & E9810_QF_UNCLEAN) ? " UNCLEAN (the last armed session never reached the last controlled point of a restart/halt/power-off)" : "",
 			(w[QM_FLAGS] & E9810_QF_UNINIT) ? " UNINIT (never cleared since a missing or ambiguous record)" : "",
+			(w[QM_FLAGS] & E9810_QF_LTIMER) ? " LTIMER (an MCT local timer fault, or a local-timer session not closed: no local timer takeover, LITTLE C2 off)" : "",
 			(w[QM_FLAGS] & E9810_QF_DRILL) ? " drill" : "",
 			w[QM_CPUS], w[QM_UPTIME_MS], e9810_qr_str(w[QM_REASON]),
 			w[QM_LOSSES], w[QM_BOOTS], w[QM_SEQ],
@@ -2172,7 +2243,9 @@ static const char *e9810_qm_session_arm(void)
 	if (!e9810_qm)
 		return NULL;
 	spin_lock_irqsave(&e9810_qm_lock, flags);
-	if (e9810_qm_cur[QM_SESSION] != E9810_QS_ARMED) {
+	/* LT_ARMED already covers an armed C2 session: never downgrade it. */
+	if (e9810_qm_cur[QM_SESSION] != E9810_QS_ARMED &&
+	    e9810_qm_cur[QM_SESSION] != E9810_QS_LT_ARMED) {
 		memcpy(w, e9810_qm_cur, sizeof(w));
 		w[QM_SESSION] = E9810_QS_ARMED;
 		ok = e9810_qm_commit(w);
@@ -2181,6 +2254,49 @@ static const char *e9810_qm_session_arm(void)
 	if (!ok)
 		return "the armed-session record failed its read-back";
 	return NULL;
+}
+
+/*
+ * Persist "MCT local timers may run CPU ticks" (LT_ARMED, read back)
+ * before the takeover: from here on, any end of this boot other than the
+ * last controlled point of a clean shutdown leaves LT_ARMED or LT_SHUTDOWN,
+ * which the next boot turns into UNCLEAN + LTIMER (no takeover, LITTLE C2
+ * off). Under e9810_arm_lock. Refused without the marker.
+ */
+static const char *e9810_qm_session_ltimer(void)
+{
+	unsigned long flags;
+	u32 w[QM_WORDS];
+	bool ok = true;
+
+	if (READ_ONCE(e9810_shutdown))
+		return "restart or power-off under way";
+	if (!e9810_qm)
+		return "no quarantine record to hold the local-timer session";
+	spin_lock_irqsave(&e9810_qm_lock, flags);
+	if (e9810_qm_cur[QM_SESSION] != E9810_QS_LT_ARMED) {
+		memcpy(w, e9810_qm_cur, sizeof(w));
+		w[QM_SESSION] = E9810_QS_LT_ARMED;
+		ok = e9810_qm_commit(w);
+	}
+	spin_unlock_irqrestore(&e9810_qm_lock, flags);
+	if (!ok)
+		return "the local-timer session record failed its read-back";
+	return NULL;
+}
+
+/*
+ * The session may not be closed on this boot: the fatal local timer path
+ * ran, the fault could not be recorded, or a local timer failed and its
+ * LTIMER flag is not in the record yet (the fault work has not run). Any
+ * context; the last check reads e9810_qm_cur without the lock (a stale
+ * read only keeps the session open).
+ */
+static bool e9810_lt_close_blocked(void)
+{
+	return atomic_read(&e9810_lt_block_close) ||
+	       (exynos9810_mct_local_faults() &&
+		!(READ_ONCE(e9810_qm_cur[QM_FLAGS]) & E9810_QF_LTIMER));
 }
 
 /*
@@ -2202,11 +2318,18 @@ static void e9810_qm_session_drained(const char *how)
 			 how);
 		return;
 	}
+	if (e9810_lt_close_blocked()) {
+		pr_emerg("C2 session not closed (%s): an MCT local timer fault on this boot is not safely recorded, or took the fatal path\n",
+			 how);
+		return;
+	}
 	spin_lock_irqsave(&e9810_qm_lock, flags);
-	if (e9810_qm_cur[QM_SESSION] == E9810_QS_ARMED) {
+	if (e9810_qm_cur[QM_SESSION] == E9810_QS_ARMED ||
+	    e9810_qm_cur[QM_SESSION] == E9810_QS_LT_ARMED) {
 		was = true;
 		memcpy(w, e9810_qm_cur, sizeof(w));
-		w[QM_SESSION] = E9810_QS_SHUTDOWN;
+		w[QM_SESSION] = e9810_qm_cur[QM_SESSION] == E9810_QS_LT_ARMED ?
+				E9810_QS_LT_SHUTDOWN : E9810_QS_SHUTDOWN;
 		ok = e9810_qm_commit(w);
 		if (ok)
 			WRITE_ONCE(e9810_qm_close_how, how);
@@ -2214,7 +2337,9 @@ static void e9810_qm_session_drained(const char *how)
 	spin_unlock_irqrestore(&e9810_qm_lock, flags);
 	if (was)
 		pr_info("C2 session drained (%s): every CPU acknowledged leaving C2; record %s (seq %u), closed only at the final %s point\n",
-			how, ok ? "SHUTDOWN" : "WRITE FAILED, stays ARMED",
+			how, !ok ? "WRITE FAILED, stays armed" :
+			e9810_qm_cur[QM_SESSION] == E9810_QS_LT_SHUTDOWN ?
+			"LT_SHUTDOWN" : "SHUTDOWN",
 			e9810_qm_cur[QM_SEQ],
 			strcmp(how, "restart") ? "syscore shutdown" : "restart handler");
 }
@@ -2241,12 +2366,20 @@ static void e9810_qm_session_final(const char *how, bool restart)
 	if (restart && (!READ_ONCE(e9810_restart_final_ok) ||
 			system_state != SYSTEM_RESTART))
 		return;
-	pr_emerg("C2 session: final %s point: closing the record (SHUTDOWN -> IDLE)\n",
-		 how);
+	/* A local timer fault not (safely) recorded, or a takeover running. */
+	if (e9810_lt_close_blocked() || READ_ONCE(e9810_lt_busy)) {
+		pr_emerg("C2 session NOT closed at the final %s point: MCT local timer fault not recorded, fatal path taken, or takeover still running; the next boot sees it as unclean\n",
+			 how);
+		return;
+	}
+	pr_emerg("C2 session: final %s point: closing the record (%s -> IDLE)\n",
+		 how, e9810_qm_cur[QM_SESSION] == E9810_QS_LT_SHUTDOWN ?
+		 "LT_SHUTDOWN" : "SHUTDOWN");
 	local_irq_save(flags);
 	locked = spin_trylock(&e9810_qm_lock);
 	if (locked) {
-		if (e9810_qm_cur[QM_SESSION] == E9810_QS_SHUTDOWN) {
+		if (e9810_qm_cur[QM_SESSION] == E9810_QS_SHUTDOWN ||
+		    e9810_qm_cur[QM_SESSION] == E9810_QS_LT_SHUTDOWN) {
 			memcpy(w, e9810_qm_cur, sizeof(w));
 			w[QM_SESSION] = E9810_QS_IDLE;
 			ok = e9810_qm_commit(w);
@@ -2516,10 +2649,11 @@ static void e9810_log_stats(void)
 {
 	unsigned int cpu;
 
-	pr_info("c2 stats: armed=%*pbl lost=%*pbl deep_off=%d quarantine=%s det_scans=%llu det_pings=%llu det_enq_fail=%llu det_revalidated=%llu det_hp_unlocked=%llu uptime_ms=%llu\n",
+	pr_info("c2 stats: armed=%*pbl lost=%*pbl deep_off=%d quarantine=%s ltimer_faults=%u det_scans=%llu det_pings=%llu det_enq_fail=%llu det_revalidated=%llu det_hp_unlocked=%llu uptime_ms=%llu\n",
 		cpumask_pr_args(&e9810_armed), cpumask_pr_args(&e9810_lost),
 		atomic_read(&e9810_deep_off),
-		e9810_qm_flags_str(e9810_quarantine), e9810_det_scans,
+		e9810_qm_flags_str(e9810_quarantine),
+		exynos9810_mct_local_faults(), e9810_det_scans,
 		e9810_det_pings, e9810_det_enq_fail, e9810_det_revalidated,
 		e9810_det_hp_unlocked, e9810_boot_ms());
 	for_each_possible_cpu(cpu) {
@@ -2693,6 +2827,155 @@ static void e9810_loss_drill_start(void)
 static bool e9810_arm_killed;
 
 /*
+ * exynos9810-mct-bc fault work (process context, CPU0): the local timer of
+ * @cpu was latched failed, which closed that CPU's C2 gate at once. Now
+ * LITTLE C2 goes off for the rest of the boot, then the fault is recorded
+ * (E9810_QF_LTIMER): later boots take no local timers and arm no LITTLE
+ * C2 until a clear. If the record cannot be written, the session is never
+ * closed on this boot, so the next boot still finds LT_ARMED or
+ * LT_SHUTDOWN (UNCLEAN + LTIMER). The replacement by the arch timer
+ * follows in the caller.
+ */
+static void e9810_lt_fault(unsigned int cpu, const char *why)
+{
+	unsigned long flags;
+	u32 w[QM_WORDS];
+	bool ok = false;
+
+	WRITE_ONCE(e9810_lt_faulted, true);
+	e9810_disarm_mask(&e9810_clusters[0].cpus);
+	if (e9810_qm) {
+		spin_lock_irqsave(&e9810_qm_lock, flags);
+		memcpy(w, e9810_qm_cur, sizeof(w));
+		w[QM_FLAGS] |= E9810_QF_LTIMER;
+		if (w[QM_REASON] == E9810_QR_NONE) {
+			w[QM_REASON] = E9810_QR_LTIMER;
+			w[QM_UPTIME_MS] = (u32)e9810_boot_ms();
+		}
+		ok = e9810_qm_commit(w);
+		if (!ok)
+			memcpy(w, e9810_qm_cur, sizeof(w));
+		spin_unlock_irqrestore(&e9810_qm_lock, flags);
+	}
+	if (!ok)
+		atomic_set(&e9810_lt_block_close, 1);
+	pr_emerg("C2: MCT local timer FAULT on cpu%u (%s): LITTLE C2 disarmed for this boot (armed now %*pbl); quarantine record %s (seq %u flags %#x session %s)%s\n",
+		 cpu, why, cpumask_pr_args(&e9810_armed),
+		 ok ? "written and read back" : "WRITE FAILED",
+		 w[QM_SEQ], w[QM_FLAGS], e9810_qs_str(w[QM_SESSION]),
+		 ok ? "; next boots: no local timer takeover, LITTLE C2 off" :
+		 "; the session stays open: next boot UNCLEAN + LTIMER");
+}
+
+/*
+ * The failed local timer of @cpu could not be replaced: @cpu may have no
+ * working tick. The S0 end of chain without a loss: the session stays
+ * open (next boot UNCLEAN + LTIMER: all C2 off, no takeover), everything
+ * disarmed, the watchdog's final stop, orderly_reboot(), and
+ * emergency_restart() as the last resort.
+ */
+static void e9810_lt_fatal(unsigned int cpu, const char *why)
+{
+	int t;
+
+	atomic_set(&e9810_lt_block_close, 1);
+	pr_emerg("C2: MCT local timer of cpu%u FAILED and was NOT replaced (%s): fatal path; the record keeps its local-timer session (next boot: UNCLEAN + LTIMER, all C2 off)\n",
+		 cpu, why);
+	e9810_disable_deep("MCT local timer fault, not replaced");
+	e9810_disarm_all();
+	t = s3c2410wdt_crownlte_stop_petting("MCT local timer fault");
+	if (t == -EIO)
+		pr_emerg("C2 ltimer fatal: watchdog final stop latched, but the counter does not run with the reset enabled now: relying on the reboot\n");
+	else if (t < 0)
+		pr_emerg("C2 ltimer fatal: no guarded watchdog (%d): relying on the reboot\n",
+			 t);
+	else
+		pr_emerg("C2 ltimer fatal: watchdog final stop: never reloaded again, SoC reset within %d s\n",
+			 t);
+	queue_delayed_work_on(0, system_highpri_wq, &e9810_last_resort_work,
+			      msecs_to_jiffies(E9810_LAST_RESORT_MS));
+	pr_emerg("C2 ltimer fatal: orderly reboot\n");
+	orderly_reboot();
+}
+
+static const struct exynos9810_mct_local_ops e9810_lt_ops = {
+	.fault = e9810_lt_fault,
+	.fatal = e9810_lt_fatal,
+};
+
+/* Why the LITTLE local timer takeover may not run now. e9810_arm_lock held. */
+static const char *e9810_lt_refused(void)
+{
+	if (e9810_setup_why)
+		return e9810_setup_why;
+	if (!e9810_qm)
+		return "no quarantine record to hold the local-timer session";
+	if (READ_ONCE(e9810_shutdown) ||
+	    system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF ||
+	    system_state == SYSTEM_RESTART)
+		return "restart or power-off under way";
+	if (e9810_quarantine & E9810_QF_ALL_OFF)
+		return "C2 quarantined (all)";
+	if (e9810_quarantine & E9810_QF_LITTLE_OFF)
+		return "C2 quarantined (LITTLE or local timers)";
+	if (!e9810_little_c2)
+		return "LITTLE C2 disabled";
+	if (atomic_read(&e9810_deep_off))
+		return "deep idle disabled";
+	if (atomic_read(&e9810_lost_fired) || READ_ONCE(e9810_arm_killed))
+		return "C2 lost or disarmed on this boot";
+	if (READ_ONCE(e9810_lt_faulted))
+		return "an MCT local timer failed on this boot";
+	return NULL;
+}
+
+/*
+ * Once per boot, from the boot arming work, before the LITTLE CPUs are
+ * armed: persist LT_ARMED, then let exynos9810-mct-bc self-check and
+ * register the local timers of the LITTLE CPUs to arm. Never CPU0 and
+ * never the big cores: they keep the arch timer + G0 broadcast (the
+ * hardware-proven S1a path). The tick core keeps both kinds side by side:
+ * a local timer without C3STOP takes its CPU out of the broadcast masks,
+ * the arch timer CPUs stay under the G0 broadcast. e9810_arm_lock is not
+ * held across the takeover (it takes the hotplug lock); e9810_lt_busy
+ * keeps the final point from closing the session meanwhile.
+ */
+static void e9810_lt_takeover(void)
+{
+	struct cpumask want, active;
+	const char *why;
+
+	e9810_lt_tried = true;
+	cpumask_and(&want, &e9810_boot_pending, &e9810_clusters[0].cpus);
+	cpumask_clear_cpu(0, &want);
+	if (cpumask_empty(&want))
+		return;
+
+	mutex_lock(&e9810_arm_lock);
+	why = e9810_lt_refused();
+	if (!why)
+		why = e9810_qm_session_ltimer();
+	if (!why)
+		WRITE_ONCE(e9810_lt_busy, true);
+	mutex_unlock(&e9810_arm_lock);
+	if (why) {
+		pr_warn("MCT local timer takeover of %*pbl not done: %s; they keep the arch timer and are not armed\n",
+			cpumask_pr_args(&want), why);
+		return;
+	}
+	pr_info("C2 local-timer session persisted (record seq %u, LT_ARMED): MCT local timer takeover of %*pbl (CPU0 and big keep the arch timer + broadcast)\n",
+		e9810_qm_cur[QM_SEQ], cpumask_pr_args(&want));
+	why = exynos9810_mct_local_takeover(&want, &e9810_lt_ops, &active);
+	WRITE_ONCE(e9810_lt_busy, false);
+	if (why)
+		pr_warn("MCT local timer takeover: %s; LITTLE CPUs without a local tick are not armed\n",
+			why);
+	else
+		pr_info("MCT local timer takeover: %*pbl tick on their local timer\n",
+			cpumask_pr_args(&active));
+}
+
+/*
  * Boot arming, one CPU at a time: a CPU that is offline or waits for the
  * MCT broadcast does not hold back the others. Both are retried every
  * second for up to E9810_ARM_RETRY_MAX_MS; after that a CPU that is still
@@ -2711,6 +2994,10 @@ static void e9810_arm_boot_fn(struct work_struct *work)
 	if (!e9810_arm_retrying)
 		e9810_arm_deadline = jiffies +
 				     msecs_to_jiffies(E9810_ARM_RETRY_MAX_MS);
+	/* S2: the LITTLE CPUs need their local tick before they can arm. */
+	if (!e9810_lt_tried && e9810_little_ltimer &&
+	    exynos9810_mct_bc_ready())
+		e9810_lt_takeover();
 
 	cpumask_clear(&armed);
 	cpumask_clear(&wait_mct);
@@ -2807,7 +3094,7 @@ static void e9810_boot_arm_setup(struct device_node *np)
 		pr_warn("C2 loss drill: already run on an earlier boot (consumed); skipped; rerun: echo 1 > c2_drill_rearm (root)\n");
 		e9810_loss_drill_ms = 0;
 	}
-	if (e9810_quarantine & E9810_QF_LITTLE) {
+	if (e9810_quarantine & E9810_QF_LITTLE_OFF) {
 		if (e9810_loss_drill_ms)
 			pr_warn("C2 quarantined (LITTLE): loss drill skipped\n");
 		e9810_loss_drill_ms = 0;
@@ -2895,8 +3182,10 @@ static ssize_t c2_stats_show(struct device *dev, struct device_attribute *a,
 				   exynos9810_mct_local_active(cpu),
 				   st.no_ltimer);
 	}
-	n += sysfs_emit_at(buf, n, "deep_off=%d det_scans=%llu det_pings=%llu det_enq_fail=%llu det_revalidated=%llu det_hp_unlocked=%llu boot_pending=%*pbl\n",
-			   atomic_read(&e9810_deep_off), e9810_det_scans,
+	n += sysfs_emit_at(buf, n, "deep_off=%d ltimer_faults=%u ltimer_close_blocked=%d det_scans=%llu det_pings=%llu det_enq_fail=%llu det_revalidated=%llu det_hp_unlocked=%llu boot_pending=%*pbl\n",
+			   atomic_read(&e9810_deep_off),
+			   exynos9810_mct_local_faults(),
+			   e9810_lt_close_blocked(), e9810_det_scans,
 			   e9810_det_pings, e9810_det_enq_fail,
 			   e9810_det_revalidated, e9810_det_hp_unlocked,
 			   cpumask_pr_args(&e9810_boot_pending));
@@ -2920,10 +3209,12 @@ static ssize_t c2_quarantine_show(struct device *dev,
 	for (i = 0; i < E9810_QM_SLOTS; i++)
 		e9810_qm_read(i, s[i]);
 	spin_unlock_irqrestore(&e9810_qm_lock, flags);
-	return sysfs_emit(buf, "record seq=%u flags=%#x (%s%s%s%s) session=%s cpus=%#x uptime_ms=%u reason=%s losses=%u boots=%u drills_consumed=%#x trial_floor=%#x slot0=%s/%u slot1=%s/%u trusted_at_boot=%d write_failed=%d in_force=%s (%#x)\n",
-			  w[QM_SEQ], w[QM_FLAGS], e9810_qm_flags_str(w[QM_FLAGS]),
+	return sysfs_emit(buf, "record seq=%u version=%u flags=%#x (%s%s%s%s%s) session=%s cpus=%#x uptime_ms=%u reason=%s losses=%u boots=%u drills_consumed=%#x trial_floor=%#x slot0=%s/%u slot1=%s/%u trusted_at_boot=%d write_failed=%d in_force=%s (%#x)\n",
+			  w[QM_SEQ], w[QM_VERSION], w[QM_FLAGS],
+			  e9810_qm_flags_str(w[QM_FLAGS]),
 			  (w[QM_FLAGS] & E9810_QF_UNCLEAN) ? ", unclean" : "",
 			  (w[QM_FLAGS] & E9810_QF_UNINIT) ? ", uninit" : "",
+			  (w[QM_FLAGS] & E9810_QF_LTIMER) ? ", ltimer" : "",
 			  (w[QM_FLAGS] & E9810_QF_DRILL) ? ", drill" : "",
 			  e9810_qs_str(w[QM_SESSION]),
 			  w[QM_CPUS], w[QM_UPTIME_MS], e9810_qr_str(w[QM_REASON]),

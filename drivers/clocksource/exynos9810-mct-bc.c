@@ -45,12 +45,27 @@
  * the G0 broadcast handler on CPU0, often one SGI to several cores at once.
  * Three LITTLE cores cycling C2 that way lose a core in EL3
  * (roadmap/c2-runtime-design.md 2.4, H1). With the property this driver
- * registers L<cpu> as the tick device of every CPU that passes a self-check
- * (an interrupt on that CPU, at the 4.9 rate, three times), with the 4.9
- * register sequence. The MCT is outside the CPU power domains (4.9 relies on
- * it across C2), so these CPUs never need the broadcast. G0 stays the
- * broadcast device for any CPU whose local timer is not in use. Nothing
- * changes without the property.
+ * only prepares L0-L7 at probe (stopped, masked, IRQs requested but not
+ * enabled). The takeover happens only when the Exynos 9810 cpuidle driver
+ * asks for it (exynos9810_mct_local_takeover()), for the LITTLE CPUs it is
+ * about to arm (never CPU0, never the big cores), after it persisted a
+ * local-timer session in its C2 quarantine record. Then each requested CPU
+ * that passes a self-check (an interrupt on that CPU, at the 4.9 rate,
+ * three times, every write acknowledged) gets L<cpu> as its tick device,
+ * with the 4.9 register sequence. The MCT is outside the CPU power domains
+ * (4.9 relies on it across C2), so these CPUs never need the broadcast. G0
+ * stays the broadcast device for every other CPU (arch timer + broadcast,
+ * the hardware-proven S1a path). Nothing changes without the property.
+ *
+ * A local timer whose write is not acknowledged, or whose interrupt does
+ * not clear, is latched failed at once, on its CPU, in any context: from
+ * then on exynos9810_mct_local_active() is false (every later LITTLE C2
+ * entry on that CPU runs WFI) and set_next_event() fails without touching
+ * the hardware. A work then reports the fault to cpuidle (record + LITTLE
+ * C2 off) and hands the CPU back to its arch timer + the G0 broadcast with
+ * clockevents_unbind_device() (a synchronised replacement on that CPU). If
+ * that fails, cpuidle takes the fatal path (watchdog final stop, record
+ * left unclean).
  */
 
 #define pr_fmt(fmt) "exynos9810-mct-bc: " fmt
@@ -67,9 +82,11 @@
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 #include <linux/irqnr.h>
+#include <linux/irq_work.h>
 #include <linux/jiffies.h>
 #include <linux/kernel_stat.h>
 #include <linux/ktime.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/percpu.h>
 #include <linux/platform_device.h>
@@ -194,15 +211,32 @@ static struct delayed_work mct_report_work;
 /* One per CPU: logical CPU N uses local timer L<N> and its SPI, as on 4.9. */
 struct mct_local {
 	struct clock_event_device evt;
+	unsigned int cpu;
 	unsigned long base;		/* MCT_L_BASE(cpu) */
 	int irq;			/* -1: none */
 	bool tested;			/* passed the self-check: may register */
-	bool registered;		/* registered while this CPU is up */
-	bool stuck;			/* interrupt did not clear: given up */
+	/*
+	 * Registered while this CPU is up. Changed only by the cpuhp
+	 * callbacks (hotplug lock held for write) and by the fault work
+	 * under cpus_read_lock().
+	 */
+	bool registered;
+	const char *rejected;		/* registration refused at STARTING */
+	/*
+	 * Latched unhealthy for the rest of the boot: a write was not
+	 * acknowledged, or the interrupt did not clear. Written on the
+	 * timer's own CPU (or by the fault work once it is replaced); read
+	 * by that CPU's C2 entry, so program order closes the gate.
+	 */
+	bool failed;
+	const char *fail_why;
+	bool irq_off;			/* IRQ disabled for good */
+	bool replaced;			/* handed back to the arch timer */
 	u64 irqs;			/* written by the CPU itself (ISR) */
 	u64 wtimeouts;			/* register write never confirmed */
 	/* self-check */
 	bool testing;
+	bool test_stop_failed;		/* the ISR's stop was not acknowledged */
 	struct completion test_done;
 	u64 test_seen;
 	int test_cpu;
@@ -212,11 +246,22 @@ struct mct_local {
 
 static DEFINE_PER_CPU(struct mct_local, mct_local);
 static bool mct_local_on;		/* the cpuhp state is installed */
+static bool mct_l_prepared;		/* probe: window + at least one IRQ */
+static bool mct_l_attempted;		/* exynos9810_mct_local_takeover() ran */
+static DEFINE_MUTEX(mct_l_lock);	/* takeover and fault recovery */
 static const char *mct_local_why = "not requested (no DT samsung,mct-local-timers)";
 static u32 mct_local_rate;
 static struct cpumask mct_local_tested;
 static u64 mct_l_test_min = U64_MAX, mct_l_test_max;
 static int mct_ipi_timer_irq = -1;
+
+/* Fault recovery (mct_l_fault() -> irq_work -> mct_l_fault_fn()). */
+static const struct exynos9810_mct_local_ops *mct_l_ops;
+static unsigned long mct_l_fault_pending;	/* CPU bits, MCT_NR_LOCAL */
+static atomic_t mct_l_faults = ATOMIC_INIT(0);
+static struct cpumask mct_l_replaced_mask;
+static struct work_struct mct_l_fault_work;
+static struct irq_work mct_l_fault_irq_work;
 
 /* Usage window snapshots (mct_local_window()). */
 static struct {
@@ -448,12 +493,19 @@ static const char *mct_check_irq(void)
 	return NULL;
 }
 
+static const char *mct_tick_name(unsigned int cpu);
+static unsigned long mct_jiffies_until(unsigned int ms);
+
 /*
  * Local timers. The register sequences are 4.9 exynos_mct.c's
  * (exynos4_mct_write(), exynos4_mct_tick_stop(), exynos4_mct_tick_start(),
  * set_state_periodic(), set_state_resume(), exynos4_mct_starting_cpu() and
  * exynos4_mct_dying_cpu()). Only TCNTB, ICNTB and TCON report a write
  * status (L_WSTAT bits 0, 1 and 3); INT_ENB and INT_CSTAT are plain writes.
+ * Where 4.9 panicked on a write that never completed, every caller here
+ * checks the result: before registration the timer is rejected (the CPU
+ * keeps the arch timer + broadcast), after it the timer is latched failed
+ * (mct_l_fault()).
  */
 static bool mct_l_write(struct mct_local *ml, u32 value, unsigned long reg,
 			u32 wmask)
@@ -472,51 +524,96 @@ static bool mct_l_write(struct mct_local *ml, u32 value, unsigned long reg,
 	return false;
 }
 
-/* 4.9 exynos4_mct_tick_stop(): ack, then stop unless periodic (or @force). */
-static void mct_l_stop(struct mct_local *ml, bool force)
+/* Interrupt masked at the MCT and acknowledged (plain writes). */
+static void mct_l_mask(struct mct_local *ml)
+{
+	writel_relaxed(0, mct_base + ml->base + MCT_L_INT_ENB);
+	writel_relaxed(1, mct_base + ml->base + MCT_L_INT_CSTAT);
+}
+
+/*
+ * 4.9 exynos4_mct_tick_stop(): ack, then stop unless periodic (or @force).
+ * False if the TCON write was not acknowledged.
+ */
+static bool mct_l_stop(struct mct_local *ml, bool force)
 {
 	u32 tcon;
 
 	writel_relaxed(1, mct_base + ml->base + MCT_L_INT_CSTAT);
 	if (!force && clockevent_state_periodic(&ml->evt))
-		return;
+		return true;
 	tcon = readl_relaxed(mct_base + ml->base + MCT_L_TCON);
 	tcon &= ~MCT_L_TCON_RUN;
-	mct_l_write(ml, tcon, MCT_L_TCON, MCT_L_WSTAT_TCON);
+	return mct_l_write(ml, tcon, MCT_L_TCON, MCT_L_WSTAT_TCON);
 }
 
-/* 4.9 exynos4_mct_tick_start(). False if a write did not complete. */
+/*
+ * 4.9 exynos4_mct_tick_start(). False if a write was not acknowledged; the
+ * timer is not started after an ICNTB failure (its count is unknown).
+ */
 static bool mct_l_start(struct mct_local *ml, unsigned long cycles,
 			bool periodic)
 {
 	u32 tcon = MCT_L_TCON_INT_START | MCT_L_TCON_TIMER_START;
-	bool ok;
 
-	ok = mct_l_write(ml, MCT_L_ICNTB_UPDATE | cycles, MCT_L_ICNTB,
-			 MCT_L_WSTAT_ICNTB);
+	if (!mct_l_write(ml, MCT_L_ICNTB_UPDATE | cycles, MCT_L_ICNTB,
+			 MCT_L_WSTAT_ICNTB))
+		return false;
 	writel_relaxed(1, mct_base + ml->base + MCT_L_INT_ENB);
 	if (periodic)
 		tcon |= MCT_L_TCON_INTERVAL_MODE;
-	ok &= mct_l_write(ml, tcon, MCT_L_TCON, MCT_L_WSTAT_TCON);
-	return ok;
+	return mct_l_write(ml, tcon, MCT_L_TCON, MCT_L_WSTAT_TCON);
 }
 
 /*
- * A write that never completes is counted (write_timeouts, reported) where
- * 4.9 panicked. The usage window reports it as FAIL.
+ * Latch @ml failed (any context; normally on its own CPU, with interrupts
+ * off). The store is the C2 gate: exynos9810_mct_local_active() is false
+ * from here on, so every later LITTLE C2 entry on this CPU runs WFI, and
+ * set_next_event() fails without touching the hardware. Recovery (record,
+ * LITTLE C2 off, replacement by the arch timer) runs in mct_l_fault_fn().
+ * No printk here: this may run inside the tick and hrtimer code.
+ */
+static void mct_l_fault(struct mct_local *ml, const char *why)
+{
+	if (READ_ONCE(ml->failed))
+		return;
+	WRITE_ONCE(ml->fail_why, why);
+	WRITE_ONCE(ml->failed, true);
+	/* Gate closed before anyone can see the fault counted. */
+	smp_wmb();
+	atomic_inc(&mct_l_faults);
+	set_bit(ml->cpu, &mct_l_fault_pending);
+	irq_work_queue(&mct_l_fault_irq_work);
+}
+
+/*
+ * Never reports a programming that did not happen: a failed timer, or a
+ * write that was not acknowledged, returns -EIO. The tick core then retries
+ * a bounded number of times (each retry fails at once, the timer being
+ * latched) until the fault work has replaced the device.
  */
 static int mct_l_set_next_event(unsigned long cycles,
 				struct clock_event_device *evt)
 {
 	struct mct_local *ml = container_of(evt, struct mct_local, evt);
 
-	mct_l_start(ml, cycles, false);
+	if (READ_ONCE(ml->failed))
+		return -EIO;
+	if (!mct_l_start(ml, cycles, false)) {
+		mct_l_fault(ml, "ICNTB/TCON write not acknowledged (set_next_event)");
+		return -EIO;
+	}
 	return 0;
 }
 
 static int mct_l_set_shutdown(struct clock_event_device *evt)
 {
-	mct_l_stop(container_of(evt, struct mct_local, evt), true);
+	struct mct_local *ml = container_of(evt, struct mct_local, evt);
+
+	if (!mct_l_stop(ml, true)) {
+		mct_l_fault(ml, "TCON stop write not acknowledged (shutdown)");
+		return -EIO;
+	}
 	return 0;
 }
 
@@ -526,8 +623,12 @@ static int mct_l_set_periodic(struct clock_event_device *evt)
 	unsigned long cycles = ((u64)NSEC_PER_SEC / HZ * evt->mult) >>
 			       evt->shift;
 
-	mct_l_stop(ml, true);
-	mct_l_start(ml, cycles, true);
+	if (READ_ONCE(ml->failed))
+		return -EIO;
+	if (!mct_l_stop(ml, true) || !mct_l_start(ml, cycles, true)) {
+		mct_l_fault(ml, "TCON/ICNTB write not acknowledged (periodic)");
+		return -EIO;
+	}
 	return 0;
 }
 
@@ -535,8 +636,13 @@ static int mct_l_resume(struct clock_event_device *evt)
 {
 	struct mct_local *ml = container_of(evt, struct mct_local, evt);
 
-	mct_l_stop(ml, true);
-	mct_l_write(ml, MCT_L_TCNTB_VAL, MCT_L_TCNTB, MCT_L_WSTAT_TCNTB);
+	if (READ_ONCE(ml->failed))
+		return -EIO;
+	if (!mct_l_stop(ml, true) ||
+	    !mct_l_write(ml, MCT_L_TCNTB_VAL, MCT_L_TCNTB, MCT_L_WSTAT_TCNTB)) {
+		mct_l_fault(ml, "TCON/TCNTB write not acknowledged (resume)");
+		return -EIO;
+	}
 	return 0;
 }
 
@@ -544,50 +650,64 @@ static irqreturn_t mct_l_isr(int irq, void *dev_id)
 {
 	struct mct_local *ml = dev_id;
 	bool testing = READ_ONCE(ml->testing);
+	bool stopped;
 	unsigned int i;
 
 	if (testing) {
 		ml->test_seen = mct_read_count();
 		ml->test_cpu = smp_processor_id();
 	}
-	mct_l_stop(ml, testing);
+	/* Replaced or failed: mask at the source, never program again. */
+	if (READ_ONCE(ml->replaced)) {
+		mct_l_mask(ml);
+		return IRQ_HANDLED;
+	}
+	stopped = mct_l_stop(ml, testing);
 	WRITE_ONCE(ml->irqs, ml->irqs + 1);
 
 	/*
 	 * The acknowledge is a plain write: give it the time of a few
 	 * register reads. A level interrupt that never clears would storm
-	 * this CPU; give up on the timer instead. The CPU then has no tick
-	 * (its hrtimers stop), which the buddy hard-lockup detector turns
-	 * into a panic and the C2 record into UNCLEAN: loud, not a hang.
+	 * this CPU: disable it and latch the timer failed (the fault work
+	 * then gives the CPU its arch timer back).
 	 */
 	for (i = 0; i < MCT_WSTAT_POLLS; i++)
 		if (!(readl_relaxed(mct_base + ml->base + MCT_L_INT_CSTAT) & 1))
 			break;
 	if (i == MCT_WSTAT_POLLS) {
-		writel_relaxed(0, mct_base + ml->base + MCT_L_INT_ENB);
-		writel_relaxed(1, mct_base + ml->base + MCT_L_INT_CSTAT);
+		mct_l_mask(ml);
 		if (readl_relaxed(mct_base + ml->base + MCT_L_INT_CSTAT) & 1) {
 			disable_irq_nosync(irq);
-			WRITE_ONCE(ml->stuck, true);
+			WRITE_ONCE(ml->irq_off, true);
 			if (!testing)
-				printk_deferred(KERN_EMERG pr_fmt("%s: interrupt does not clear; IRQ disabled, this CPU has no tick now\n"),
-						ml->name);
+				mct_l_fault(ml, "interrupt does not clear (IRQ disabled)");
 		}
 	}
 
 	if (testing) {
+		if (!stopped)
+			ml->test_stop_failed = true;
 		complete(&ml->test_done);
 		return IRQ_HANDLED;
 	}
+	if (!stopped)
+		mct_l_fault(ml, "TCON stop write not acknowledged (interrupt)");
+	/*
+	 * This expiry is real: run it. If the timer failed, reprogramming
+	 * fails (-EIO) until the replacement.
+	 */
 	if (ml->evt.event_handler)
 		ml->evt.event_handler(&ml->evt);
+	if (READ_ONCE(ml->failed))
+		mct_l_mask(ml);
 	return IRQ_HANDLED;
 }
 
 /*
  * Real local timer events before the tick code may rely on them: the
  * interrupt must reach @cpu, clear, and come after cycles x (TCNTB + 1)
- * MCT clocks (the 4.9 rate), within 2 % + 1 ms.
+ * MCT clocks (the 4.9 rate), within 2 % + 1 ms; every write, the stops
+ * included, must be acknowledged.
  */
 static const char *mct_l_test(unsigned int cpu)
 {
@@ -608,6 +728,7 @@ static const char *mct_l_test(unsigned int cpu)
 
 	ml->test_min = U64_MAX;
 	ml->test_max = 0;
+	ml->test_stop_failed = false;
 	WRITE_ONCE(ml->testing, true);
 	enable_irq(ml->irq);
 	for (i = 0; i < MCT_L_TEST_ROUNDS; i++) {
@@ -623,8 +744,12 @@ static const char *mct_l_test(unsigned int cpu)
 			why = "interrupt did not arrive within 100 ms";
 			break;
 		}
-		if (READ_ONCE(ml->stuck)) {
+		if (READ_ONCE(ml->irq_off)) {
 			why = "interrupt does not clear; IRQ disabled";
+			break;
+		}
+		if (ml->test_stop_failed) {
+			why = "stop write in the interrupt did not complete";
 			break;
 		}
 		if (ml->test_cpu != cpu) {
@@ -643,22 +768,27 @@ static const char *mct_l_test(unsigned int cpu)
 			break;
 		}
 	}
-	if (!READ_ONCE(ml->stuck))
+	if (!READ_ONCE(ml->irq_off))
 		disable_irq(ml->irq);
-	mct_l_stop(ml, true);
-	writel_relaxed(0, mct_base + ml->base + MCT_L_INT_ENB);
+	if (!mct_l_stop(ml, true) && !why)
+		why = "final stop write did not complete";
+	mct_l_mask(ml);
 	WRITE_ONCE(ml->testing, false);
 	return why;
 }
 
-/* cpuhp STARTING, on @cpu with interrupts off (4.9 exynos4_mct_starting_cpu). */
+/*
+ * cpuhp STARTING, on @cpu with interrupts off (4.9 exynos4_mct_starting_cpu).
+ * Only CPUs whose takeover was requested and whose self-check passed; a
+ * failed timer never registers again (hotplug included).
+ */
 static int mct_l_starting_cpu(unsigned int cpu)
 {
 	struct mct_local *ml = per_cpu_ptr(&mct_local, cpu);
 	struct clock_event_device *evt = &ml->evt;
 
-	/* Untested or given up: the arch timer and the broadcast stay. */
-	if (!ml->tested || READ_ONCE(ml->stuck))
+	/* Untested, failed or refused: the arch timer and the broadcast stay. */
+	if (!ml->tested || READ_ONCE(ml->failed) || ml->irq_off)
 		return 0;
 
 	evt->name = ml->name;
@@ -678,10 +808,22 @@ static int mct_l_starting_cpu(unsigned int cpu)
 			CLOCK_EVT_FEAT_PERCPU;
 	evt->rating = MCT_L_RATING;
 
-	mct_l_write(ml, MCT_L_TCNTB_VAL, MCT_L_TCNTB, MCT_L_WSTAT_TCNTB);
-	irq_force_affinity(ml->irq, cpumask_of(cpu));
+	/* Not registered yet: a failure here keeps the arch timer. */
+	if (!mct_l_write(ml, MCT_L_TCNTB_VAL, MCT_L_TCNTB, MCT_L_WSTAT_TCNTB)) {
+		ml->rejected = "TCNTB write not acknowledged at registration";
+		return 0;
+	}
+	if (irq_force_affinity(ml->irq, cpumask_of(cpu))) {
+		ml->rejected = "cannot route its interrupt at registration";
+		return 0;
+	}
+	ml->rejected = NULL;
 	enable_irq(ml->irq);
 	ml->registered = true;
+	/*
+	 * A programming failure from here on (the first one is inside the
+	 * registration) latches the timer failed; the fault work replaces it.
+	 */
 	clockevents_config_and_register(evt, mct_local_rate, MCT_L_MIN_DELTA,
 					MCT_L_MAX_DELTA);
 	return 0;
@@ -695,19 +837,24 @@ static int mct_l_dying_cpu(unsigned int cpu)
 	if (!ml->registered)
 		return 0;
 	ml->registered = false;
-	mct_l_stop(ml, true);
-	if (!READ_ONCE(ml->stuck))
+	if (!mct_l_stop(ml, true))
+		mct_l_fault(ml, "TCON stop write not acknowledged (cpu dying)");
+	if (!ml->irq_off)
 		disable_irq_nosync(ml->irq);
-	writel_relaxed(1, mct_base + ml->base + MCT_L_INT_CSTAT);
+	mct_l_mask(ml);
 	return 0;
 }
 
-static const char *mct_local_setup(struct platform_device *pdev)
+/*
+ * Probe with DT samsung,mct-local-timers: resources only. Every timer is
+ * stopped, masked and acknowledged, and its IRQ requested but not enabled.
+ * Nothing is tested or registered until exynos9810_mct_local_takeover().
+ */
+static const char *mct_local_prepare(struct platform_device *pdev)
 {
 	struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	struct device *dev = &pdev->dev;
-	unsigned int cpu;
-	const char *why;
+	unsigned int cpu, n = 0;
 	int irq, ret;
 
 	if (!res || resource_size(res) < MCT_L_REG_END)
@@ -717,6 +864,7 @@ static const char *mct_local_setup(struct platform_device *pdev)
 	for_each_possible_cpu(cpu) {
 		struct mct_local *ml = per_cpu_ptr(&mct_local, cpu);
 
+		ml->cpu = cpu;
 		ml->irq = -1;
 		init_completion(&ml->test_done);
 		if (cpu >= MCT_NR_LOCAL)
@@ -730,9 +878,12 @@ static const char *mct_local_setup(struct platform_device *pdev)
 			continue;
 		}
 		/* Stopped, acknowledged and masked before the IRQ is taken. */
-		mct_l_stop(ml, true);
-		writel_relaxed(0, mct_base + ml->base + MCT_L_INT_ENB);
-		writel_relaxed(1, mct_base + ml->base + MCT_L_INT_CSTAT);
+		if (!mct_l_stop(ml, true)) {
+			pr_warn("local timer L%u: stop write not acknowledged at probe: cpu%u keeps the arch timer\n",
+				cpu, cpu);
+			continue;
+		}
+		mct_l_mask(ml);
 		ret = devm_request_irq(dev, irq, mct_l_isr,
 				       IRQF_TIMER | IRQF_NOBALANCING |
 				       IRQF_PERCPU | IRQF_NO_AUTOEN,
@@ -743,18 +894,139 @@ static const char *mct_local_setup(struct platform_device *pdev)
 			continue;
 		}
 		ml->irq = irq;
+		n++;
 	}
+	if (!n)
+		return "no local timer interrupt";
+	return NULL;
+}
+
+static void mct_local_window(struct work_struct *work);
+
+/*
+ * Process context, cpus_read_lock() held: give @cpu its arch timer (and the
+ * G0 broadcast) back. clockevents_unbind_device() runs on @cpu with the
+ * clockevents lock held and installs the best detached device that serves
+ * that CPU alone: its arch timer (rating 450, C3STOP), whose tick setup
+ * puts the CPU back under the broadcast.
+ */
+static bool mct_l_replace(struct mct_local *ml, int *err)
+{
+	unsigned int cpu = ml->cpu;
+
+	*err = 0;
+	if (!ml->registered)
+		return true;		/* offline, or never registered */
+	*err = clockevents_unbind_device(&ml->evt, cpu);
+	if (*err || tick_cpu_evtdev(cpu) == &ml->evt)
+		return false;
+	ml->registered = false;
+	WRITE_ONCE(ml->replaced, true);
+	return true;
+}
+
+static void mct_l_recover(unsigned int cpu)
+{
+	struct mct_local *ml = per_cpu_ptr(&mct_local, cpu);
+	const char *why = READ_ONCE(ml->fail_why);
+	bool ok;
+	int err;
+
+	pr_emerg("%s: local timer FAULT on cpu%u: %s (write_timeouts=%llu); its LITTLE C2 gate is closed; recording the fault, then handing cpu%u back to the arch timer + broadcast\n",
+		 ml->name, cpu, why, READ_ONCE(ml->wtimeouts), cpu);
+	/* Record + LITTLE C2 off first: the replacement itself may hang. */
+	if (mct_l_ops && mct_l_ops->fault)
+		mct_l_ops->fault(cpu, why);
 
 	cpus_read_lock();
-	for_each_online_cpu(cpu) {
-		struct mct_local *ml = per_cpu_ptr(&mct_local, cpu);
+	ok = mct_l_replace(ml, &err);
+	/* Masked at the source and disabled: it never fires again. */
+	mct_l_mask(ml);
+	if (ml->irq >= 0 && !ml->irq_off) {
+		disable_irq(ml->irq);
+		WRITE_ONCE(ml->irq_off, true);
+	}
+	cpus_read_unlock();
 
-		if (ml->irq < 0)
+	if (ok) {
+		cpumask_set_cpu(cpu, &mct_l_replaced_mask);
+		pr_emerg("%s: cpu%u ticks on %s now (local timer replaced); LITTLE C2 stays off this boot, and the record keeps the local timers off on the next boots\n",
+			 ml->name, cpu, mct_tick_name(cpu));
+		return;
+	}
+	pr_emerg("%s: cpu%u: replacement by the arch timer FAILED (%d, tick device %s): fatal path\n",
+		 ml->name, cpu, err, mct_tick_name(cpu));
+	if (mct_l_ops && mct_l_ops->fatal)
+		mct_l_ops->fatal(cpu, why);
+}
+
+static void mct_l_fault_fn(struct work_struct *work)
+{
+	unsigned long pending;
+	unsigned int cpu;
+
+	/* After a takeover in progress: it registers before it returns. */
+	mutex_lock(&mct_l_lock);
+	pending = xchg(&mct_l_fault_pending, 0);
+	for_each_set_bit(cpu, &pending, MCT_NR_LOCAL)
+		mct_l_recover(cpu);
+	mutex_unlock(&mct_l_lock);
+}
+
+/* Hard IRQ context: only queue the work (CPU0, as the cpuidle detector). */
+static void mct_l_fault_irq_fn(struct irq_work *w)
+{
+	queue_work_on(0, system_highpri_wq, &mct_l_fault_work);
+}
+
+const char *exynos9810_mct_local_takeover(const struct cpumask *want,
+				const struct exynos9810_mct_local_ops *ops,
+				struct cpumask *active)
+{
+	struct cpumask cand;
+	const char *why = NULL;
+	unsigned int cpu;
+	int ret;
+
+	cpumask_clear(active);
+	mutex_lock(&mct_l_lock);
+	if (mct_l_attempted) {
+		why = "already attempted on this boot";
+		goto out;
+	}
+	mct_l_attempted = true;
+	if (!READ_ONCE(mct_ready)) {
+		why = "the MCT broadcast is not ready";
+		goto out;
+	}
+	if (!mct_l_prepared) {
+		why = mct_local_why;
+		goto out;
+	}
+	/* CPU0 and the big cores keep the arch timer + broadcast. */
+	cpumask_and(&cand, want, cpu_possible_mask);
+	cpumask_clear_cpu(0, &cand);
+	mct_l_ops = ops;
+
+	cpus_read_lock();
+	for_each_cpu(cpu, &cand) {
+		struct mct_local *ml = per_cpu_ptr(&mct_local, cpu);
+		const char *tw;
+
+		if (cpu >= MCT_NR_LOCAL || ml->irq < 0) {
+			pr_warn("local timer for cpu%u not used: no prepared timer: it keeps the arch timer\n",
+				cpu);
 			continue;
-		why = mct_l_test(cpu);
-		if (why) {
+		}
+		if (!cpu_online(cpu)) {
+			pr_warn("local timer L%u not used: cpu%u offline at the takeover: it keeps the arch timer\n",
+				cpu, cpu);
+			continue;
+		}
+		tw = mct_l_test(cpu);
+		if (tw) {
 			pr_warn("local timer L%u (irq %d) not used: %s (start->irq %llu..%llu MCT clocks, expected %llu): cpu%u keeps the arch timer\n",
-				cpu, ml->irq, why,
+				cpu, ml->irq, tw,
 				ml->test_min == U64_MAX ? 0 : ml->test_min,
 				ml->test_max,
 				div_u64((u64)mct_local_rate * MCT_L_TEST_US,
@@ -768,16 +1040,59 @@ static const char *mct_local_setup(struct platform_device *pdev)
 		mct_l_test_max = max(mct_l_test_max, ml->test_max);
 	}
 	cpus_read_unlock();
-	if (cpumask_empty(&mct_local_tested))
-		return "no local timer passed its self-check";
+	if (cpumask_empty(&mct_local_tested)) {
+		why = "no requested local timer passed its self-check";
+		goto out;
+	}
 
 	ret = cpuhp_setup_state(CPUHP_AP_EXYNOS4_MCT_TIMER_STARTING,
 				"clockevents/exynos9810_mct:starting",
 				mct_l_starting_cpu, mct_l_dying_cpu);
-	if (ret < 0)
-		return "MCT cpuhp state already in use";
+	if (ret < 0) {
+		cpus_read_lock();
+		for_each_cpu(cpu, &mct_local_tested)
+			per_cpu_ptr(&mct_local, cpu)->tested = false;
+		cpus_read_unlock();
+		cpumask_clear(&mct_local_tested);
+		why = "MCT cpuhp state already in use";
+		goto out;
+	}
 	WRITE_ONCE(mct_local_on, true);
-	return NULL;
+	for_each_cpu(cpu, &mct_local_tested) {
+		struct mct_local *ml = per_cpu_ptr(&mct_local, cpu);
+
+		if (exynos9810_mct_local_active(cpu))
+			cpumask_set_cpu(cpu, active);
+		else
+			pr_warn("local timer L%u passed its self-check but is not cpu%u's tick device (%s): cpu%u keeps the arch timer\n",
+				cpu, cpu,
+				ml->rejected ? ml->rejected :
+				READ_ONCE(ml->failed) ? ml->fail_why :
+				"not chosen by the tick core", cpu);
+	}
+	if (cpumask_empty(active))
+		why = "no requested CPU ticks on its local timer after registration";
+
+	INIT_DELAYED_WORK(&mct_local_work, mct_local_window);
+	queue_delayed_work(system_long_wq, &mct_local_work,
+			   mct_jiffies_until(MCT_L_WINDOW_START_MS));
+out:
+	mct_local_why = why;
+	if (why)
+		pr_warn("local timers not used for %*pbl (%s): those CPUs keep the arch timer + broadcast\n",
+			cpumask_pr_args(want), why);
+	else
+		pr_info("local timers: takeover of %*pbl: self-check passed on %*pbl (start->irq %llu..%llu MCT clocks, expected %llu for %u us at %u Hz), tick device now on %*pbl; rating %u, every other CPU keeps the arch timer + broadcast; IPI_TIMER irq %d\n",
+			cpumask_pr_args(want),
+			cpumask_pr_args(&mct_local_tested),
+			mct_l_test_min, mct_l_test_max,
+			div_u64((u64)mct_local_rate * MCT_L_TEST_US,
+				USEC_PER_SEC) * (MCT_L_TCNTB_VAL + 1),
+			MCT_L_TEST_US, mct_local_rate,
+			cpumask_pr_args(active), MCT_L_RATING,
+			mct_ipi_timer_irq);
+	mutex_unlock(&mct_l_lock);
+	return why;
 }
 
 bool exynos9810_mct_local_active(unsigned int cpu)
@@ -787,7 +1102,12 @@ bool exynos9810_mct_local_active(unsigned int cpu)
 	if (!READ_ONCE(mct_local_on) || cpu >= nr_cpu_ids)
 		return false;
 	ml = per_cpu_ptr(&mct_local, cpu);
-	return !READ_ONCE(ml->stuck) && tick_cpu_evtdev(cpu) == &ml->evt;
+	return !READ_ONCE(ml->failed) && tick_cpu_evtdev(cpu) == &ml->evt;
+}
+
+unsigned int exynos9810_mct_local_faults(void)
+{
+	return atomic_read(&mct_l_faults);
 }
 
 void exynos9810_mct_local_get_stats(unsigned int cpu,
@@ -798,6 +1118,7 @@ void exynos9810_mct_local_get_stats(unsigned int cpu,
 	s->irqs = READ_ONCE(ml->irqs);
 	s->write_timeouts = READ_ONCE(ml->wtimeouts);
 	s->active = exynos9810_mct_local_active(cpu);
+	s->failed = READ_ONCE(ml->failed);
 }
 
 /*
@@ -825,19 +1146,6 @@ static unsigned int mct_bc_ipis(unsigned int cpu)
 	return mct_ipi_timer_irq < 0 ? 0 : kstat_irqs_cpu(mct_ipi_timer_irq, cpu);
 }
 
-/* CPUs whose tick runs on their MCT local timer now (for log lines). */
-static const struct cpumask *mct_local_active_mask(void)
-{
-	static struct cpumask m;
-	unsigned int cpu;
-
-	cpumask_clear(&m);
-	for_each_online_cpu(cpu)
-		if (exynos9810_mct_local_active(cpu))
-			cpumask_set_cpu(cpu, &m);
-	return &m;
-}
-
 /* Jiffies from now until @ms boot time (0 if that has passed). */
 static unsigned long mct_jiffies_until(unsigned int ms)
 {
@@ -856,19 +1164,22 @@ static const char *mct_tick_name(unsigned int cpu)
 
 /*
  * Proof that the local timers are in use, at 150 s boot time (window from
- * 90 s) and then every 10 min: every online CPU ticks on its own
- * mct_tickN, each took local timer interrupts in the window, and the
- * broadcast stayed idle (no G0 interrupt, no timer broadcast IPI). 4.9
- * shows 0 broadcast IPIs on every CPU.
+ * 90 s) and then every 10 min, over the CPUs that took over (LITTLE 1-3):
+ * each still ticks on its own mct_tickN, took local timer interrupts in
+ * the window, received no timer broadcast IPI and had no write timeout or
+ * fault. 4.9 shows 0 broadcast IPIs on every CPU. The other CPUs (CPU0,
+ * big) keep the arch timer + broadcast: their lines and the G0 count are
+ * reported, not judged (big C2 wakes through G0 by design).
  */
 static void mct_local_window(struct work_struct *work)
 {
 	u64 now = ktime_to_ms(ktime_get_boottime()), g0 = atomic64_read(&mct_irqs);
 	u64 lmin = U64_MAX, lmax = 0, wt = 0, secs;
-	unsigned int cpu, ipis = 0;
-	struct cpumask active, not_local, silent;
+	unsigned int cpu, ipis = 0, faults = atomic_read(&mct_l_faults);
+	struct cpumask tk, active, not_local, silent;
 	bool pass;
 
+	cpumask_and(&tk, &mct_local_tested, cpu_online_mask);
 	cpumask_clear(&active);
 	cpumask_clear(&not_local);
 	cpumask_clear(&silent);
@@ -879,9 +1190,14 @@ static void mct_local_window(struct work_struct *work)
 			u64 l = READ_ONCE(ml->irqs) - mct_win.local[cpu];
 			unsigned int ipi = mct_bc_ipis(cpu) - mct_win.ipi[cpu];
 
-			pr_info("mct-local: window %llu s: cpu%u tick=%s local_irqs=+%llu (%llu/s) timer_bc_ipis=+%u write_timeouts=%llu\n",
-				secs, cpu, mct_tick_name(cpu), l, div64_u64(l, secs),
-				ipi, READ_ONCE(ml->wtimeouts));
+			pr_info("mct-local: window %llu s: cpu%u tick=%s%s local_irqs=+%llu (%llu/s) timer_bc_ipis=+%u write_timeouts=%llu%s\n",
+				secs, cpu, mct_tick_name(cpu),
+				cpumask_test_cpu(cpu, &tk) ? " (takeover)" : "",
+				l, div64_u64(l, secs), ipi,
+				READ_ONCE(ml->wtimeouts),
+				READ_ONCE(ml->failed) ? " FAILED" : "");
+			if (!cpumask_test_cpu(cpu, &tk))
+				continue;
 			if (exynos9810_mct_local_active(cpu))
 				cpumask_set_cpu(cpu, &active);
 			else
@@ -893,17 +1209,17 @@ static void mct_local_window(struct work_struct *work)
 			ipis += ipi;
 			wt += READ_ONCE(ml->wtimeouts);
 		}
-		pass = cpumask_empty(&not_local) && cpumask_empty(&silent) &&
-		       !ipis && g0 == mct_win.g0 && !wt &&
+		pass = !cpumask_empty(&tk) && cpumask_empty(&not_local) &&
+		       cpumask_empty(&silent) && !ipis && !wt && !faults &&
 		       mct_ipi_timer_irq >= 0;
-		pr_info("mct-local: %s window=%llu s: online %*pbl, on their MCT local timer %*pbl (not: %*pbl), no local irq: %*pbl, local irqs/CPU +%llu..+%llu, broadcast mct-bc G0 irqs +%llu, timer broadcast IPIs +%u%s, write_timeouts %llu\n",
+		pr_info("mct-local: %s window=%llu s: takeover CPUs online %*pbl, on their MCT local timer %*pbl (not: %*pbl), no local irq: %*pbl, local irqs/CPU +%llu..+%llu, timer broadcast IPIs on them +%u%s, write_timeouts %llu, faults %u (replaced %*pbl); broadcast mct-bc G0 irqs +%llu (big C2, not judged)\n",
 			pass ? "PASS" : "FAIL", secs,
-			cpumask_pr_args(cpu_online_mask),
-			cpumask_pr_args(&active),
+			cpumask_pr_args(&tk), cpumask_pr_args(&active),
 			cpumask_pr_args(&not_local), cpumask_pr_args(&silent),
-			lmin == U64_MAX ? 0 : lmin, lmax, g0 - mct_win.g0, ipis,
+			lmin == U64_MAX ? 0 : lmin, lmax, ipis,
 			mct_ipi_timer_irq < 0 ? " (IPI_TIMER not found)" : "",
-			wt);
+			wt, faults, cpumask_pr_args(&mct_l_replaced_mask),
+			g0 - mct_win.g0);
 	}
 
 	mct_win.at_ms = now;
@@ -1013,10 +1329,12 @@ static void mct_report(struct work_struct *work)
 			(t1[cpu] - t0[cpu]) * 1000 / MCT_TICK_WINDOW_MS,
 			div_u64((l1[cpu] - l0[cpu]) * 1000, MCT_TICK_WINDOW_MS),
 			(b1[cpu] - b0[cpu]) * 1000 / MCT_TICK_WINDOW_MS, HZ);
-	pr_info("report: local timers %s (%s), self-check passed on %*pbl\n",
+	pr_info("report: local timers %s (%s), self-check passed on %*pbl, faults %u, replaced %*pbl\n",
 		READ_ONCE(mct_local_on) ? "on" : "off",
 		mct_local_why ? mct_local_why : "ok",
-		cpumask_pr_args(&mct_local_tested));
+		cpumask_pr_args(&mct_local_tested),
+		atomic_read(&mct_l_faults),
+		cpumask_pr_args(&mct_l_replaced_mask));
 
 	exynos9810_mct_bc_get_stats(&s);
 	pr_info("report: done irqs=%llu programmed=%llu etime=%llu write_timeouts=%llu\n",
@@ -1106,28 +1424,23 @@ static int mct_bc_probe(struct platform_device *pdev)
 		}
 	} else {
 		/*
-		 * Local timers first: once mct_ready is set, cpuidle may arm,
-		 * and exynos9810_mct_local_active() must be final by then.
+		 * Local timers: resources only. Every CPU keeps the arch timer
+		 * + broadcast until cpuidle requests the takeover (LITTLE C2
+		 * boot arming, after its record holds the local-timer session).
 		 */
 		if (want_local) {
 			mct_find_ipi_timer();
-			mct_local_why = mct_local_setup(pdev);
-			if (mct_local_why)
-				pr_warn("local timers not used, every CPU keeps the arch timer + broadcast: %s\n",
+			INIT_WORK(&mct_l_fault_work, mct_l_fault_fn);
+			init_irq_work(&mct_l_fault_irq_work, mct_l_fault_irq_fn);
+			mct_local_why = mct_local_prepare(pdev);
+			if (mct_local_why) {
+				pr_warn("local timers not available, every CPU keeps the arch timer + broadcast: %s\n",
 					mct_local_why);
-			else
-				pr_info("local timers: self-check passed on %*pbl (start->irq %llu..%llu MCT clocks, expected %llu for %u us at %u Hz), tick device now on %*pbl; rating %u, the broadcast stays for the others; IPI_TIMER irq %d\n",
-					cpumask_pr_args(&mct_local_tested),
-					mct_l_test_min, mct_l_test_max,
-					div_u64((u64)mct_local_rate * MCT_L_TEST_US,
-						USEC_PER_SEC) * (MCT_L_TCNTB_VAL + 1),
-					MCT_L_TEST_US, mct_local_rate,
-					cpumask_pr_args(mct_local_active_mask()),
-					MCT_L_RATING, mct_ipi_timer_irq);
-			if (!mct_local_why) {
-				INIT_DELAYED_WORK(&mct_local_work, mct_local_window);
-				queue_delayed_work(system_long_wq, &mct_local_work,
-						   mct_jiffies_until(MCT_L_WINDOW_START_MS));
+			} else {
+				mct_l_prepared = true;
+				mct_local_why = "prepared, takeover not requested (yet)";
+				pr_info("local timers prepared (stopped, masked, IRQs requested, not enabled); takeover only on request by cpuidle, for the LITTLE CPUs it arms; IPI_TIMER irq %d\n",
+					mct_ipi_timer_irq);
 			}
 		}
 		WRITE_ONCE(mct_ready_ms, ktime_to_ms(ktime_get_boottime()));
