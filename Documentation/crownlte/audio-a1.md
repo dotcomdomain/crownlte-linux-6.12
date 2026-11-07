@@ -52,8 +52,20 @@ register access:
 | refused (no deadline, verify failed, no nonzero CPU, bad DT) or A1 not built | -EPERM / -EINVAL / -ENODEV | fails for this boot |
 
 `hsi2c_amp` only exists once `usi_amp` probed (exynos-usi populates its
-children), so the HSI2C18 pin mux ("default" state, applied by the driver
-core just before the HSI2C probe) also comes after the guard opened.
+children). Its pins are named `"a1-bus"`, not `"default"`, so the driver
+core muxes nothing before the probe; the A1 mode selects them itself
+after the latch and the guard (2.4).
+
+Each guarded device comes up at most once per boot (fix round 2). The A1
+driver keeps a boot-lifetime latch keyed by the device's MMIO base
+(`exynos9810_audio_a1_bus()`): CHECK is the first thing in the probe,
+before the guard, pins, clocks or registers, and refuses a controller
+that was already brought up or closed; CLAIM records the one bring-up
+just before the first pin mux, clock, SYSREG or register access; CLOSE
+marks a failed HSI2C18. Both bus drivers and the A1 driver have no sysfs
+`bind`/`unbind` files in an A1 build (`suppress_bind_attrs`). Their other
+suppliers cannot unbind either: the Samsung pinctrl driver suppresses its
+bind files, the legacy CMU is `CLK_OF_DECLARE` (no device), all built in.
 
 ### 2.2 Self-test at ~30 s, on a nonzero CPU
 
@@ -100,10 +112,19 @@ missing>)`); the ID read moves to A3 with mainline madera.
 `samsung,exynos9810-hsi2c`; it also makes the A1 guard mandatory). In
 that mode i2c-exynos5:
 
-- accepts only `[write, 2 bytes][read, 1 byte]` to one 7-bit address
-  (flags other than `I2C_M_RD`, ten-bit, `NOSTART`, `IGNORE_NAK` etc. are
-  refused); a refusal touches no register (it is checked before the
-  clocks are enabled);
+- accepts only `[write, 2 bytes][read, 1 byte]` to 0x39 or 0x3a whose
+  two address bytes name a register on the A1 list (0x0001-0x0003,
+  0x0400, 0x0402, 0x0500, 0x0600; `exynos9810_audio_a1_amp_reg_ok()` in
+  `exynos9810-audio-a1.h`, the same helper the self-test uses). The
+  clear-on-read interrupt flags 0x0007-0x0009 and every other register
+  or address are refused, whoever sends them (A1, another kernel client,
+  a `new_device` client); flags other than `I2C_M_RD`, ten-bit,
+  `NOSTART`, `IGNORE_NAK` etc. are refused. A refusal touches no
+  register (checked before the clocks are enabled) and closes the
+  adapter;
+- has no i2c-dev node: `CONFIG_EXYNOS9810_AUDIO_A1` depends on
+  `I2C_CHARDEV=n` (the A1 config has it off), so no `/dev/i2c-N` and no
+  `I2C_RDWR` exist in an A1 build;
 - sets `adap.retries = 0`: no automatic retry, also not after
   arbitration loss (`-EAGAIN`);
 - never runs the stuck-bus recovery (nine manual read clocks + STOP). If
@@ -114,6 +135,11 @@ that mode i2c-exynos5:
   enable error): IRQ disabled, INT_ENABLE cleared, controller put in
   software reset (HSI2C_CTL SW_RST) and left there. Later transfers
   return -EIO without touching the hardware; resume skips the re-init.
+  The closure is latched by base address in the A1 driver for the whole
+  boot, so no rebind can reopen it (2.1);
+- refuses a `"default"` or `"init"` pin state in its node (the driver
+  core would select it before the probe) and selects `"a1-bus"` itself
+  after the latch CLAIM.
 
 What the amps can see on a failure path:
 
@@ -145,12 +171,14 @@ What the amps can see on a failure path:
   (`GATE_USI07`, `USI07`), exactly as for the touch bus (USI03).
 - `i2c-exynos5` for `hsi2c_amp`: HSI2C18 controller reset/timing
   registers; on a failure, SW_RST (2.4).
-- pinctrl "default" of the bus: gpp4-4/gpp4-5 to function 2, no pull
-  (the 4.9 `hsi2c18-bus` values).
+- pin state `"a1-bus"` of the bus, selected by i2c-exynos5 after the
+  latch and the guard: gpp4-4/gpp4-5 to function 2, no pull (the 4.9
+  `hsi2c18-bus` values).
 - Everything the delayed-UFS diagnostic always does.
 
 No amp child node exists, so no amp driver binds and the i2c core scans
-nothing (no adapter class, no I2C_CHARDEV, no bus recovery info).
+nothing (no adapter class, no I2C_CHARDEV, no bus recovery info). Each of
+these writes happens at most once per boot (latch, 2.1).
 
 ## 3. Code
 
@@ -160,19 +188,26 @@ nothing (no adapter class, no I2C_CHARDEV, no bus recovery info).
   20000..100000), without a valid `samsung,audio-a1-deadline-ms`
   (121000..180000) or without an online nonzero CPU. The DT windows are
   mapped with `devm_ioremap()` without claiming them. Exports
-  `exynos9810_audio_a1_guard()`.
-- `include/soc/samsung/exynos9810-audio-a1.h`: the guard; stub returns
-  -ENODEV (guarded devices never come up without A1).
+  `exynos9810_audio_a1_guard()` and the bus latch
+  `exynos9810_audio_a1_bus()` (4 entries; a full table refuses every
+  further claim). Depends on `I2C_CHARDEV=n`. No sysfs bind files.
+- `include/soc/samsung/exynos9810-audio-a1.h`: the guard and the latch
+  (stubs return -ENODEV: guarded devices never come up without A1), the
+  amp address and register list (`exynos9810_audio_a1_amp_addr_ok()`,
+  `exynos9810_audio_a1_amp_reg_ok()`).
 - `drivers/i2c/busses/i2c-exynos5.c`: `samsung,crownlte-a1-read-only`
-  (2.4) and the guard call (A1 mode or `samsung,audio-a1-guard`). Other
-  adapters unchanged.
-- `drivers/soc/samsung/exynos-usi.c`: guard call when the node has
-  `samsung,audio-a1-guard`. Other USIs unchanged.
+  (2.4), the latch CHECK/CLAIM/CLOSE and the guard call (A1 mode or
+  `samsung,audio-a1-guard`). Other adapters unchanged, except that an A1
+  build suppresses the driver's sysfs bind files for every HSI2C.
+- `drivers/soc/samsung/exynos-usi.c`: latch CHECK/CLAIM and guard call
+  when the node has `samsung,audio-a1-guard`. Other USIs unchanged,
+  except that an A1 build suppresses the driver's sysfs bind files.
 - `exynos9810-crownlte-clocks.dtsi`: `usi_peric1_07_sysreg`, `usi_amp`
   (`usi@108c00c0`) and `hsi2c_amp` (`i2c@108c0000`, SPI 430, 400 kHz,
   `hsi2c18_bus` pins), all **disabled** and without children.
 - `exynos9810-crownlte-delayed-ufs-audio-a1-diag.dts`: delayed-UFS
-  diagnostic + bus enabled with the guard and A1 mode + `audio-a1@14050000`
+  diagnostic + bus enabled with the guard and A1 mode (pins as
+  `"a1-bus"`) + `audio-a1@14050000`
   node (five always-on windows); the other self-tests removed as in the
   suspend S0 DTB (cpuidle, MCT report, devfreq, TMU, cpufreq, display,
   battery, ADC; Mali disabled). The read-only PMIC snapshot at ~106 s
@@ -183,23 +218,26 @@ Config: `config-suspend-s0-ee215e307` (1ec1bef6) +
 
 ## 4. Artifacts
 
-Current (fix round 1):
+Current (fix round 2):
 
 | Item | Value |
 |---|---|
-| Commits | 6d2c7fdfc A1 driver + guard, c350c9cf3 i2c-exynos5 A1 mode, f76aa18de exynos-usi guard, 0e90c992d DTS, this doc |
-| Image | `panel-bright-work/images/Image-audio-a1-r1-0e90c992d` sha256 `33fb884522f085caabd40e027034fb4a0d63a3874c994e22b0da7d98b44b0e6e` |
-| DTB | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-audio-a1-diag-0e90c992d.dtb` sha256 `ec5ab02d67d4a2d20d76dbd94090f0bb922ba844f00158e0b2863d6037f7c21c` |
-| Pack | gekko `acpm-audio-a1-r1-s2/recovery.img` sha256 `1abac03f4c29e28189a3ba903a0b8417b592aaffeae99f141d5711a965442a23` (68149248 bytes); loader `be816f09...`; shim bbea959; ramdisk 506232b1; parent a8198be0; see `PROVENANCE.txt` |
+| Commits | round 1: 6d2c7fdfc A1 driver + guard, c350c9cf3 i2c-exynos5 A1 mode, f76aa18de exynos-usi guard, 0e90c992d DTS; round 2: 0a9a1f1a4 A1 (amp list, bus latch, no i2c-dev), 74e8e661f i2c-exynos5 (allowlist, latch, own pin state, no bind files), c0aab6cca exynos-usi (latch, no bind files), f6023a69d DTS (`"a1-bus"`), this doc |
+| Image | `panel-bright-work/images/Image-audio-a1-r2-f6023a69d` sha256 `0f4d5a54cc80e18c42527ed5f7bfacfcde687d19026c569ae5d34c5705d9040b` |
+| DTB | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-audio-a1-diag-f6023a69d.dtb` sha256 `bec36837607615b7e52817ab66740015389088eb4eecfa225b2c70e6f2f917fe` (only `pinctrl-names` of `i2c@108c0000` differs from round 1) |
+| Pack | gekko `acpm-audio-a1-r2-s2/recovery.img` sha256 `e69a160b532c315f0cabc9c275c0693601131b5e68747093accd494ff6f4ee1b` (68149248 bytes); loader `da610a68334dcc33ed9d3664a79b6e46119fa6342847ee41febb58bfb3b32409`; shim bbea959; ramdisk 506232b1; parent a8198be0; see `PROVENANCE.txt` |
 
-Superseded (757cbf76f, before fix round 1, must not be run):
-`acpm-audio-a1-s2` recovery `c7601027...`, Image `490e3ab8...`, DTB
-`35c9c7aa...`. The pack directory was deleted from gekko; a copy may
-still be on the PC.
+Superseded, must not be run:
+- fix round 1 (70edd371f): `acpm-audio-a1-r1-s2` recovery `1abac03f...`,
+  Image `33fb8845...`, DTB `ec5ab02d...`. Deleted from gekko; a copy is
+  on the PC.
+- before fix round 1 (757cbf76f): `acpm-audio-a1-s2` recovery
+  `c7601027...`, Image `490e3ab8...`, DTB `35c9c7aa...`. Deleted from
+  gekko; a copy may still be on the PC.
 
 ## 5. Running it
 
-Same procedure as the other delayed-UFS trials: copy `acpm-audio-a1-r1-s2`
+Same procedure as the other delayed-UFS trials: copy `acpm-audio-a1-r2-s2`
 to the PC (it includes `ready-capture.ps1`), start only with
 `adb reboot recovery`, then `run-trial.sh <dir>` (the default 180 s
 capture is enough). The host sends `CROWNLTE-UFS-READY-1` once. **Never
@@ -267,7 +305,9 @@ counter delta over A1 (must be 0); this driver has no write call.
 | `amp 0x3.: rev ID read FAILED -6 (NACK)` (-ENXIO), then `A1 read-only mode: transfer failed (-6): adapter closed for this boot (IRQ off, controller held in reset, ...)` and `amp 0x3a: not read: amp bus closed ...` | no ACK: wrong bus/USI mode/pins, or the amp has no supply | record; no retry by design. Compare gpp4-4/5 `con=0x2` |
 | `... (bus timeout)` + `9810 timeout:` + adapter closed | SCL held or clocking wrong | record the `9810 timing:` and `9810 timeout:` lines |
 | `... (arbitration lost)` / `... (bus busy or stuck)` / `A1 read-only mode: bus stuck before a transfer (TRANS_STATUS ...)` | another master or a slave holding SDA; no recovery clocks were sent | record; the next boot's START/STOP resets the amps' interface |
-| `A1 read-only mode: transfer refused: only [2-byte ...` | a non-A1 client tried the bus | must not happen (no child, no i2c-dev); report |
+| `A1 read-only mode: transfer refused (N messages, first to 0x..): only [2-byte ...` or `A1 read-only mode: transfer refused: register 0x.... at 0x3. is not on the A1 list`, then `adapter closed for this boot` | a non-A1 client tried the bus; nothing was sent | must not happen (no child, no i2c-dev); report |
+| `audio A1 bus latch: controller 0x... already brought up once` / `closed after a failure` `in this boot: bring-up refused` | a second probe of `usi_amp` / `hsi2c_amp` in the same boot; refused before any access | must not happen (no bind files); report what re-probed |
+| `A1 read-only mode: no "a1-bus" pin state` / `the bus pins must be pinctrl-names "a1-bus" only` | wrong DTB | use the DTB from section 4 |
 | `amp 0x3.: rev ID 0x.. below 0x40 at 0x0402 and 0x0600` | not a MAX98512 as 4.9 knows it | stop, report |
 | `STOP ... en=1` and the `STOP:` line | an amp has GLOBAL_EN=1 left from before this kernel | owner decides (design A1); A1 wrote nothing |
 | `fails: pmic-writes` | the PMIC write counter moved during A1 | must not happen with the sealed policy; report |
@@ -285,7 +325,7 @@ within 30 s. If the phone does not return: owner force restart (Power +
 Vol Down ~7-10 s), shim bounces to Lineage, restore bright RECOVERY
 `8763860c` by hand and wait for AshLooper `boot=booted`.
 
-## 9. Risks (after fix round 1)
+## 9. Risks (after fix round 2)
 
 - **HSI2C18 bring-up writes** (2.5): same pattern as the touch bus, but
   USI07 and its clock are new to 6.12. Now behind the deadline. A failure
@@ -295,7 +335,8 @@ Vol Down ~7-10 s), shim bounces to Lineage, restore bright RECOVERY
   Before probe the controller drives nothing; a glitch cannot form a
   complete address+register+data sequence, so the worst case is a
   spurious START/STOP seen by the amps, no register change. Unchanged
-  from the original A1 and from the touch bus.
+  from the original A1 and from the touch bus, but now after the latch
+  and the guard and at most once per boot.
 - **One release edge on a failure** (2.4): bounded to one SCL edge and
   one possible STOP; no data byte can complete.
 - **NACK on the first amp ends the run**: by design (no bus traffic after
@@ -309,7 +350,21 @@ Vol Down ~7-10 s), shim bounces to Lineage, restore bright RECOVERY
   deadline covers both.
 - **Watchdog accesses**: arming at probe reads WTCON/WTCNT through the
   watchdog driver's API from the probing CPU, as its own ping path does.
-- Not reviewed by Sol after fix round 1 yet.
+- **Allowlisted reads by another client**: a kernel client on the
+  adapter (only possible via `new_device` by root; there is no amp node
+  and no i2c-dev) can still read the seven listed registers. They are
+  not clear-on-read, so the amps do not change; such a client could
+  also send a refused message and close the adapter, which loses the A1
+  amp reads (FAIL), not a register.
+- **Latch scope**: keyed by the first MMIO base; 4 entries, a full table
+  refuses every further guarded bring-up. One bring-up per boot also
+  means an error after CLAIM (the lookups that can defer run before it;
+  `platform_get_irq()` after it only defers if the GIC is missing) fails
+  closed for the boot instead of retrying.
+- **Bind files**: an A1 build removes the sysfs `bind`/`unbind` files of
+  every exynos-usi and exynos5-hsi2c device (touch bus included), not
+  only the amp bus; nothing in the diagnostic uses them.
+- Not reviewed by Sol after fix round 2 yet.
 
 ## 10. Fix log
 
@@ -325,3 +380,17 @@ Vol Down ~7-10 s), shim bounces to Lineage, restore bright RECOVERY
 Build: `config-suspend-s0-ee215e307` + A1, clang 18, no warnings in the
 changed files (W=1). Pack: same packer, shim, ramdisk and parent as
 before (section 4).
+
+### Fix round 2 (Sol R2 on 70edd371f: CHANGES)
+
+| # | Sol finding | Fix | Commit |
+|---|---|---|---|
+| 1 | i2c-exynos5.c:852: the A1 filter accepts any 2-byte register address + 1-byte read; another kernel client or i2c-dev `I2C_RDWR` could read the clear-on-read MAX98512 flags 0x0007-0x0009 | before the clocks the adapter checks address 0x39/0x3a and the register against the exact A1 list (shared helper in `exynos9810-audio-a1.h`, also used by the self-test); anything else is refused and closes the adapter. `CONFIG_I2C_CHARDEV` was already off in the A1 config; `CONFIG_EXYNOS9810_AUDIO_A1` now depends on `I2C_CHARDEV=n`, so i2c-dev cannot exist in an A1 build | 0a9a1f1a4, 74e8e661f |
+| 2 | i2c-exynos5.c:840/1017/1104/1190: "closed for this boot" only lasts for the binding; sysfs unbind/bind reprobes with a zeroed `a1_closed` | boot-lifetime latch keyed by MMIO base in the built-in A1 driver: CHECK first in the USI07 and HSI2C18 probes (before guard, pins, clocks, registers), CLAIM before the first access (one bring-up per boot), CLOSE on failure. The amp bus pins are `"a1-bus"` (no `"default"`), so the driver core muxes nothing before the probe; the A1 mode selects them after the latch and the guard. `suppress_bind_attrs` on exynos-usi and exynos5-hsi2c in A1 builds (the A1 driver already had it) | 0a9a1f1a4, 74e8e661f, c0aab6cca, f6023a69d |
+
+Build: same config, clang 18, W=1 clean for the three changed C files,
+whole build without warnings; make re-run on the committed tree rebuilt
+nothing (Image sha unchanged). DTB differs from round 1 only in
+`pinctrl-names`. Pack: same packer (`pack-acpm-q-paths.py`), shim
+bbea959, ramdisk 506232b1, parent a8198be0; the shim worktree was removed
+after the loader build.
