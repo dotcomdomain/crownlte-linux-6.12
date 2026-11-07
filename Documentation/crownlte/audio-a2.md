@@ -3,8 +3,8 @@
 Design: gekko `roadmap/audio-design.md`, section 5 "A2" (also 1.1, 2 item 5,
 3.2, 6). Branch `crownlte-audio-a2`. Build only; not run on the phone yet.
 Sol R1 (CHANGES) fixed in fix round 1, Sol R2 (CHANGES) fixed in fix
-round 2, Sol R3 (CHANGES) fixed in fix round 3 (section 13); fix round 3
-not re-reviewed yet.
+round 2, Sol R3 (CHANGES) fixed in fix round 3, Sol R4 (CHANGES) fixed in
+fix round 4 (section 13); fix round 4 not re-reviewed yet.
 
 A2 boots the ABOX ("Calliope") audio DSP firmware in the DSP's own SRAM and
 in kernel DRAM buffers, waits for the firmware's "ready to sing" message,
@@ -123,6 +123,14 @@ unchanged (the DPU uses the same driver).
 
 ### 3.2 Self-test at `samsung,abox-a2-selftest-ms` (60 s), on CPU1 (pinned)
 
+The worker disables migration at its start and enables it again exactly
+once, at its single exit, right after the final PMU snapshot (step 10
+below), on every path. The firmware release and the reset fallback of an
+unconfirmed stop run unpinned (fix round 4). While pinned, A2 takes no
+lock that can wait for a CPU hotplug operation (audit in the comment at
+`migrate_disable()`), so an offline of CPU1 during the test is delayed,
+never blocked.
+
 1. Watchdog deadline still armed and at least 30 s away; re-verified.
    Then the reset fallback (fix round 2): `exynos9810_diagnostic_restart_check()`
    must report the diagnostic restart ready (context published, CAL up,
@@ -198,6 +206,12 @@ A2 ends the boot in a full-SoC reset and keeps all of the above until it:
    `exynos9810-diagnostic-restart.c`. It is the vehicle's normal restart
    path (the ramdisk's `reboot` at 600 s, every ROM-RAM trial so far)
    minus device shutdown:
+   - called only after the A2 worker ended its migration pin (fix round
+     4). The function refuses a migration-disabled caller (`WARN_ON_ONCE`,
+     `-EDEADLK`) before it takes any lock: a pinned caller waiting in
+     `cpus_read_lock()` deadlocks against an offline of its own CPU, which
+     holds the hotplug write lock and waits in `sched_cpu_wait_empty()`
+     for the caller to unpin;
    - on the reboot CPU (CPU0, as `migrate_to_reboot_cpu()`), via
      `work_on_cpu()`; the CPU is chosen and the work runs under
      `cpus_read_lock()` (fix round 3), so it cannot go offline in between;
@@ -273,6 +287,7 @@ child), S2MPS18 (no PMIC access at all), `/efs`, UAIF/DSIF pin mux,
 | 5b15c8ece | fix round 1: chip-ID RAM snapshot, unconfirmed stop keeps everything and ends via the watchdog, SUSPEND ack required (section 13) |
 | fb47f58fa | fix round 2: SysMMU never released in the boot, suspend refused; diagnostic restart emergency entry points (`exynos9810_diagnostic_restart_check()`, `exynos9810_diagnostic_emergency_restart()`, `include/soc/samsung/exynos9810-diagnostic-restart.h`) as the reset fallback; confirmed CPU-off at shutdown; Kconfig `EXYNOS9810_ABOX_A2` depends on `EXYNOS9810_DIAGNOSTIC_RESTART` (section 13) |
 | 867044c69 | fix round 3 (diagnostic restart only): independent emergency preparation accepted by the restart guard; reboot-CPU selection and dispatch under the CPU hotplug read lock (section 13) |
+| 5dff1ba4c | fix round 4: the A2 worker ends its migration pin before the reset fallback (one exit, balanced on every path); the emergency restart refuses migration-disabled callers; deadlock analysis and header contract corrected; audit of the locks taken while pinned (section 13) |
 
 DT bindings (A2 only, not upstream):
 - gate `samsung,exynos9810-abox-a2`: `samsung,pmu-syscon`, clocks
@@ -311,11 +326,11 @@ command reproduces the BT-B1 DTB bit for bit (adedcd7d). The `.dts` and
 
 | Item | Value |
 |---|---|
-| Image | `panel-bright-work/ko-audio-a2-fix3/arch/arm64/boot/Image` sha256 `b21587c5c4ee5a97222437023dc3798ca7ce00860f1fc923df0d00eaf5806fb6` (built at 867044c69) |
-| config | `panel-bright-work/ko-audio-a2-fix3/config` sha256 `197e5ff61b9a4501b3608aaccda928b9915fa8800f0cac7fb650a77a34835eaa` (unchanged) |
-| DTB | `panel-bright-work/ko-audio-a2-fix3/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-audio-a2.dtb` sha256 `18fb1b412739d4b51b813f60ac4b668c1b56b8094c5c14c0bd77adfd698b2a3d` (unchanged) |
-| Pack | gekko `rom-ram/pack-romram-audio-a2-fix3/recovery.img` sha256 `5f1f36b6c89abe8e5cf1ee1e4681a1f9483fe1f8307e496673058d8b2b1f26f7` (68149248 bytes, mode 0600: the build-32 ramdisk contains the device MAC addresses; do not publish) |
-| loader | `43952bfe57a0ed83dd93c7f4df235bf04fedf8750e9e4ceb51a0e25e43022e92`, shim bbea959 |
+| Image | `panel-bright-work/ko-audio-a2-fix4/arch/arm64/boot/Image` sha256 `8c0df85b9f238d73e5556f8467924f94734238367843225edfd302610efb205e` (built at 5dff1ba4c) |
+| config | `panel-bright-work/ko-audio-a2-fix4/config` sha256 `197e5ff61b9a4501b3608aaccda928b9915fa8800f0cac7fb650a77a34835eaa` (unchanged) |
+| DTB | `panel-bright-work/ko-audio-a2-fix4/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-audio-a2.dtb` sha256 `18fb1b412739d4b51b813f60ac4b668c1b56b8094c5c14c0bd77adfd698b2a3d` (unchanged) |
+| Pack | gekko `rom-ram/pack-romram-audio-a2-fix4/recovery.img` sha256 `c61cc4d00d89f6f5e0de17638225ad0563285bee5246beb0fad4f8e736bbc6ae` (68149248 bytes, mode 0600: the build-32 ramdisk contains the device MAC addresses; do not publish) |
+| loader | `18c44cb96ae6dcf05e72c57c6930746dfeb34a248ee5c7e5a555c93ace39201f`, shim bbea959 |
 | ramdisk | `rom-ram/build-32/diagnostic-initramfs.cpio.gz` `82771399d5af1ff8afc6b575ef8edddd57d5ea5cc30db67084e7a05ec848f3fa` (romram-adb 46a3670, DEADLINE 600 s) |
 | parent / restore | `a8198be0...` / bright RECOVERY `8763860c...` |
 
@@ -332,7 +347,11 @@ Superseded packs, deleted on gekko (copies on the PC); do not run them:
 - `pack-romram-audio-a2-fix2` (`9250fb93...`, Image `ee87233c...` at
   fb47f58fa, loader `ce8912f7...`): the two Sol R3 defects (a concurrent
   reboot could clear the emergency preparation before the guard read it;
-  reboot-CPU selection not protected against hotplug).
+  reboot-CPU selection not protected against hotplug);
+- `pack-romram-audio-a2-fix3` (`5f1f36b6...`, Image `b21587c5...` at
+  867044c69, loader `43952bfe...`): the Sol R4 defect (the A2 worker
+  called the emergency restart, and so `cpus_read_lock()`, while still
+  migration-disabled: possible deadlock against an offline of its CPU).
 
 ## 7. Running it
 
@@ -436,7 +455,7 @@ A2 does not).
 | `ABOX_RESUME ipc NOT acked`, `fails: resume-ipc` | DSP not polling its mailbox after boot | record |
 | `ABOX_SUSPEND ipc NOT acked` / `WFI NOT seen`, then `ABOX CPU off (...), stop not clean (no SUSPEND ack or no WFI)`, `fails: stop`, `dsp=off` | firmware did not take SUSPEND or did not reach WFI; the CPU was powered off anyway and reads off, the DRAM request was then withdrawn. The SysMMU keeps translating until the next reset (as after every test) | record STANDBY and the GPR dump; boot not counted, no further boot |
 | `ABOX CPU still on after enable/power off (STATUS=...): DRAM request (SYSPOWER_CTRL) kept`, `dsp=LEFT-RUNNING`, `fails: stop-unconfirmed` (or the earlier failure, e.g. `no-ready-to-sing`), then `ABOX CPU could not be stopped: ... ending this boot via the watchdog` and `s3c2410-wdt: petting stopped for good (audio A2: ABOX CPU not stopped)` | DSP stop unconfirmed: DRAM request, clocks, buffers and SysMMU translation kept, suspend refused; the CL0 watchdog resets the SoC ~30 s later (counter reloaded once) | report; the reset clears it. Read pstore after the reset |
-| as above, but `CL0 watchdog final stop not possible (...): diagnostic emergency restart (PMU SWRESET, no device shutdown)`, then `Diagnostic emergency restart (audio A2: ABOX CPU not stopped) on CPU0: ...` and the reset at once | the guarded watchdog was gone; the diagnostic restart reset the SoC with the normal boot reasons, containment kept until then | report. If instead `Diagnostic emergency restart (...) refused: <why>` and `orderly reboot, containment kept`: the reset depends on user space (or the 600 s ramdisk reboot); owner force restart if the phone does not come back |
+| as above, but `CL0 watchdog final stop not possible (...): diagnostic emergency restart (PMU SWRESET, no device shutdown)`, then `Diagnostic emergency restart (audio A2: ABOX CPU not stopped) on CPU0: ...` and the reset at once | the guarded watchdog was gone; the diagnostic restart reset the SoC with the normal boot reasons, containment kept until then | report. If instead `Diagnostic emergency restart (...) refused: <why>` and `orderly reboot, containment kept`: the reset depends on user space (or the 600 s ramdisk reboot); owner force restart if the phone does not come back. `refused: caller is migration-disabled` (with a WARNING backtrace) must never appear: it means the A2 pin was not ended before the fallback (a code regression); report it |
 | `diagnostic restart (reset fallback) not ready: <why>: nothing touched`, `FAIL ... fails: restart (nothing touched)`; or `boot N not started: diagnostic restart not ready: <why>`, `fails: restart` | the reset fallback is not available (diagnostic restart not probed or unbound, CAL not up, INFORM2/3 not normal, DFD dump on). Nothing was touched (first form), or no further boot was started (second form) | check the `exynos9810-diagnostic-restart` probe line and `boot selection at probe` |
 | `exynos-sysmmu 17e00000.sysmmu: disabled (bypass)` after the self-test started | must not happen in fix round 2 (containment failed) | report |
 | `Calliope is not compatible with the driver`, `fails: incompatible` | firmware reports an ABI 'A' marker (4.9 check) | record version |
@@ -463,7 +482,7 @@ As in the other ROM-RAM trials:
   Down ~7-10 s), the shim bounces to Lineage, restore bright RECOVERY
   `8763860c` by hand.
 
-## 11. Risks (after fix round 3)
+## 11. Risks (after fix round 4)
 
 - **First non-secure access to SYSREG_AUD, ABOX SFR/SRAM/GIC and the ABOX
   SysMMU in 6.12.**
@@ -523,7 +542,18 @@ As in the other ROM-RAM trials:
   restart helps (as before). The emergency work holds the CPU hotplug
   read lock: a CPU hotplug operation started meanwhile waits up to
   ~10 s plus the bounded STOP, or until the reset; nothing in the
-  vehicle hotplugs CPUs at that point.
+  vehicle hotplugs CPUs at that point. Since fix round 4 the A2 worker
+  ends its migration pin before it calls the emergency restart, which
+  refuses a pinned caller, so an offline of the A2 CPU can no longer
+  deadlock against it. While pinned (the test itself) A2 waits for
+  nothing that waits for a hotplug operation, so such an offline is
+  only delayed, by at most the test (with up to 60 s per firmware file if
+  the user-helper fallback is not answered). The audit covers A2's own
+  locks and the drivers it calls (watchdog, diagnostic restart, PMU
+  regmap, SysMMU `rpm_lock`, firmware loader, IRQ); the clock framework
+  locks taken by the SysMMU runtime resume are assumed, not proven
+  exhaustively, never to be held by a task waiting for CPU hotplug (no
+  9810 clock provider or notifier in this config is known to do that).
 - **`fails: restart`**: A2 now refuses to start if the diagnostic restart
   is not ready (read-only check: context, CAL, chip revision,
   INFORM2/INFORM3 normal, DFD dump off). The guarded watchdog already
@@ -538,7 +568,7 @@ As in the other ROM-RAM trials:
   (deadline in the ping path, keep-armed suspend) now run in ROM-RAM for
   the first time. Without a deadline they behave as before.
   `exynos9810-pm` is not built.
-- Sol R1, R2 and R3 fixed (section 13); fix round 3 not re-reviewed yet.
+- Sol R1, R2, R3 and R4 fixed (section 13); fix round 4 not re-reviewed yet.
   Neither the emergency path nor the round 3 changes have run on
   hardware (the CL0 watchdog final stop comes first).
 
@@ -623,3 +653,44 @@ loader build (loader log identical to fix2 apart from the work dir),
 then moved to `rom-ram/pack-romram-audio-a2-fix3` (`5f1f36b6...`, loader
 `43952bfe...`, section 6). The superseded `pack-romram-audio-a2-fix2`
 (`9250fb93`) was deleted on gekko.
+
+### Fix round 4 (Sol R4 on 1e088b195: CHANGES)
+
+Sol's other conclusions on round 3: the `emergency_prepared` fix is
+correct, and the non-default-command override policy is accepted (owner
+and Sol).
+
+| # | Sol finding | Fix | Commit |
+|---|---|---|---|
+| 1 | MEDIUM `exynos9810-diagnostic-restart.c`:379: CPU hotplug locking can deadlock against the migration-disabled A2 caller. `a2_work_fn()` disabled migration at its start and called the emergency restart (via `a2_end_left_running()`) before `migrate_enable()`. If an offline of that CPU takes the hotplug write lock first, `sched_cpu_wait_empty()` waits for the worker to unpin, and the worker blocks forever in `cpus_read_lock()`. The emergency work never starts, so the 10 s transition-mutex bound cannot break the cycle (`CONFIG_HOTPLUG_CPU=y`) | `a2_work_fn()` has a single exit (`out`). It calls `migrate_enable()` exactly once on every path, right after the last access that had to run on the test CPU (the final PMU snapshot), and before the firmware release and the reset fallback (watchdog final stop, emergency restart, `orderly_reboot()`), which now run unpinned. `left_running` is false on every early exit, and the firmware release is a no-op for firmware never requested. `exynos9810_diagnostic_emergency_restart()` states its caller contract (not migration-disabled; no hotplug lock, and no lock a hotplug operation takes, held) and refuses a migration-disabled caller with `WARN_ON_ONCE` and `-EDEADLK` before it takes any lock. Reboot-CPU selection and `work_on_cpu()` dispatch stay under `cpus_read_lock()`. The deadlock analysis is corrected: round 3 claimed that no hotplug operation waits for the caller, which is false for a pinned one. Given the contract, an offline in progress does not wait for the caller, because `balance_push()` moves an unpinned task and the workqueue offline callback unbinds a per-CPU kworker without waiting for its work. The header comment states the same contract. Re-audit of every lock `a2_work_fn()` takes while pinned (comment at `migrate_disable()`): watchdog state reads (MMIO, wdt spinlock); `exynos9810_diagnostic_restart_check()` (context mutex; its other holders, the restart preparation and the emergency work, take no hotplug lock under it, and the emergency work only runs after the pin ended); PMU regmap (spinlock); `request_firmware()` (loader mutexes, user-helper wait bounded by its timeout); SysMMU runtime resume (owner `rpm_lock`, clock prepare/enable locks); `enable_irq()`/`disable_irq()`; the IPC spinlock; sleeps, a bounded completion wait and bounded polls. None waits for a CPU hotplug operation (3.2, 11) | 5dff1ba4c |
+
+Build: same config (`197e5ff6`), `make ARCH=arm64 LLVM=-18 -j3 Image`,
+clang 18.1.3, in `/dev/shm/a2fix4-build` (unused AMD GPU register
+headers left out of the worktree for space, as in round 3; DRM is not
+configured). `exynos9810-diagnostic-restart.c` and
+`exynos9810-abox-a2.c` are clean with W=1, and the full build has only
+the existing bcmdhd warnings (73). Image `8c0df85b...` at 5dff1ba4c; a
+`make Image` re-run on the committed tree rebuilt nothing (same hash).
+DTB unchanged (`18fb1b41`). Pack: same packer, shim bbea959, ramdisk
+build-32 (`82771399`), parent a8198be0; built in `/dev/shm`, the shim
+worktree and shim-out removed after the loader build (loader log
+identical to fix3 apart from the work dir), then moved to
+`rom-ram/pack-romram-audio-a2-fix4` (`c61cc4d0...`, loader
+`18c44cb9...`, section 6). The superseded `pack-romram-audio-a2-fix3`
+(`5f1f36b6`) was deleted on gekko.
+
+Residual risks of this round:
+- The audit of the locks taken while pinned covers A2 and the drivers it
+  calls. The clock framework locks (SysMMU runtime resume) and the
+  firmware loader internals are generic code; they are assumed, not
+  proven exhaustively, never to be held by a task that waits for CPU
+  hotplug. Even then, nothing in the vehicle hotplugs CPUs during the
+  test.
+- An unanswered firmware user-helper keeps the worker pinned for up to
+  60 s per file (10 files at most), which delays, but does not block, an
+  offline of CPU1.
+- If a future caller of the emergency restart is migration-disabled, it
+  is refused (WARNING), and A2 falls back to `orderly_reboot()`, which is
+  not bounded. It does not deadlock.
+- The emergency path (unpinned or not) has still not run on hardware;
+  the CL0 watchdog final stop comes first.
