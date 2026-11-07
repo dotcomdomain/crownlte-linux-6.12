@@ -5,10 +5,15 @@ everything a suspend-to-RAM does, up to but never including the firmware
 sleep call. Four self-recovering self-tests, S0a to S0d, on the delayed-UFS
 RECOVERY vehicle. Log prefix: `suspend s0:`.
 
-Build-only so far. The first hardware run (S0ab pack `7b48380b`,
-2026-11-06 23:46) panicked in probe on the secure-only PMU register 0x30;
-fix round 1 (§10) removes that access and the other unproven ones (§9),
-and fixes the Sol R1 review findings. Fix round 1 has not run on the phone.
+The first hardware run (S0ab pack `7b48380b`, 2026-11-06 23:46) panicked
+in probe on the secure-only PMU register 0x30. Fix round 1 (§10) removed
+that access and the other unproven ones (§9); its S0ab pack `0b956baa`
+PASSED on hardware (2026-11-07 01:00: S0a read-only, S0b 140/140 + 5/5 +
+25/25). Fix round 2 (§10) addresses Sol R2: the deadline is installed and
+verified before the first diagnostic read, user space can no longer
+change the timeout under a deadline, and the sleep masks are written only
+with software-owned values. Fix round 2 is build-only; S0c/S0d have never
+run.
 
 ## 1. What S0 can and cannot do
 
@@ -59,6 +64,8 @@ none are expected.
 | `PM: suspend: run pm_suspend_test_level() under one system_transition_mutex ownership` (fix round 1) | `enter_state_check()` / `enter_state_locked()` split (§10). |
 | `soc: samsung: exynos9810-pm: S0 fix round 1: ...` (fix round 1) | CP_CTRL reads removed, register audit (§9), bounded cross-CPU calls, recovery gate (§10). |
 | `watchdog: s3c2410_wdt: no stretched or late reload when crownlte petting stops` (fix round 1) | Keep-armed refusal puts the run-time timeout back; the restart notifier re-checks the deadline under the lock (§10). |
+| `watchdog: s3c2410_wdt: crownlte timeout changes serialized with the deadline` (fix round 2, `7b58093af`) | `.set_timeout`/`.stop` refuse under `wdt->lock` once a deadline is installed; every prescaler change runs under the lock and never slows a counter that may no longer be reloaded; `s3c2410wdt_set_heartbeat_pet()` (§10). |
+| `soc: samsung: exynos9810-pm: S0 fix round 2: deadline before the first read, software-owned masks` (fix round 2, `f6d389d19`) | Deadline installed and verified before the boot snapshot; masks written only with the 4.9 SYS_SLEEP values (§9, §10). |
 
 ### Why the generic files change
 
@@ -120,18 +127,22 @@ after S0 has ended.
 
 ## 3. Artifacts
 
-| Item | Path (gekko `/mnt/ssd/host-builds/kernel-upgrade/`) | sha256 |
-|---|---|---|
-Fix round 1 (code at `7c0493496`):
+Fix round 2 (code at `f6d389d19`):
 
 | Item | Path (gekko `/mnt/ssd/host-builds/kernel-upgrade/`) | sha256 |
 |---|---|---|
-| Image | `panel-bright-work/images/Image-suspend-s0-7c0493496` | `fea8dbe1913f95e59d93b1cfaf4ae35a7eba0db0a606c72ae29277f769314fc7` |
-| config (unchanged) | `panel-bright-work/images/config-suspend-s0-7c0493496` | `1ec1bef6e867e455921af6dd6f57ace26a543d9257bf56ff71fde350b6e4fa6a` |
-| S0 DTB (a..d), unchanged | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0-diag-7c0493496.dtb` | `61e670ec5078b8e9f8c1a07b520beb102a7476c545e69cd9de1165c4c7259050` |
-| S0ab DTB (a+b), unchanged | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0ab-diag-7c0493496.dtb` | `362e56d366f53a87394f24969452c254991362824819b9ae358fa18c69a8b4de` |
-| Trial 1: S0ab RECOVERY | `acpm-suspend-s0ab-r1-s2/recovery.img` | `0b956baad13d1b7cbe5923e1726f8565e14c7b9ca81746f5033380b7c93a72fe` |
-| Trial 2: S0 RECOVERY | `acpm-suspend-s0-r1-s2/recovery.img` | `c39885265bb9587db27cba96fc7aacb44190ec129f866c62bf4078e30ae2df74` |
+| Image | `panel-bright-work/images/Image-suspend-s0-f6d389d19` | `649b1b957e2f83511b1b0297b92df5fa1922e14aefc2179771a4e04bd3d651f1` |
+| config (unchanged) | `panel-bright-work/images/config-suspend-s0-f6d389d19` | `1ec1bef6e867e455921af6dd6f57ace26a543d9257bf56ff71fde350b6e4fa6a` |
+| S0 DTB (a..d), rebuilt, byte-identical | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0-diag-f6d389d19.dtb` | `61e670ec5078b8e9f8c1a07b520beb102a7476c545e69cd9de1165c4c7259050` |
+| S0ab DTB (a+b), rebuilt, byte-identical | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0ab-diag-f6d389d19.dtb` | `362e56d366f53a87394f24969452c254991362824819b9ae358fa18c69a8b4de` |
+| Trial 1: S0ab RECOVERY | `acpm-suspend-s0ab-r2-s2/recovery.img` | `e1aa0b0a84e87fc65150b1ec4c03666533f6b34dfdf6033753e67a8c895a2a9c` |
+| Trial 2: S0 RECOVERY | `acpm-suspend-s0-r2-s2/recovery.img` | `03198f447e3ae235f18608cdf527307537a1727c204980258e73c3e63c33ad68` |
+
+Superseded, fix round 1 (code at `7c0493496`; gekko copies of the packs
+deleted, PC copies exist): Image `fea8dbe1…` (still at
+`panel-bright-work/images/Image-suspend-s0-7c0493496`), S0ab RECOVERY
+`0b956baa…` (PASS on hardware 2026-11-07 01:00), S0 RECOVERY `c3988526…`
+(never run).
 
 Superseded (code at `4877cf53b`, panics in probe on PMU 0x30; gekko
 copies of the packs deleted, PC copies in
@@ -161,7 +172,7 @@ Timeline:
 
 | Boot time | What |
 |---|---|
-| ~0.3 s (probe) | `s3c2410-wdt ... system suspend keeps it armed (timeout 60 s while suspended)`; `s3c2410-wdt ... crownlte deadline: no reload after 145000 ms boot time`; `suspend s0: probe: watchdog deadline 145000 ms installed before any cross-CPU request`; `suspend s0: probe: stages abcd ...` |
+| ~0.3 s (probe) | `s3c2410-wdt ... system suspend keeps it armed (timeout 60 s while suspended)`; `s3c2410-wdt ... crownlte deadline: no reload after 145000 ms boot time`; `suspend s0: probe: watchdog deadline 145000 ms installed and verified before any diagnostic register read or cross-CPU request`; `suspend s0: probe: stages abcd ...` |
 | 20 s | `deadline 145000 ms installed at probe in the watchdog ping path`; S0a; recovery check (WTCNT moving) before S0b |
 | ~20-35 s | S0b (170 hotplug cycles) |
 | ~35-75 s | S0c (5 levels × 5 s + overhead). **COM4 drops** at the `devices` level (dwc3 suspends) and comes back on resume. `ready-capture.ps1` reopens the port, and PID1 resends its cached log. |
@@ -198,6 +209,16 @@ suspend s0: S0a PASS (read-only) CP_STAT=<cp>
 unconditionally, and syscore suspend refuses if G3D is off. The S0a
 values are the 6.12 reference for design §7 (CP_STAT with the CP never
 booted, and the reset values of 0x60c/0x610/0x614/0x618/0x644).
+
+Values seen on hardware (r1 S0ab `0b956baa`, 2026-11-07 01:00, boot
+snapshot): `CP_STAT=0x1 SEQ_CP cfg=0x10000 status=0x0 DFD=0x0
+G3D=0x10000f`; `INFORM0..7=0x0 0x10000 0x10000 0x0 0x0 0x0 0x0 0x0
+FLEXPMU_INFORM=0xbadabcd`; `WAKEUP_MASK 0x60c=0x0 0x610=0x0
+0x614=0xffff00ff 0x618=0xffff00ff 0x644=0x0 WAKEUP_STAT=0x0/0x0`;
+`IDLE_IP=0x0 0x0 0x0 0x1 IDLE_IP_MASK=0xffffffff ×4`; `INTR_GEN en/pend
+grp1=0x0/0xff grp2=0x0/0xef grp4=0xffffffff/0x0
+EVENT_INT_EN_GRP2=0xffffffff`. From fix round 2 on, the `S0a boot`
+snapshot is read after the deadline line.
 
 ### S0b
 
@@ -236,6 +257,14 @@ suspend s0: step 50 syscore resume exit ok (ret 0/0): INFORM0=0x0 GRP2 en=<..> E
 suspend s0: S0c level=core ret=0 <ms> ms begin/prepare_late/enter +1/+1/+0 syscore +1/+1 no-cpu0-WFI cpus 8/8 wdt 30s en=1 -> PASS
 suspend s0: S0c PASS 5/5
 ```
+
+The masks keep the SYS_SLEEP values after the `core` level, as in 4.9
+(fix round 2: no restore from a hardware read). 0x610 therefore goes from
+its boot value (0x0 on hardware) to `0xd00f7e7e` and stays there; the
+register check expects the DT values from the first syscore suspend on,
+so no `changed wakeup mask` line is expected. A `changed wakeup mask[i]:
+<DT value> -> <found>` line after `core` or S0d means a register did not
+keep the value written.
 
 Also expected: `s3c2410-wdt ... suspend: kept armed, timeout 60 s` and
 `resume: armed, timeout 30 s` at the levels from `devices` up. The
@@ -281,7 +310,8 @@ With the S0ab DTB: `S0c=not-run [] S0d=not-run [] lost=`.
 |---|---|---|
 | Kernel panic in `e9810_snap` / `regmap_mmio_read32le`, `synchronous external abort` (pstore `dmesg-ramoops-0`) | A register read that the secure world protects (the 4877cf53b build read PMU 0x30). Fix round 1 reads only the §9 set. | Panic → reboot → shim bounce → Lineage (seen 2026-11-06 23:46). |
 | `suspend s0: probe FAIL: <why>` and, at ~22 s, `SUMMARY ... probe failed: <why>` | The driver did not start (bad DT, CAL, topology, or the DFD dump is enabled so `big_reset_control()` would be needed). Nothing ran. | Normal 120 s restart. |
-| `probe FAIL: no armed, petted CL0 watchdog to carry the 145000 ms deadline` | The guarded watchdog is not running with the reset enabled (INFORM not normal, DFD set, or the PMU still masks the reset). No cross-CPU request was sent, nothing ran. | Normal 120 s restart. |
+| `probe FAIL: no armed, petted CL0 watchdog to carry the 145000 ms deadline` | The guarded watchdog is not running with the reset enabled (INFORM not normal, DFD set, or the PMU still masks the reset). No diagnostic register was read, no cross-CPU request was sent, nothing ran. | Normal 120 s restart. |
+| `probe FAIL: watchdog deadline 145000 ms not verified: <why>` (fix round 2) | The deadline was accepted but the read-back failed (`counter not moving`, reset disabled, petting stopped, deadline missing). No diagnostic register was read, nothing ran. The deadline stays installed. | Normal 120 s restart; if not, WDT reset after 145 s. |
 | `cpuN did not run the <what> request within 200 ms (request left to it)`, then `s3c2410-wdt: petting stopped for good (suspend s0: a CPU does not answer cross-CPU calls)` | A CPU counted online does not take IPIs. At probe (`MPIDR read`, `hook reset`) the probe fails as well. | WDT reset ≤ 30 s → shim bounce. |
 | `S0b refused (no hotplug done): <why>` | No live, reset-enabled, still-petted watchdog with the deadline (B2 gate; `counter not moving` means WTCNT did not change in ~50 ms). | S0b SKIPPED; S0c/S0d not run. |
 | `S0b <phase> cpuN off#n not started: <why> FAIL` | The watchdog stopped being a recovery path during S0b (deadline passed, petting stopped). No further core goes down. | S0b FAIL. |
@@ -339,7 +369,29 @@ S0 PASS is necessary for S1, not sufficient. Still missing:
 
 S1 needs the owner present (design §5, D5).
 
-## 9. Register access audit (fix round 1)
+## 9. Register access audit (fix rounds 1 and 2)
+
+Order (fix round 2): probe installs the watchdog deadline and verifies it
+(running, reset enabled, petted, deadline present, WTCNT moving) before
+the first access to any register below except the CL0 watchdog's own.
+Before that point probe uses only the DT, `cal_if_is_initialized()` (a
+flag), `syscon_regmap_lookup_by_phandle()` and `devm_ioremap()`, none of
+which reads a register; the initcall reads only the DT, and the cpuhp
+hooks are registered later. A read that stalls CPU0 instead of aborting
+therefore ends in a WDT reset at the latest 30 s after 145 s.
+
+Hardware evidence (fix round 2): the r1 S0ab run (pack `0b956baa`,
+2026-11-07 01:00, PASS) read the whole `e9810_snap()` set at least four
+times without an abort or a stall: the probe boot snapshot, S0a at 20 s,
+and the S0b start and end snapshots. That set is every R entry of the
+Kept table except the APM log ring (read through ACPM, also on c2diag-a),
+in particular the four wakeup masks, IDLE_IP_MASK0..3, CPU_INFORM0..7 and
+the INTR_GEN GRP1/GRP4 enable registers, whose 4.9 evidence is weaker
+(below). S0b also ran the dying-CPU INTR_GEN GRP2 CLEAR write and the
+CPU STATUS poll on every core-off (140 single, 5 cluster, 25 group
+cycles). Not run on hardware yet: the syscore writes of the
+wakeup masks and IDLE_IP_MASK, and the CAL system tables (S0c `core`,
+S0d).
 
 Rule: the driver touches a register directly only if the 4.9 kernel
 running on 9810 reaches that register by plain non-secure MMIO. 4.9
@@ -371,22 +423,22 @@ given in full; `T/` = `cal-if/exynos9810/`; `DTS` =
 | PMU 0x0280 CENTRAL_SEQ_CP_CONFIGURATION | R | `T/pmucal_cp_exynos9810.h:21` RMW in the non-SMC branch `cal-if/pmucal_rae.c:307-312` |
 | PMU 0x0284 CENTRAL_SEQ_CP_STATUS | R | `T/pmucal_cp_exynos9810.h:23,27` WAIT (R) |
 | PMU 0x03e0-0x03ec IDLE_IP0..3 | R | `exynos-powermode.c:137` R, `:305` RMW |
-| PMU 0x03f0-0x03fc IDLE_IP_MASK0..3 | R, W (syscore save, all masked, restore) | `exynos-powermode.c:194` W. **Read justified, not proven:** 4.9 only writes it. 4.9 treats the 9810 secure registers per offset and the same for reads and writes (`pmucal_is_cp_smc_regs()` sends reads and writes of the same offsets to SMC), so an offset that 4.9 writes from the non-secure side is not a secure-only one. IDLE_IP in the same block is read by 4.9. |
+| PMU 0x03f0-0x03fc IDLE_IP_MASK0..3 | R (snapshot only); W `0xffffffff` (syscore suspend, resume and undo; never a read-back value) | `exynos-powermode.c:194` W (`exynos_set_idle_ip_mask()`, value from `init_idle_ip()` `:349`, all ones without `fix-idle-ip`). 4.9 only writes it. **Read proven on HW:** r1 S0ab `0b956baa` read `0xffffffff` ×4 without a fault. (Round-1 argument, still valid: 4.9 routes 9810 secure registers to SMC per offset for reads and writes alike, `pmucal_is_cp_smc_regs()`, and IDLE_IP in the same block is read by 4.9.) |
 | PMU 0x0500 RESET_SEQUENCER_CONFIGURATION | R (DFD check) | `exynos-reboot.c:137,144,164,191,293` R |
 | PMU 0x0600 WAKEUP_STAT | R | `exynos-pm.c:216` R |
 | PMU 0x060c EINT_WAKEUP_MASK | R | `exynos-pm.c:92` R; `exynos-powermode.c:639` W |
-| PMU 0x0610 / 0x0614 / 0x0618 / 0x0644 wakeup masks | R, W (syscore) | `exynos-powermode.c:642` W, offsets DTS:4918,4923,4928,4933 (SYS_SLEEP column `0xd00f7e7e 0xffff00ff 0xffff00ff 0`). **Read justified as for IDLE_IP_MASK**; 4.9 reads 0x600, 0x60c and 0x640 of the same group. |
+| PMU 0x0610 / 0x0614 / 0x0618 / 0x0644 wakeup masks | R (snapshot, step 20 log); W the DT SYS_SLEEP values (syscore suspend, resume and undo; never a read-back value) | `exynos-powermode.c:642` W, offsets DTS:4918,4923,4928,4933 (SYS_SLEEP column `0xd00f7e7e 0xffff00ff 0xffff00ff 0`); 4.9 writes them in `exynos_prepare_sys_powerdown()` `:646-653` and never restores them. 4.9 only writes them; it reads 0x600, 0x60c and 0x640 of the same group. **Read proven on HW:** r1 S0ab `0b956baa` read `0x0 0xffff00ff 0xffff00ff 0x0` without a fault. |
 | PMU 0x0640 WAKEUP_STAT2 | R | `exynos-pm.c:131` R (`extra_wakeup_stat`, DTS:4884 = 1600 = 0x640) |
-| PMU 0x0860-0x087c CPU_INFORM0..7 | R | `cal-if/pmucal_powermode.c:26,35` W (`T/flexpmu_cal_powermode_exynos9810.h:2-9`). **Read justified as for IDLE_IP_MASK**; the 6.12 `drivers/cpuidle/cpuidle-exynos9810.c:911,1059` C2 diagnostics also read it. |
+| PMU 0x0860-0x087c CPU_INFORM0..7 | R | `cal-if/pmucal_powermode.c:26,35` W (`T/flexpmu_cal_powermode_exynos9810.h:2-9`). 4.9 only writes it. **Read proven on HW:** r1 S0ab `0b956baa` read `0x0 0x10000 0x10000 0x0 0x0 0x0 0x0 0x0` at boot, and again in every S0b snapshot, without a fault; the 6.12 `drivers/cpuidle/cpuidle-exynos9810.c:911,1059` C2 diagnostics also read it. |
 | PMU 0x0880 FLEXPMU_INFORM | R | `exynos-pm.c:383,644` R |
 | PMU 0x2004..0x203c CPU STATUS (LITTLE 0x2024+8n, BIG 0x2004+8n) | R (CPU_DEAD poll, snapshot, dump) | `exynos-pmu.c:83` R (`core_status` sysfs, `:210`); `T/flexpmu_cal_cpu_exynos9810.h:15,67` (`coreNN_status` READ) |
 | PMU 0x2044 / 0x204c NONCPU STATUS | R | `exynos-pmu.c:113` R; `T/flexpmu_cal_cpu_exynos9810.h:115,124` READ |
 | PMU 0x3060/0x3080/0x30a0/0x30c0/0x3120/0x31a0 PAD_RETENTION | R | `T/flexpmu_cal_system_exynos9810.h:1272-1277` RMW (exit_sleep) |
 | PMU 0x4044 EMBEDDED_G3D_STATUS | R (syscore G3D gate) | `T/flexpmu_cal_local_exynos9810.h:480,488,495` WAIT/READ |
 | PMU 0x7f08 EVENT_INTERRUPT_ENABLE_GRP2 | R | `T/flexpmu_cal_system_exynos9810.h:128`, `T/flexpmu_cal_cpu_exynos9810.h:7,12` RMW |
-| INTR_GEN 0x14070100 / 0x108 GRP1 EN / PEND | R | `T/flexpmu_cal_cpu_exynos9810.h:269` RMW; `:11` COND (R of 0x108) |
+| INTR_GEN 0x14070100 / 0x108 GRP1 EN / PEND | R | PEND: `T/flexpmu_cal_cpu_exynos9810.h:11,24,…,102` and `T/flexpmu_cal_system_exynos9810.h:1282` COND (R of 0x108) in the Linux branch (`#ifndef ACPM_FRAMEWORK`). EN: **no 4.9 Linux path reads or writes it**; the only accesses (`T/flexpmu_cal_cpu_exynos9810.h:269-324` RMW) are in the `#else` (ACPM_FRAMEWORK, APM firmware) branch. **EN read proven on HW:** r1 S0ab `0b956baa` read `0x0` (PEND `0xff`) without a fault. |
 | INTR_GEN 0x14070200 / 0x208 / 0x20c GRP2 EN / PEND / CLEAR | R; W CLEAR (dying CPU) | `T/flexpmu_cal_cpu_exynos9810.h:5,6,10`: RMW of 0x200, COND R of 0x208, W of 0x20c |
-| INTR_GEN 0x14070400 / 0x408 GRP4 EN / PEND | R | `T/flexpmu_cal_system_exynos9810.h:2588,2622` W/RMW, `:1284` COND (R of 0x408) |
+| INTR_GEN 0x14070400 / 0x408 GRP4 EN / PEND | R | PEND: `T/flexpmu_cal_system_exynos9810.h:1284` COND (R of 0x408, `earlywkup_sleep`, Linux branch). EN: **no 4.9 Linux path reads or writes it**; the only accesses (`:2588,2622` W/RMW) are in the ACPM_FRAMEWORK branch (after `:2565 #else`). **EN read proven on HW:** r1 S0ab `0b956baa` read `0xffffffff` (PEND `0x0`) without a fault. |
 | GPIO_ALIVE 0x14050900-0x910 EINT mask gpa0..4 | R | `drivers/pinctrl/samsung/pinctrl-exynos.c:103,138` RMW of `eint_mask + eint_offset`, `:501` (`exynos7_wkup_irq_chip`, 0x900), banks `:1930-1935` (offsets 0x00-0x10), DTS:316-317 |
 | GPIO_ALIVE 0x14050a00-0xa10 EINT pend gpa0..4 | R | `exynos-pm.c:99,137,206` R (DTS:4874 `gpio_alive_base` 0x14050000, `num-eint` 34) |
 | GICD 0x10101200-0x23c ISPENDR0..15 | R (snapshot, S0d self-IPI, early-wakeup dump) | `exynos-pm.c:210` R (DTS:4874 `gicd_ispendrn_base` 0x10101200, `num-gic` 16) |
@@ -459,3 +511,52 @@ Residual risks (fix round 1):
   WTCON has the reset enabled. The PMU reset routing was proven in
   q35/q37 and is not re-checked here.
 - The CAL save/exit lists (§9, last paragraph).
+
+### Fix round 2 (2026-11-07): commits `7b58093af`, `f6d389d19`
+
+Input: the r1 S0ab hardware run (pack `0b956baa`, 2026-11-07 01:00,
+PASS: S0a read-only, S0b single 140/140, cluster 5/5, group 25/25 in
+10896 ms, 0 CPU_DEAD polls saw the core still powered; PMIC selftest 0
+errors, 0 writes) and Sol R2 (verdict CHANGES) on `e0cfc3891`.
+
+| Finding | Fix |
+|---|---|
+| BLOCKER: `e9810_snap()` (boot snapshot) ran before `e9810_deadline_install()`. A snapshot read that stalled CPU0 instead of aborting would have left the other CPUs petting with no deadline. | Probe installs the deadline, then verifies it with `s0_recovery_refused(live)`: running, reset enabled, still petted, this deadline or an earlier one, WTCNT seen moving. Only then is the boot snapshot read. A failed check fails probe with `watchdog deadline ... not verified` (§6) before any diagnostic read. Re-checked: before that point probe touches only the DT, the CAL init flag and the syscon/ioremap lookups; the initcall reads only the DT; the cpuhp hooks, syscore and suspend ops are registered later (§9, Order). |
+| MAJOR: `s3c2410wdt_ops_set_timeout()` did not check `pet_deadline_ns`, so `WDIOC_SETTIMEOUT` could stretch the count under a deadline (fix round 1 claimed otherwise). `set_heartbeat()` changed WTDAT and the prescaler outside `wdt->lock`. | `.set_timeout` and `.stop` decide under `wdt->lock` (the lock `s3c2410wdt_crownlte_set_deadline()` installs under) and return `-EBUSY` once a deadline is installed or petting stopped. `set_heartbeat` is split into `s3c2410wdt_calc_heartbeat()` (clock rate, no lock) and `__s3c2410wdt_apply_heartbeat()` (under `wdt->lock`); once the counter may no longer be reloaded, it refuses any change that would slow the running count. `s3c2410wdt_set_heartbeat_pet()` changes the timeout and reloads in one critical section, or writes nothing. The kept-armed suspend, kept-armed resume, restart notifier and expiry selftest use it, so none of them reloads after the deadline or leaves a slower prescaler on a counter that is no longer petted. |
+| MAJOR: the INTR_GEN GRP1/GRP4 enable reads rested only on ACPM_FRAMEWORK (firmware-branch) table entries. | Kept. §9 now says that no 4.9 Linux path reads or writes the GRP1/GRP4 enable registers (the Linux branch reads only their PEND registers) and cites the r1 hardware reads (`grp1=0x0/0xff`, `grp4=0xffffffff/0x0`, no fault). |
+| MAJOR: the wakeup-mask, IDLE_IP_MASK and CPU_INFORM reads had only 4.9 write evidence; the masks were restored after suspend from a hardware read. | §9 cites the r1 hardware reads of all three. The masks are now written only with software-owned values, the 4.9 SYS_SLEEP ones (DT `samsung,wakeup-masks`, IDLE_IP_MASK all ones), at syscore suspend and again on resume and on the undo path. As in 4.9, they are not put back to their pre-suspend value. From the first write on, the register check expects these values (§5 S0c). |
+
+Build: `config-suspend-s0-f6d389d19` (identical to
+`config-suspend-s0-7c0493496`), clang 18, `-j3`. `W=1` on
+`s3c2410_wdt.o` and `exynos9810-pm.o` gave no warnings.
+`exynos9810-pm.o` still has no `smc`/`hvc` instruction, no PSCI symbol,
+no `smp_call_function_single` and no `cal_pm_enter` reference. The DTS
+did not change; both rebuilt DTBs are byte-identical to the r1 ones. The
+packs were made as for r1 (`pack-acpm-q-paths.py`, shim `bbea959`,
+ramdisk `506232b1`, parent `a8198be0`), and the shim worktrees were
+removed afterwards. Artifacts in §3.
+
+Residual risks (fix round 2):
+
+- The syscore writes of the wakeup masks and IDLE_IP_MASK have not run on
+  hardware. They are 4.9 writes of 4.9 values, but after S0c `core`
+  0x610 stays at `0xd00f7e7e` instead of its boot value 0x0. Nothing in
+  6.12 enters a system power mode outside this driver, so this is not
+  expected to matter at run time. It does differ from the boot state for
+  the rest of the vehicle run.
+- 0x610 and 0x644 read 0x0 on hardware. A register that reads as zero
+  whatever was written would show up after `core` as `changed wakeup
+  mask[i]: 0xd00f7e7e -> 0x0` and fail S0c with `PMU state not restored`,
+  without a hang. Since round 2 nothing is written from such a read.
+- Probe now spends up to ~60 ms on the WTCNT liveness check before the
+  boot snapshot. A probe that fails that check leaves the deadline
+  installed (as in fix round 1).
+- The non-keep-armed `s3c2410wdt_suspend()` path still checks
+  `pet_deadline_ns` without the lock. A deadline is only installed at S0
+  probe, long before any suspend, and the S0 watchdog always takes the
+  keep-armed path.
+- The kept-armed suspend still runs the 60 s count under a deadline by
+  design: after the deadline, a reset is due within 60 s instead of 30 s
+  if it passes while suspended.
+- Fix round 1 residuals still apply, except the first one, which the
+  hardware reads have resolved.
