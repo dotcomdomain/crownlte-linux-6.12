@@ -12,8 +12,14 @@ PASSED on hardware (2026-11-07 01:00: S0a read-only, S0b 140/140 + 5/5 +
 25/25). Fix round 2 (§10) addresses Sol R2: the deadline is installed and
 verified before the first diagnostic read, user space can no longer
 change the timeout under a deadline, and the sleep masks are written only
-with software-owned values. Fix round 2 is build-only; S0c/S0d have never
-run.
+with software-owned values. The r2 S0 pack `03198f44` (2026-11-07 01:59)
+was the first S0c run: S0a, S0b and the S0c levels freezer to processors
+PASSED. The `core` level ran the CAL system tables and resumed with all
+CPUs, but failed the register check: bit 12 of wakeup mask 0x610 does not
+keep a written value. S0d was not run. Fix round 3 (§10) leaves that bit
+out of the check and adds a read-only dwc3 state line. The USB link that
+looked lost after `core` came back on its own (§10). Fix round 3 is
+build-only.
 
 ## 1. What S0 can and cannot do
 
@@ -66,6 +72,8 @@ none are expected.
 | `watchdog: s3c2410_wdt: no stretched or late reload when crownlte petting stops` (fix round 1) | Keep-armed refusal puts the run-time timeout back; the restart notifier re-checks the deadline under the lock (§10). |
 | `watchdog: s3c2410_wdt: crownlte timeout changes serialized with the deadline` (fix round 2, `7b58093af`) | `.set_timeout`/`.stop` refuse under `wdt->lock` once a deadline is installed; every prescaler change runs under the lock and never slows a counter that may no longer be reloaded; `s3c2410wdt_set_heartbeat_pet()` (§10). |
 | `soc: samsung: exynos9810-pm: S0 fix round 2: deadline before the first read, software-owned masks` (fix round 2, `f6d389d19`) | Deadline installed and verified before the boot snapshot; masks written only with the 4.9 SYS_SLEEP values (§9, §10). |
+| `soc: samsung: exynos9810-pm: S0 fix round 3: read-only bit 12 of wakeup mask 0x610` (fix round 3, `da17e083a`) | The wakeup-mask check leaves out the bits that do not keep a written value (`E9810_WMASK_610_RO`, 0x610 bit 12 only); logs keep the raw values (§10). |
+| `usb: dwc3: crownlte: log the device state at system suspend and resume` (fix round 3, `ee215e307`) | `drivers/usb/dwc3/core.c`: one read-only DCTL/DSTS/GCTL/DEVTEN line at system suspend entry and after system resume, crownlte diagnostic build, device mode, never while runtime suspended (§10). |
 
 ### Why the generic files change
 
@@ -90,6 +98,10 @@ none are expected.
   deadline lives in the ping path for the same reason: no timer on any
   particular CPU has to fire for it to hold. Without a crownlte deadline
   (every DT but the S0 ones) the driver behaves as before.
+- **dwc3/core.c** (fix round 3): diagnostics only. The S0 driver must not
+  read the USB controller itself (another block, clocks it does not
+  own), so dwc3 prints its own state while its core is initialised.
+  Only with `CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART` on `samsung,crownlte`.
 
 ### CONFIG
 
@@ -127,16 +139,27 @@ after S0 has ended.
 
 ## 3. Artifacts
 
-Fix round 2 (code at `f6d389d19`):
+Fix round 3 (code at `ee215e307`):
 
 | Item | Path (gekko `/mnt/ssd/host-builds/kernel-upgrade/`) | sha256 |
 |---|---|---|
-| Image | `panel-bright-work/images/Image-suspend-s0-f6d389d19` | `649b1b957e2f83511b1b0297b92df5fa1922e14aefc2179771a4e04bd3d651f1` |
-| config (unchanged) | `panel-bright-work/images/config-suspend-s0-f6d389d19` | `1ec1bef6e867e455921af6dd6f57ace26a543d9257bf56ff71fde350b6e4fa6a` |
-| S0 DTB (a..d), rebuilt, byte-identical | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0-diag-f6d389d19.dtb` | `61e670ec5078b8e9f8c1a07b520beb102a7476c545e69cd9de1165c4c7259050` |
-| S0ab DTB (a+b), rebuilt, byte-identical | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0ab-diag-f6d389d19.dtb` | `362e56d366f53a87394f24969452c254991362824819b9ae358fa18c69a8b4de` |
-| Trial 1: S0ab RECOVERY | `acpm-suspend-s0ab-r2-s2/recovery.img` | `e1aa0b0a84e87fc65150b1ec4c03666533f6b34dfdf6033753e67a8c895a2a9c` |
-| Trial 2: S0 RECOVERY | `acpm-suspend-s0-r2-s2/recovery.img` | `03198f447e3ae235f18608cdf527307537a1727c204980258e73c3e63c33ad68` |
+| Image | `panel-bright-work/images/Image-suspend-s0-ee215e307` | `780bf979851c3031828549dd8c2a5e9874309dc6d48c1d70acab18a0ebdb3009` |
+| config (unchanged) | `panel-bright-work/images/config-suspend-s0-ee215e307` | `1ec1bef6e867e455921af6dd6f57ace26a543d9257bf56ff71fde350b6e4fa6a` |
+| S0 DTB (a..d), rebuilt, byte-identical | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0-diag-ee215e307.dtb` | `61e670ec5078b8e9f8c1a07b520beb102a7476c545e69cd9de1165c4c7259050` |
+| S0ab DTB (a+b), rebuilt, byte-identical | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0ab-diag-ee215e307.dtb` | `362e56d366f53a87394f24969452c254991362824819b9ae358fa18c69a8b4de` |
+| Trial 1: S0ab RECOVERY | `acpm-suspend-s0ab-r3-s2/recovery.img` | `4a8056ab0569deb148b038fd271f095657fc7b50ead294c01640e5d2a463107f` |
+| Trial 2: S0 RECOVERY | `acpm-suspend-s0-r3-s2/recovery.img` | `416fb7f3cf9dfcc7582b242e6b4e0a5fce18d9af89062e2c19bc3ff47db32e1d` |
+
+Each pack directory also holds `ready-capture.ps1` (fix round 3): the
+same READY-once capture, but it logs every open and every drop with the
+capture time and byte count, so a reconnect shows up in `capture.log`.
+
+Superseded, fix round 2 (code at `f6d389d19`; gekko copies of the packs
+deleted, PC copies in `C:\Users\Patrick\tools\trial-acpm-suspend-{s0ab,s0}-r2-20261107`):
+Image `649b1b95…` (still at
+`panel-bright-work/images/Image-suspend-s0-f6d389d19`), S0ab RECOVERY
+`e1aa0b0a…`, S0 RECOVERY `03198f44…` (ran 2026-11-07 01:59, §10 fix
+round 3).
 
 Superseded, fix round 1 (code at `7c0493496`; gekko copies of the packs
 deleted, PC copies exist): Image `fea8dbe1…` (still at
@@ -150,7 +173,7 @@ copies of the packs deleted, PC copies in
 `1fa72477…`, S0ab RECOVERY `7b48380b…` (ran 2026-11-06 23:46), S0
 RECOVERY `f787654d…` (never run).
 
-Both packs: `pack-acpm-q-paths.py`, shim `bbea959`, ramdisk `506232b1`
+All packs: `pack-acpm-q-paths.py`, shim `bbea959`, ramdisk `506232b1`
 (CPU0-pinned PID1, restart at 120 s, fallback at 150 s), parent
 `a8198be0`. `manifest.json` sits next to each image. Its
 `kernel_source` field is the packer's stale default; `PROVENANCE.txt`
@@ -162,9 +185,10 @@ The order is S0ab first, then S0. A LITTLE hotplug loss in S0ab ends the
 series: S0c/S0d need all CPUs.
 
 Same procedure as the other delayed-UFS trials: copy the work dir to the
-PC, add `ready-capture.ps1`, then `run-trial.sh <dir>` (default capture
-180 s). Start it only with `adb reboot recovery`. The host sends
-`CROWNLTE-UFS-READY-1` once. **Never send `CROWNLTE-UFS-PROBE-1`**: a
+PC (it includes `ready-capture.ps1`), then `run-trial.sh <dir>` with a
+capture of at least 240 s (the default 180 s is too short: the suspended
+watchdog bound is 60 s). Start it only with `adb reboot recovery`. The
+host sends `CROWNLTE-UFS-READY-1` once. **Never send `CROWNLTE-UFS-PROBE-1`**: a
 bound UFS host makes S0c/S0d refuse, and the UFS guard is not extended
 for suspend.
 
@@ -175,8 +199,8 @@ Timeline:
 | ~0.3 s (probe) | `s3c2410-wdt ... system suspend keeps it armed (timeout 60 s while suspended)`; `s3c2410-wdt ... crownlte deadline: no reload after 145000 ms boot time`; `suspend s0: probe: watchdog deadline 145000 ms installed and verified before any diagnostic register read or cross-CPU request`; `suspend s0: probe: stages abcd ...` |
 | 20 s | `deadline 145000 ms installed at probe in the watchdog ping path`; S0a; recovery check (WTCNT moving) before S0b |
 | ~20-35 s | S0b (170 hotplug cycles) |
-| ~35-75 s | S0c (5 levels × 5 s + overhead). **COM4 drops** at the `devices` level (dwc3 suspends) and comes back on resume. `ready-capture.ps1` reopens the port, and PID1 resends its cached log. |
-| ~75-80 s | S0d (COM4 drops again) |
+| ~35-60 s | S0c (5 levels × 5 s + overhead). **COM4 drops** at the `devices` level (dwc3 suspends) and stays away until a few seconds after the `core` level: the levels follow each other within some 30 ms, far less than the host needs to enumerate the gadget again (r2: back within ~8 s of `core`). PID1 sees `serial write errno=5`, reopens ttyGS0 and resends its whole cached log once the host is back. |
+| ~60-65 s | S0d (COM4 drops again, then the same resend) |
 | then | `SUMMARY` four times, 5 s apart |
 | ~106 s | `pmic selftest:` (read-only) |
 | 120 s | PID1 restart (150 s fallback); shim → Lineage |
@@ -251,20 +275,44 @@ suspend s0: S0c level=freezer ret=0 <ms> ms begin/prepare_late/enter +0/+0/+0 sy
 suspend s0: S0c level=devices ret=0 <ms> ms begin/prepare_late/enter +1/+0/+0 syscore +0/+0 cpus 8/8 wdt 30s en=1 -> PASS
 suspend s0: S0c level=platform ret=0 <ms> ms begin/prepare_late/enter +1/+1/+0 syscore +0/+0 cpus 8/8 wdt 30s en=1 -> PASS
 suspend s0: S0c level=processors ret=0 <ms> ms begin/prepare_late/enter +1/+1/+0 syscore +0/+0 cpus 8/8 wdt 30s en=1 -> PASS
-suspend s0: step 20 syscore suspend mode 8 masks 0x60c=<..>(not written in S0) 0x610=0xd00f7e7e 0x614=0xffff00ff 0x618=0xffff00ff 0x644=0x0 IDLE_IP_MASK=0xffffffff CP_STAT=<cp> (CP off, allowed by DT)
-suspend s0: step 20 cal_pm_enter_unarmed(8) ok: INFORM0=0x4 EVENT_INT_EN_GRP2=<bit4 set> GRP2 en=<bit4 clear> (cpu0 bit 0, APM hand-off withheld: 1 write skipped)
-suspend s0: step 50 syscore resume exit ok (ret 0/0): INFORM0=0x0 GRP2 en=<..> EVENT_INT_EN_GRP2=<bit4 clear> cpu0 GRP2 latched in window=0 PAD_RET top=1 spi=1 bootldo0=1 bootldo1=1 pcie=1 uart=1 WAKEUP_STAT=<..>
+suspend s0: step 20 syscore suspend mode 8 masks 0x60c=0x0(not written in S0) 0x610=0xd00f6e7e 0x614=0xffff00ff 0x618=0xffff00ff 0x644=0x0 IDLE_IP_MASK=0xffffffff CP_STAT=0x1
+suspend s0: step 20 cal_pm_enter_unarmed(8) ok: INFORM0=0x4 EVENT_INT_EN_GRP2=0xffffffff GRP2 en=0xef (cpu0 bit 0, APM hand-off withheld: 1 write skipped)
+suspend s0: step 50 syscore resume exit ok (ret 0/0): INFORM0=0x0 GRP2 en=0xef EVENT_INT_EN_GRP2=0xffffffef cpu0 GRP2 latched in window=0 PAD_RET top=1 spi=1 bootldo0=1 bootldo1=1 pcie=1 uart=1 WAKEUP_STAT=0x0/0x0
+suspend s0: step 60 wake: 8 CPUs online
+suspend s0: step 70 end
 suspend s0: S0c level=core ret=0 <ms> ms begin/prepare_late/enter +1/+1/+0 syscore +1/+1 no-cpu0-WFI cpus 8/8 wdt 30s en=1 -> PASS
 suspend s0: S0c PASS 5/5
 ```
 
+The values are the ones the r2 run printed (2026-11-07 01:59), except the
+last two lines, which r2 did not reach.
+
 The masks keep the SYS_SLEEP values after the `core` level, as in 4.9
 (fix round 2: no restore from a hardware read). 0x610 therefore goes from
-its boot value (0x0 on hardware) to `0xd00f7e7e` and stays there; the
-register check expects the DT values from the first syscore suspend on,
-so no `changed wakeup mask` line is expected. A `changed wakeup mask[i]:
-<DT value> -> <found>` line after `core` or S0d means a register did not
-keep the value written.
+its boot value (0x0 on hardware) to `0xd00f6e7e` and stays there: the DT
+value `0xd00f7e7e` minus bit 12, which reads as 0 whatever is written
+(r2 hardware, fix round 3). The register check expects the DT values from
+the first syscore suspend on, without the read-only bits, so no `changed
+wakeup mask` line is expected. A `changed wakeup mask[i]: <DT value> ->
+<found> (<offset>, read-only bits <ro> not compared)` line after `core` or
+S0d means a writable bit did not keep the value written.
+
+From the `devices` level up, each level also prints two dwc3 lines (fix
+round 3; r2 values in brackets where known):
+
+```
+dwc3 10c00000.usb: crownlte system suspend entry: DCTL=<bit 31 set> DSTS=<..> GCTL=<..> DEVTEN=<..> connected=<0|1> softconnect=1 pullups=1 gadget=<configured|...>
+phy-exynos9810-usbdrd 11100000.phy: before init: ... utmi=00000033 ...   [r2: identical at every level]
+phy-exynos9810-usbdrd 11100000.phy: after init: ... utmi=00000030 ...
+phy-exynos9810-usbdrd 11100000.phy: power_on: ...
+dwc3 10c00000.usb: crownlte system resume done: DCTL=<bit 31 set> DSTS=<bit 22 clear> GCTL=<..> DEVTEN=<..> connected=<..> softconnect=1 pullups=1 gadget=<..>
+```
+
+`DCTL` bit 31 set and `DSTS` bit 22 (DEVCTRLHLT) clear after resume mean
+the controller runs with the pullup on again. The host then needs a few
+seconds to enumerate it; until then `connected` stays 0 at the next
+level's suspend entry, which is expected while the levels follow each
+other within tens of milliseconds.
 
 Also expected: `s3c2410-wdt ... suspend: kept armed, timeout 60 s` and
 `resume: armed, timeout 30 s` at the levels from `devices` up. The
@@ -331,7 +379,7 @@ With the S0ab DTB: `S0c=not-run [] S0d=not-run [] lost=`.
 | `S0d ... FAIL: FRC/arch counter not counting` | MCT FRC or CNTPCT did not advance across `.enter`. | Must be understood before S1 (design R3). |
 | `s3c2410-wdt: deadline 145000 ms passed: counter no longer reloaded ...` and/or `deadline 145000 ms reached and the system is still up` | The PID1 restart and its 150 s fallback did not happen by 145 s. | No CPU can reload the counter any more → WDT reset ≤ 30 s → shim bounce. |
 | Log stops with no FAIL line | Hang. The last `suspend s0:` / `step NN` line in pstore names the place. From the devices level up, the watchdog is kept armed at 60 s. | WDT reset → shim bounce → Lineage. |
-| Serial stops at S0c `devices` and never resumes | dwc3 did not come back after resume. | Read pstore after return. The 120 s restart still runs. |
+| Serial stops at S0c `devices` and is still gone ~10 s after S0d | The host did not enumerate the gadget again. Expected between `devices` and a few seconds after `core`/S0d (r2: back within ~8 s of `core`). Check the `crownlte system resume done` lines in pstore: DCTL bit 31 clear or DSTS bit 22 set points at dwc3. | Read pstore after return. The 120 s restart still runs. |
 
 ## 7. Recovery path
 
@@ -389,9 +437,13 @@ in particular the four wakeup masks, IDLE_IP_MASK0..3, CPU_INFORM0..7 and
 the INTR_GEN GRP1/GRP4 enable registers, whose 4.9 evidence is weaker
 (below). S0b also ran the dying-CPU INTR_GEN GRP2 CLEAR write and the
 CPU STATUS poll on every core-off (140 single, 5 cluster, 25 group
-cycles). Not run on hardware yet: the syscore writes of the
-wakeup masks and IDLE_IP_MASK, and the CAL system tables (S0c `core`,
-S0d).
+cycles). The r2 S0 run (pack `03198f44`, 2026-11-07 01:59) then ran the
+syscore writes of the wakeup masks and IDLE_IP_MASK and the CAL system
+tables (`cal_pm_enter_unarmed(8)` with the ~1100-entry `save_sleep` list,
+`cal_pm_exit(8)` with the DRCG enables, PAD_RETENTION release and restore)
+once, in S0c `core`, without an abort, a stall or a lost CPU. Every mask
+read back as written except 0x610 bit 12 (fix round 3). Not run on
+hardware yet: `cal_pm_earlywakeup(8)` (S0d).
 
 Rule: the driver touches a register directly only if the 4.9 kernel
 running on 9810 reaches that register by plain non-secure MMIO. 4.9
@@ -427,7 +479,7 @@ given in full; `T/` = `cal-if/exynos9810/`; `DTS` =
 | PMU 0x0500 RESET_SEQUENCER_CONFIGURATION | R (DFD check) | `exynos-reboot.c:137,144,164,191,293` R |
 | PMU 0x0600 WAKEUP_STAT | R | `exynos-pm.c:216` R |
 | PMU 0x060c EINT_WAKEUP_MASK | R | `exynos-pm.c:92` R; `exynos-powermode.c:639` W |
-| PMU 0x0610 / 0x0614 / 0x0618 / 0x0644 wakeup masks | R (snapshot, step 20 log); W the DT SYS_SLEEP values (syscore suspend, resume and undo; never a read-back value) | `exynos-powermode.c:642` W, offsets DTS:4918,4923,4928,4933 (SYS_SLEEP column `0xd00f7e7e 0xffff00ff 0xffff00ff 0`); 4.9 writes them in `exynos_prepare_sys_powerdown()` `:646-653` and never restores them. 4.9 only writes them; it reads 0x600, 0x60c and 0x640 of the same group. **Read proven on HW:** r1 S0ab `0b956baa` read `0x0 0xffff00ff 0xffff00ff 0x0` without a fault. |
+| PMU 0x0610 / 0x0614 / 0x0618 / 0x0644 wakeup masks | R (snapshot, step 20 log); W the DT SYS_SLEEP values (syscore suspend, resume and undo; never a read-back value). **Write proven on HW** (r2 S0 `03198f44`): read back `0xd00f6e7e 0xffff00ff 0xffff00ff 0x0` after writing `0xd00f7e7e 0xffff00ff 0xffff00ff 0`; 0x610 bit 12 is not writable. | `exynos-powermode.c:642` W, offsets DTS:4918,4923,4928,4933 (SYS_SLEEP column `0xd00f7e7e 0xffff00ff 0xffff00ff 0`); 4.9 writes them in `exynos_prepare_sys_powerdown()` `:646-653` and never restores them. 4.9 only writes them; it reads 0x600, 0x60c and 0x640 of the same group. **Read proven on HW:** r1 S0ab `0b956baa` read `0x0 0xffff00ff 0xffff00ff 0x0` without a fault. |
 | PMU 0x0640 WAKEUP_STAT2 | R | `exynos-pm.c:131` R (`extra_wakeup_stat`, DTS:4884 = 1600 = 0x640) |
 | PMU 0x0860-0x087c CPU_INFORM0..7 | R | `cal-if/pmucal_powermode.c:26,35` W (`T/flexpmu_cal_powermode_exynos9810.h:2-9`). 4.9 only writes it. **Read proven on HW:** r1 S0ab `0b956baa` read `0x0 0x10000 0x10000 0x0 0x0 0x0 0x0 0x0` at boot, and again in every S0b snapshot, without a fault; the 6.12 `drivers/cpuidle/cpuidle-exynos9810.c:911,1059` C2 diagnostics also read it. |
 | PMU 0x0880 FLEXPMU_INFORM | R | `exynos-pm.c:383,644` R |
@@ -560,3 +612,92 @@ Residual risks (fix round 2):
   if it passes while suspended.
 - Fix round 1 residuals still apply, except the first one, which the
   hardware reads have resolved.
+
+### Fix round 3 (2026-11-07): commits `da17e083a`, `ee215e307`
+
+Input: the r2 S0 hardware run (pack `03198f44`, 2026-11-07 01:59, capture
+240 s; serial `serial-ready.bin`, pstore `first-return-pmsg.bin` in
+`C:\Users\Patrick\tools\trial-acpm-suspend-s0-r2-20261107`).
+
+Hardware result (S0 r2):
+
+| Stage | Result |
+|---|---|
+| S0a | PASS |
+| S0b | PASS: single 140/140, cluster 5/5, groups 25/25 in 17127 ms, 0 CPU_DEAD polls saw the core still powered |
+| S0c freezer | PASS, 5006 ms |
+| S0c devices | PASS, 5037 ms. Watchdog `suspend: kept armed, timeout 60 s, WTCON 0xb939`, `resume: armed, timeout 30 s, WTCON 0x5c39`. |
+| S0c platform | PASS, 5022 ms |
+| S0c processors | PASS, 5058 ms. All 7 non-boot CPUs down and up again. |
+| S0c core | Ran and resumed: step 20 syscore suspend, `cal_pm_enter_unarmed(8) ok` (GRP2 en `0xef`, cpu0 bit 0: hand-off withheld), 5 s, step 50 `syscore resume exit ok (ret 0/0)` (INFORM0 0x0, PAD_RET all 1, WAKEUP_STAT 0/0, cpu0 GRP2 latched in window=0), 8/8 CPUs, no hang. **FAIL** only on `changed wakeup mask[0]: 0xd00f7e7e -> 0xd00f6e7e` → `PMU state not restored`. |
+| S0d | Not run (S0c failed) |
+| Restart | Normal PID1 restart at 120 s (RPON, `rst_stat=0x20000000`), back on 4.9, RECOVERY restored. PMIC selftest at 107 s: 0 errors, 0 writes. |
+
+| Finding | Fix |
+|---|---|
+| HW: 0x610 written `0xd00f7e7e` reads `0xd00f6e7e`, at step 20 and after resume. Bit 12 is not writable. 0x614/0x618/0x644 read back exactly what was written. 4.9 never reads these registers back: `exynos_set_wakeupmask()` (`exynos-powermode.c:633-643`) only writes, and no 4.9 path compares them, so 4.9 never saw this. | `da17e083a`: per-offset read-only bits (`E9810_WMASK_610_RO` = bit 12 of 0x610, nothing else). The check compares only the other bits, both against the software-owned values and, before the first write, read against read. The driver still writes the 4.9 value, and the logs print the raw register value with the read-only bits named. Any other changed bit still fails the stage. |
+| USB: the serial log seemed to stop at the `core` level and the host port seemed never to come back before the 120 s restart. | **No USB defect.** The link came back by itself within ~8 s of `core` and stayed up until the 120 s restart (evidence below). `ee215e307` adds a read-only dwc3 state line per system suspend and resume, so the next run shows it directly. `ready-capture.ps1` now logs every reconnect. |
+
+USB analysis:
+
+- `serial-ready.bin` holds the log twice. The first copy ends at 42.146 s,
+  where the `devices` level suspends dwc3. The second copy is PID1's
+  full resend after a reopen (PID1 logged `serial write errno=5 ...
+  closing serial endpoint` at 47.18 s, reopened ttyGS0 and starts again
+  from byte 0 of its cache). It runs on, live, to 110.5 s: the PID1
+  heartbeats at 64.98, 80.0, 95.0 and 110.1 s appear as direct ttyGS0
+  writes interleaved in order with the forwarded kernel log. The 64.98 s
+  direct line comes after the forwarded records up to 62.44 s, so the
+  host was draining the port by then. The pmic selftest (107.5 s) is in
+  it as well.
+- `capture.log` logs failed opens only, never a successful open. That is
+  why the reconnect was missed. Retry counts give the same timeline:
+  29 failures in 24.8 s before READY (~0.86 s each); 22 failures after
+  the first drop put the reopen at about 61 s boot time; the second drop
+  is the 120 s restart.
+- The link did not "stay up" at `devices`, `platform` and `processors`
+  either. It dropped at `devices` and stayed away until after `core`.
+  The levels follow each other within 6-30 ms, far less than the host
+  needs to enumerate the gadget again. `core` was simply the first level
+  followed by a long enough gap.
+- Nothing in the `core` path touches dwc3 after dwc3 resumes. The CAL
+  `save_sleep` list (byte-identical to 4.9) holds the CMU_FSYS0 USB
+  registers (QCH_CON_USB30DRD_* 0x11000000+0x304c..0x3058, the
+  USB30DRD/USBDP_DEBUG user muxes 0x1e0/0x240, DMYQCH 0x3000). They are
+  saved and restored inside syscore while dwc3 is already suspended,
+  with the values saved milliseconds earlier. dwc3 resumes later, in the
+  device phase (`dwc3_resume_common()`: core soft reset and init, gadget
+  resume with run/stop). The PHY dump at that resume (57.30 s) is
+  identical to the ones after `devices`, `platform` and `processors`
+  (`pmu72c=1 pmu704=1`, `utmi` 0x33 → 0x30, `linkctrl` 0x53ef0 → 0x53ff0).
+- The 4.9 `save_sleep_usbl2` / `enter_sleep_usbl2` tables (USB L2 sleep
+  with the link kept) are not used: mode 8 is plain SYS_SLEEP, as in 4.9
+  without a USB host session.
+
+The dwc3 line (`ee215e307`) reads DCTL, DSTS, GCTL and DEVTEN with the
+driver's own accessor, only in the crownlte diagnostic build, only in
+device mode, only for system suspend/resume and never while the device
+is runtime suspended. It changes no register.
+
+Build: `config-suspend-s0-ee215e307` (identical to
+`config-suspend-s0-f6d389d19`), clang 18, `-j3`. `W=1` on
+`exynos9810-pm.o` and `dwc3/core.o` gave no warnings. `exynos9810-pm.o`
+still has no `smc`/`hvc` instruction, no PSCI symbol, no
+`smp_call_function_single` and no `cal_pm_enter` reference. The DTS did
+not change; both rebuilt DTBs are byte-identical to the r2 ones. Packs as
+before (`pack-acpm-q-paths.py`, shim `bbea959`, ramdisk `506232b1`,
+parent `a8198be0`); the shim worktrees were removed. Artifacts in §3. The
+r2 packs were deleted on gekko (PC copies exist).
+
+Residual risks (fix round 3):
+
+- The read-only-bit list rests on one run. If another wakeup-mask bit
+  turns out not to hold a written value, the signature is the same
+  `changed wakeup mask` FAIL without a hang.
+- `cal_pm_earlywakeup(8)` (S0d) has not run on hardware yet. It is a
+  shorter sequence than `cal_pm_exit(8)`, which has.
+- Each dwc3 diagnostic line adds four MMIO reads to the dwc3 system
+  suspend and resume paths, on a controller whose core is initialised at
+  that point. The upstream code next to them reads the same block.
+- Earlier residuals still apply, except the first fix round 2 one: the
+  syscore mask writes have now run on hardware.
