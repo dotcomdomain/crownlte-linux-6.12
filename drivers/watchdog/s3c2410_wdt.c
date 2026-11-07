@@ -33,6 +33,8 @@
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
 
+#include <soc/samsung/crownlte-wdt.h>
+
 #define S3C2410_WTCON		0x00
 #define S3C2410_WTDAT		0x04
 #define S3C2410_WTCNT		0x08
@@ -251,7 +253,29 @@ struct s3c2410_wdt {
 	/* Restart in progress: armed with a short timeout, no longer petted */
 	struct notifier_block	reboot_nb;
 	bool			reboot_pending;
+	/*
+	 * DT samsung,keep-armed-in-suspend (guarded variants only): system
+	 * suspend leaves the watchdog running with a longer timeout instead
+	 * of stopping it, so the noirq/syscore/firmware part of a suspend that
+	 * hangs still ends in a reset. resume_timeout is the run-time timeout
+	 * restored on resume.
+	 */
+	bool			keep_armed_suspend;
+	bool			suspended_armed;
+	unsigned int		resume_timeout;
+	/* Petting stopped for good by s3c2410wdt_crownlte_stop_petting() */
+	bool			pet_stopped;
 };
+
+/* Suspend-time timeout with samsung,keep-armed-in-suspend (capped at max) */
+#define S3C2410_WDT_SUSPEND_TIMEOUT	60
+
+/*
+ * The one guarded (SBOOT reset guard) instance, for crownlte-wdt.h.
+ * Published with smp_store_release() once probe has set it up; the
+ * hooks read it with smp_load_acquire() and see a complete instance.
+ */
+static struct s3c2410_wdt *s3c2410wdt_crownlte;
 
 static const struct s3c2410_wdt_variant drv_data_s3c2410 = {
 	.quirks = 0
@@ -523,7 +547,7 @@ static int s3c2410wdt_keepalive(struct watchdog_device *wdd)
 
 	spin_lock_irqsave(&wdt->lock, flags);
 	/* The opt-in selftest deliberately stops petting to prove expiry. */
-	if (!wdt->reboot_pending && !wdt->selftest_stopped)
+	if (!wdt->reboot_pending && !wdt->selftest_stopped && !wdt->pet_stopped)
 		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
 	spin_unlock_irqrestore(&wdt->lock, flags);
 
@@ -1028,6 +1052,78 @@ static int s3c2410wdt_selftest_setup(struct s3c2410_wdt *wdt)
 static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 				    unsigned long action, void *data);
 
+static void s3c2410wdt_crownlte_clear(void *data)
+{
+	if (READ_ONCE(s3c2410wdt_crownlte) == data)
+		WRITE_ONCE(s3c2410wdt_crownlte, NULL);
+}
+
+/*
+ * crownlte-wdt.h: hooks for the crownlte suspend driver
+ * (drivers/soc/samsung/exynos9810-pm.c). Only the guarded instance is
+ * served; every call is safe from any context, including hardirq and
+ * syscore with interrupts off.
+ */
+
+/* Reload the counter now (e.g. right before the firmware sleep call). */
+int s3c2410wdt_crownlte_ping(void)
+{
+	struct s3c2410_wdt *wdt = smp_load_acquire(&s3c2410wdt_crownlte);
+
+	if (!wdt)
+		return -ENODEV;
+	if (!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
+		return -EIO;
+	s3c2410wdt_keepalive(&wdt->wdt_device);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_ping);
+
+/*
+ * Stop petting for good, so the running watchdog resets the SoC within its
+ * current timeout. For a hang the kernel can see but not undo (a CPU lost
+ * while online): other CPUs would otherwise keep petting forever. Returns
+ * the timeout in seconds, or a negative error if nothing is armed.
+ */
+int s3c2410wdt_crownlte_stop_petting(const char *why)
+{
+	struct s3c2410_wdt *wdt = smp_load_acquire(&s3c2410wdt_crownlte);
+	unsigned long flags;
+
+	if (!wdt)
+		return -ENODEV;
+	if (!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
+		return -EIO;
+	spin_lock_irqsave(&wdt->lock, flags);
+	writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	wdt->pet_stopped = true;
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	pr_emerg("s3c2410-wdt: petting stopped for good (%s): SoC reset in about %u s\n",
+		 why, wdt->wdt_device.timeout);
+	return wdt->wdt_device.timeout;
+}
+EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_stop_petting);
+
+/* WTCON/WTDAT/WTCNT snapshot for logs; false if no guarded instance. */
+bool s3c2410wdt_crownlte_state(struct crownlte_wdt_state *st)
+{
+	struct s3c2410_wdt *wdt = smp_load_acquire(&s3c2410wdt_crownlte);
+
+	if (!wdt)
+		return false;
+	st->wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	st->wtdat = readl(wdt->reg_base + S3C2410_WTDAT);
+	st->wtcnt = readl(wdt->reg_base + S3C2410_WTCNT);
+	st->timeout = wdt->wdt_device.timeout;
+	st->enabled = !!(st->wtcon & S3C2410_WTCON_ENABLE);
+	st->reset = !!(st->wtcon & S3C2410_WTCON_RSTEN);
+	st->keep_armed_suspend = wdt->keep_armed_suspend;
+	st->pet_stopped = wdt->pet_stopped || wdt->reboot_pending ||
+			  wdt->selftest_stopped;
+	return true;
+}
+EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_state);
+
 static int s3c2410wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1190,6 +1286,17 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 		ret = s3c2410wdt_selftest_setup(wdt);
 		if (ret)
 			return ret;
+		wdt->keep_armed_suspend = of_property_read_bool(dev->of_node,
+						"samsung,keep-armed-in-suspend");
+		if (wdt->keep_armed_suspend)
+			dev_info(dev, "system suspend keeps it armed (timeout %u s while suspended)\n",
+				 min_t(unsigned int, S3C2410_WDT_SUSPEND_TIMEOUT,
+				       wdt->wdt_device.max_timeout));
+		ret = devm_add_action_or_reset(dev, s3c2410wdt_crownlte_clear,
+					       wdt);
+		if (ret)
+			return ret;
+		smp_store_release(&s3c2410wdt_crownlte, wdt);
 	}
 
 	return 0;
@@ -1246,6 +1353,32 @@ static int s3c2410wdt_suspend(struct device *dev)
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
 
+	/*
+	 * samsung,keep-armed-in-suspend: stay armed with the reset enabled and
+	 * a longer timeout. The PMU reset mask is left as it is. If the
+	 * firmware really stops the counter clock in system sleep, a resume
+	 * re-initializes it (see resume).
+	 */
+	wdt->suspended_armed = false;
+	if (wdt->keep_armed_suspend &&
+	    (readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE)) {
+		unsigned int t = min_t(unsigned int, S3C2410_WDT_SUSPEND_TIMEOUT,
+				       wdt->wdt_device.max_timeout);
+
+		wdt->resume_timeout = wdt->wdt_device.timeout;
+		ret = s3c2410wdt_set_heartbeat(&wdt->wdt_device, t);
+		if (!ret) {
+			s3c2410wdt_keepalive(&wdt->wdt_device);
+			wdt->suspended_armed = true;
+			dev_info(dev, "suspend: kept armed, timeout %u s, WTCON %#x\n",
+				 wdt->wdt_device.timeout,
+				 readl(wdt->reg_base + S3C2410_WTCON));
+			return 0;
+		}
+		dev_warn(dev, "suspend: keep-armed timeout %u s failed (%d), stopping as usual\n",
+			 t, ret);
+	}
+
 	/* Save watchdog state, and turn it off. */
 	wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);
 	wdt->wtdat_save = readl(wdt->reg_base + S3C2410_WTDAT);
@@ -1264,6 +1397,32 @@ static int s3c2410wdt_resume(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
+
+	if (wdt->suspended_armed) {
+		u32 wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+
+		wdt->suspended_armed = false;
+		/*
+		 * Still running: back to the run-time timeout. Lost (the block
+		 * was reset): start it again, as the boot-time start did.
+		 */
+		if (!(wtcon & S3C2410_WTCON_ENABLE) ||
+		    !(wtcon & S3C2410_WTCON_RSTEN)) {
+			dev_warn(dev, "resume: found WTCON %#x after a kept-armed suspend; restarting\n",
+				 wtcon);
+			s3c2410wdt_set_heartbeat(&wdt->wdt_device,
+						 wdt->resume_timeout);
+			s3c2410wdt_start(&wdt->wdt_device);
+		} else {
+			s3c2410wdt_set_heartbeat(&wdt->wdt_device,
+						 wdt->resume_timeout);
+			s3c2410wdt_keepalive(&wdt->wdt_device);
+		}
+		dev_info(dev, "resume: armed, timeout %u s, WTCON %#x\n",
+			 wdt->wdt_device.timeout,
+			 readl(wdt->reg_base + S3C2410_WTCON));
+		return 0;
+	}
 
 	/* Restore watchdog state. */
 	writel(wdt->wtdat_save, wdt->reg_base + S3C2410_WTDAT);
