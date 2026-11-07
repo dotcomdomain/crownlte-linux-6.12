@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Audio stage A1 (Documentation/crownlte/audio-a1.md, gekko
+ * roadmap/audio-design.md section 5): read-only probe of the audio
+ * hardware at ~30 s ("audio selftest A1:"), before the PMIC read-only
+ * snapshot at ~106 s and the delayed-UFS PID1 restart at 120 s.
+ *
+ * Changes against the delayed-UFS diagnostic DTB:
+ *  - HSI2C18 (USI07, the MAX98512 bus) enabled with no child: the amp
+ *    driver is never bound; the self-test reads 7 whitelisted registers
+ *    on 0x39 and 0x3a with plain register-address + read transactions;
+ *  - the audio-a1 node: PMU, GPIO and PMIC (ACPM, read-only policy) reads;
+ *    ABOX SFR, SYSREG_AUD, ABOX SysMMU and pinctrl_aud only when
+ *    AUD_STATUS reads 0xf and the watchdog deadline is armed;
+ *  - every other self-test removed (as in the suspend S0 DTB), except the
+ *    read-only PMIC snapshot. The PMIC write policy stays sealed empty.
+ * No codec (SPI) node, no ABOX node, no pd-aud power control.
+ * UFS stays unbound (never send CROWNLTE-UFS-PROBE-1).
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 audio A1 read-only diagnostic";
+};
+
+&usi_amp {
+	status = "okay";
+};
+
+&hsi2c_amp {
+	status = "okay";
+};
+
+&soc {
+	/*
+	 * Fixed windows, mapped without claiming them (their owners keep
+	 * their regions). The last four lie inside pd-aud and are read only
+	 * while PMU AUD_STATUS[3:0] == 0xf.
+	 */
+	audio_a1: audio-a1@14050000 {
+		compatible = "samsung,exynos9810-audio-a1";
+		reg = <0x14050000 0x100>,	/* pinctrl_alive: gpa2 */
+		      <0x10430000 0x100>,	/* pinctrl_peric0: gpp0, gpg1 */
+		      <0x10830000 0x100>,	/* pinctrl_peric1: gpp4 */
+		      <0x14220000 0x100>,	/* pinctrl_cmgp: gpm2, gpm3 */
+		      <0x1041100c 0x4>,		/* PERIC0 SYSREG USI01 SW_CONF */
+		      <0x17c60000 0x60>,	/* pd-aud: pinctrl_aud gpb0..2 */
+		      <0x17c1032c 0x4>,		/* pd-aud: SYSREG_AUD MISC_CON */
+		      <0x17c50000 0x20>,	/* pd-aud: ABOX SFR */
+		      <0x17e00000 0x40>;	/* pd-aud: ABOX SysMMU */
+		reg-names = "pinctrl-alive", "pinctrl-peric0", "pinctrl-peric1",
+			    "pinctrl-cmgp", "usi01-swconf", "pinctrl-aud",
+			    "sysreg-aud-misc", "abox-sfr", "sysmmu-abox";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,pmic = <&s2mps18_pmic>;
+		samsung,amp-i2c-bus = <&hsi2c_amp>;
+		samsung,audio-a1-selftest-ms = <30000>;
+		/* still up 25 s after the 120 s restart: stop petting, WDT resets */
+		samsung,audio-a1-deadline-ms = <145000>;
+		status = "okay";
+	};
+};
+
+/* No C2 is armed. */
+&cpuidle {
+	/delete-property/ samsung,cpuidle-selftest;
+};
+
+&mct {
+	/delete-property/ samsung,mct-bc-report;
+};
+
+&legacy_devfreq_mif {
+	/delete-property/ samsung,devfreq-selftest;
+};
+
+&acpm_tmu {
+	/delete-property/ samsung,tmu-selftest;
+};
+
+&{/cpufreq} {
+	/delete-property/ samsung,cpufreq-selftest;
+};
+
+&decon_handover {
+	/delete-property/ samsung,display-selftest;
+};
+
+&gpu {
+	status = "disabled";
+};
+
+&max77705_battery {
+	/delete-property/ samsung,selftest-ms;
+	/delete-property/ samsung,adc-selftest-ms;
+};
+
+&adc {
+	/delete-property/ samsung,adc-selftest-ms;
+};

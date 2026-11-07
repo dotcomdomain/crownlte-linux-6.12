@@ -214,3 +214,60 @@
 		};
 	};
 };
+
+/*
+ * Amplifier bus: PERIC1 USI07 as HSI2C (4.9 alias hsi2c18 = hsi2c@108C0000,
+ * SPI 430, pins gpp4-4/gpp4-5 function 2 no pull, clocks rate 275 = USI07
+ * and gate 251 = GATE_USI07, 4.9 default fast mode 400 kHz). The USI07
+ * protocol selector is PERIC1 SYSREG +0x1024 (4.9 usi@10811024 usi_v2_mode
+ * "i2c"). 4.9 children: max98512@39 (left, earpiece in receiver mode) with
+ * maxim,sub_reg = 0x3a (right, bottom speaker).
+ * No child node here on purpose: the MAX98512 driver writes boost,
+ * brownout and gain registers at probe (audio-design.md 4.1); the amps
+ * stay unbound until stage A6 [owner gates G3/G4]. Disabled; the audio A1
+ * DTB enables the bus for read-only register reads.
+ */
+&pinctrl_peric1 {
+	hsi2c18_bus: hsi2c18-bus-pins {
+		samsung,pins = "gpp4-4", "gpp4-5";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <0>;
+		samsung,pin-drv = <0>;
+	};
+};
+
+&soc {
+	usi_peric1_07_sysreg: syscon@10811024 {
+		compatible = "samsung,exynos9810-peric1-usi-sysreg", "syscon";
+		reg = <0x10811024 0x4>;
+	};
+
+	usi_amp: usi@108c00c0 {
+		compatible = "samsung,exynos9810-usi";
+		/* Wrapper owns +0xc4/+0xc8; the HSI2C below owns [0, 0xc0). */
+		reg = <0x108c00c0 0x20>;
+		clocks = <&legacy_cmu GATE_USI07>, <&legacy_cmu USI07>;
+		clock-names = "pclk", "ipclk";
+		samsung,sysreg = <&usi_peric1_07_sysreg 0>;
+		samsung,mode = <USI_V2_I2C>;
+		samsung,clkreq-on;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		status = "disabled";
+
+		hsi2c_amp: i2c@108c0000 {
+			compatible = "samsung,exynos9810-hsi2c";
+			reg = <0x108c0000 0xc0>;
+			interrupts = <GIC_SPI 430 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			clocks = <&legacy_cmu USI07>, <&legacy_cmu GATE_USI07>;
+			clock-names = "hsi2c", "hsi2c_pclk";
+			clock-frequency = <400000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&hsi2c18_bus>;
+			status = "disabled";
+		};
+	};
+};
