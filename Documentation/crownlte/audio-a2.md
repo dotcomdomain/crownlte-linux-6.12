@@ -3,7 +3,8 @@
 Design: gekko `roadmap/audio-design.md`, section 5 "A2" (also 1.1, 2 item 5,
 3.2, 6). Branch `crownlte-audio-a2`. Build only; not run on the phone yet.
 Sol R1 (CHANGES) fixed in fix round 1, Sol R2 (CHANGES) fixed in fix
-round 2 (section 13); not re-reviewed yet.
+round 2, Sol R3 (CHANGES) fixed in fix round 3 (section 13); fix round 3
+not re-reviewed yet.
 
 A2 boots the ABOX ("Calliope") audio DSP firmware in the DSP's own SRAM and
 in kernel DRAM buffers, waits for the firmware's "ready to sing" message,
@@ -198,22 +199,33 @@ A2 ends the boot in a full-SoC reset and keeps all of the above until it:
    path (the ramdisk's `reboot` at 600 s, every ROM-RAM trial so far)
    minus device shutdown:
    - on the reboot CPU (CPU0, as `migrate_to_reboot_cpu()`), via
-     `work_on_cpu()`;
-   - takes `system_transition_mutex` (waits at most 10 s for a running
-     `reboot(2)`, whose command notifier would otherwise clear the
-     prepared state), then the context lock;
-   - re-runs the read-only check, then `diagnostic_prepare()`: INFORM2 =
-     0x12345678, INFORM3 = 0x12345670 (normal boot, verified), the ACPM
-     STOP per the reset policy (best effort with
-     `EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET=y`, as configured);
+     `work_on_cpu()`; the CPU is chosen and the work runs under
+     `cpus_read_lock()` (fix round 3), so it cannot go offline in between;
+   - tries `system_transition_mutex` for at most 10 s (lets a running
+     `reboot(2)` finish; it ends in the same SWRESET) and goes on without
+     it. It never blocks on it, because that reboot's device shutdown can
+     be waiting in the A2 `.shutdown` for the A2 worker that called this;
+   - takes the context lock, re-runs the read-only check, then
+     `diagnostic_prepare_locked()`: INFORM2 = 0x12345678, INFORM3 =
+     0x12345670 (normal boot, verified), the ACPM STOP per the reset policy
+     (best effort with `EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET=y`, as
+     configured). The normal restart preparation takes the same lock, so
+     the two never interleave;
+   - publishes its own preparation, `emergency_prepared` (fix round 3).
+     Only this path writes it; the reboot callbacks of a concurrent
+     `reboot(2)` clear only the normal state (`prepared`,
+     `default_requested`), and this path no longer touches those;
    - then `emergency_restart()` → `machine_restart()` (IRQs off, other
-     CPUs stopped) → the priority-255 restart guard, which re-checks the
-     prerequisites and INFORM, runs the DFD preparation (a read-only no-op
-     because the check required the DFD dump off) and writes PMU
-     `SWRESET`. The guard returns `NOTIFY_STOP` in every case, so no other
+     CPUs stopped) → the priority-255 restart guard. The guard accepts
+     the emergency or the normal preparation, re-checks CAL and INFORM,
+     runs the DFD preparation (a read-only no-op because the check
+     required the DFD dump off) and writes PMU `SWRESET`. If a racing
+     `reboot(2)` with a non-default command reaches `machine_restart()`
+     first, the published emergency preparation still resets, to a normal
+     boot. The guard returns `NOTIFY_STOP` in every case, so no other
      restart handler runs.
    A bare `emergency_restart()` would not work: the guard refuses unless
-   the preparation ran (`physical reset required`).
+   one of the two preparations ran (`physical reset required`).
 3. Only if the diagnostic restart refuses before `emergency_restart()`
    (not ready any more): `orderly_reboot()`, which is not bounded.
 
@@ -260,6 +272,7 @@ child), S2MPS18 (no PMIC access at all), `/efs`, UAIF/DSIF pin mux,
 | 898a21307 | this doc |
 | 5b15c8ece | fix round 1: chip-ID RAM snapshot, unconfirmed stop keeps everything and ends via the watchdog, SUSPEND ack required (section 13) |
 | fb47f58fa | fix round 2: SysMMU never released in the boot, suspend refused; diagnostic restart emergency entry points (`exynos9810_diagnostic_restart_check()`, `exynos9810_diagnostic_emergency_restart()`, `include/soc/samsung/exynos9810-diagnostic-restart.h`) as the reset fallback; confirmed CPU-off at shutdown; Kconfig `EXYNOS9810_ABOX_A2` depends on `EXYNOS9810_DIAGNOSTIC_RESTART` (section 13) |
+| 867044c69 | fix round 3 (diagnostic restart only): independent emergency preparation accepted by the restart guard; reboot-CPU selection and dispatch under the CPU hotplug read lock (section 13) |
 
 DT bindings (A2 only, not upstream):
 - gate `samsung,exynos9810-abox-a2`: `samsung,pmu-syscon`, clocks
@@ -298,11 +311,11 @@ command reproduces the BT-B1 DTB bit for bit (adedcd7d). The `.dts` and
 
 | Item | Value |
 |---|---|
-| Image | `panel-bright-work/ko-audio-a2-fix2/arch/arm64/boot/Image` sha256 `ee87233c2549ce5dd9b2515ff973249c18b5275dc80fdf27b187ba83a84668ae` (built at fb47f58fa) |
-| config | `panel-bright-work/ko-audio-a2-fix2/config` sha256 `197e5ff61b9a4501b3608aaccda928b9915fa8800f0cac7fb650a77a34835eaa` (unchanged) |
-| DTB | `panel-bright-work/ko-audio-a2-fix2/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-audio-a2.dtb` sha256 `18fb1b412739d4b51b813f60ac4b668c1b56b8094c5c14c0bd77adfd698b2a3d` (unchanged) |
-| Pack | gekko `rom-ram/pack-romram-audio-a2-fix2/recovery.img` sha256 `9250fb9340a37b9d5a63e07796a5c9cd8477d584c58341bbc733ff6d4c0850e1` (68149248 bytes, mode 0600: the build-32 ramdisk contains the device MAC addresses; do not publish) |
-| loader | `ce8912f72c2822db342ba4b5964709f351ac45964b7bad3c975e5b46082e825d`, shim bbea959 |
+| Image | `panel-bright-work/ko-audio-a2-fix3/arch/arm64/boot/Image` sha256 `b21587c5c4ee5a97222437023dc3798ca7ce00860f1fc923df0d00eaf5806fb6` (built at 867044c69) |
+| config | `panel-bright-work/ko-audio-a2-fix3/config` sha256 `197e5ff61b9a4501b3608aaccda928b9915fa8800f0cac7fb650a77a34835eaa` (unchanged) |
+| DTB | `panel-bright-work/ko-audio-a2-fix3/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-audio-a2.dtb` sha256 `18fb1b412739d4b51b813f60ac4b668c1b56b8094c5c14c0bd77adfd698b2a3d` (unchanged) |
+| Pack | gekko `rom-ram/pack-romram-audio-a2-fix3/recovery.img` sha256 `5f1f36b6c89abe8e5cf1ee1e4681a1f9483fe1f8307e496673058d8b2b1f26f7` (68149248 bytes, mode 0600: the build-32 ramdisk contains the device MAC addresses; do not publish) |
+| loader | `43952bfe57a0ed83dd93c7f4df235bf04fedf8750e9e4ceb51a0e25e43022e92`, shim bbea959 |
 | ramdisk | `rom-ram/build-32/diagnostic-initramfs.cpio.gz` `82771399d5af1ff8afc6b575ef8edddd57d5ea5cc30db67084e7a05ec848f3fa` (romram-adb 46a3670, DEADLINE 600 s) |
 | parent / restore | `a8198be0...` / bright RECOVERY `8763860c...` |
 
@@ -315,7 +328,11 @@ Superseded packs, deleted on gekko (copies on the PC); do not run them:
   464b9cd3c, loader `586f1bde...`): the three Sol R1 defects;
 - `pack-romram-audio-a2-fix1` (`a83c16b7...`, Image `2a5e2035...` at
   5b15c8ece, loader `981d9252...`): the two Sol R2 defects (SysMMU
-  bypass after a CPU-off stop, unbounded `orderly_reboot()` fallback).
+  bypass after a CPU-off stop, unbounded `orderly_reboot()` fallback);
+- `pack-romram-audio-a2-fix2` (`9250fb93...`, Image `ee87233c...` at
+  fb47f58fa, loader `ce8912f7...`): the two Sol R3 defects (a concurrent
+  reboot could clear the emergency preparation before the guard read it;
+  reboot-CPU selection not protected against hotplug).
 
 ## 7. Running it
 
@@ -446,7 +463,7 @@ As in the other ROM-RAM trials:
   Down ~7-10 s), the shim bounces to Lineage, restore bright RECOVERY
   `8763860c` by hand.
 
-## 11. Risks (after fix round 2)
+## 11. Risks (after fix round 3)
 
 - **First non-secure access to SYSREG_AUD, ABOX SFR/SRAM/GIC and the ABOX
   SysMMU in 6.12.**
@@ -494,7 +511,19 @@ As in the other ROM-RAM trials:
   resort is `orderly_reboot()` (needs user space; the 600 s ramdisk
   reboot is the backstop), then the owner force restart. The emergency
   restart waits up to 10 s for a concurrent `reboot(2)`; in that case
-  both paths end in the same SWRESET.
+  both paths end in the same SWRESET. Since fix round 3 a concurrent
+  `reboot(2)` cannot withdraw the emergency preparation, and if it wins
+  the race to `machine_restart()` with a non-default command (e.g.
+  `reboot recovery`), the guard still resets, to a normal boot instead of
+  the requested mode. Remaining ways for the emergency reset to refuse
+  after its preparation: INFORM2/INFORM3 changed between preparation and
+  guard by another writer (none in this vehicle), CAL gone, or the DFD
+  preparation failing (DFD is required off). Then the CPU that reached
+  `machine_restart()` halts with IRQs off and only the owner force
+  restart helps (as before). The emergency work holds the CPU hotplug
+  read lock: a CPU hotplug operation started meanwhile waits up to
+  ~10 s plus the bounded STOP, or until the reset; nothing in the
+  vehicle hotplugs CPUs at that point.
 - **`fails: restart`**: A2 now refuses to start if the diagnostic restart
   is not ready (read-only check: context, CAL, chip revision,
   INFORM2/INFORM3 normal, DFD dump off). The guarded watchdog already
@@ -509,7 +538,9 @@ As in the other ROM-RAM trials:
   (deadline in the ping path, keep-armed suspend) now run in ROM-RAM for
   the first time. Without a deadline they behave as before.
   `exynos9810-pm` is not built.
-- Sol R1 and R2 fixed (section 13); fix round 2 not re-reviewed yet.
+- Sol R1, R2 and R3 fixed (section 13); fix round 3 not re-reviewed yet.
+  Neither the emergency path nor the round 3 changes have run on
+  hardware (the CL0 watchdog final stop comes first).
 
 ## 12. Plan after A2
 
@@ -568,3 +599,27 @@ bbea959, ramdisk build-32 (`82771399`), parent a8198be0; built in
 build, then moved to `rom-ram/pack-romram-audio-a2-fix2` (`9250fb93...`,
 loader `ce8912f7...`, section 6). The superseded
 `pack-romram-audio-a2-fix1` (`a83c16b7`) was deleted on gekko.
+
+### Fix round 3 (Sol R3 on 83901294b: CHANGES)
+
+Only `exynos9810-diagnostic-restart.c` (and its header comment) changed;
+the A2 driver is unchanged.
+
+| # | Sol finding | Fix | Commit |
+|---|---|---|---|
+| 1 | MEDIUM :269: a concurrent reboot can invalidate the emergency preparation. After 10 s the emergency path goes on without `system_transition_mutex`, and `diagnostic_context_lock` serialises neither `diagnostic_command()` nor the normal `diagnostic_prepare()`. A late reboot notifier can clear `prepared` after the emergency worker checked it and before the guard reads it; the guard then refuses SWRESET and arm64 `machine_restart()` halts for good | The emergency reset publishes its own state, `emergency_prepared` (`smp_store_release`), written only by the emergency worker under the context lock. Reboot callbacks (`diagnostic_command()`, `diagnostic_prepare()`) write only `prepared`/`default_requested`, and the emergency path no longer writes those. The guard allows SWRESET for emergency OR normal preparation and re-checks CAL, INFORM2/INFORM3 and DFD for both; with the emergency preparation published, a racing non-default restart command still resets, to a normal boot. The shared PMU/STOP part is `diagnostic_prepare_locked()`; the normal `diagnostic_prepare()` now takes the context lock around it, so the two preparations never interleave. The transition mutex is still only trylocked, 10 s at most, never waited on (`.shutdown` of A2 can wait for the caller) (3.2, stop-unconfirmed path, reset item 2) | 867044c69 |
+| 2 | MEDIUM :308: CPU selection is not protected against hotplug; `cpu_online()` then `work_on_cpu()` does not keep the CPU online | Selection and `work_on_cpu()` run under `cpus_read_lock()` (the `work_on_cpu_safe()` pattern with the selection inside). Deadlock analysis, also in the code comment: (a) a hotplug operation already running finishes first; no hotplug callback waits for the A2 worker or this driver; (b) a later one waits for the work (bounded) or the reset; (c) nothing in the work takes the hotplug lock again (msleep, trylock, context lock, `device_trylock`, ACPM `spin_trylock` IPC, `emergency_restart()`), so no recursive read with a queued writer; (d) `reboot(2)` takes no hotplug lock before device shutdown returns (`migrate_to_reboot_cpu()` comes after), and its chain restart → A2 `.shutdown` → A2 worker → emergency work meets only the bounded trylock; a hotplug writer holding `cpu_add_remove_lock` in between is bounded the same way; (e) suspend takes the transition mutex before the hotplug write lock (reverse order), again only against the trylock, and A2 refuses suspend after its test | 867044c69 |
+
+Build: same config (`197e5ff6`), `make ARCH=arm64 LLVM=-18 -j3 Image`,
+clang 18.1.3, in `/dev/shm/a2fix3-build` (unused AMD GPU register
+headers left out of the worktree for space; DRM is not configured);
+`exynos9810-diagnostic-restart.c` and `exynos9810-abox-a2.c` are clean
+with W=1, and the full build has only the existing bcmdhd warnings.
+Image `b21587c5...` at 867044c69; a `make Image` re-run on the committed
+tree rebuilt nothing (same hash). DTB unchanged (`18fb1b41`). Pack: same
+packer, shim bbea959, ramdisk build-32 (`82771399`), parent a8198be0;
+built in `/dev/shm`, the shim worktree and shim-out removed after the
+loader build (loader log identical to fix2 apart from the work dir),
+then moved to `rom-ram/pack-romram-audio-a2-fix3` (`5f1f36b6...`, loader
+`43952bfe...`, section 6). The superseded `pack-romram-audio-a2-fix2`
+(`9250fb93`) was deleted on gekko.
