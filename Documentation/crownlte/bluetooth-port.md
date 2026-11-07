@@ -1,7 +1,7 @@
 # crownlte Bluetooth on 6.12: stage B1 (BCM4361 BT over UART, rfkill)
 
-Status: B1-read ran on hardware once (2026-11-07 00:11, section 7); fix round 1 (section 8) is
-build-only, not run on the phone. Branch `crownlte-bt` on `crownlte-wifi` (15cebae03, Wi-Fi
+Status: B1-read ran on hardware once (2026-11-07 00:11, section 7); fix rounds 1 and 2 (section 8)
+are build-only, not run on the phone. Branch `crownlte-bt` on `crownlte-wifi` (15cebae03, Wi-Fi
 working on hardware), so Wi-Fi and BT are in one kernel. Design and evidence:
 `roadmap/bluetooth-design.md` on gekko (sections 1-5); this file covers what B1 implements, how
 to run the three trials and how to read their logs.
@@ -17,6 +17,7 @@ to run the three trials and how to read their logs.
 | d3a3b71c2 | self-test: a UART clock that cannot do 3 Mbaud no longer skips the 115200 HCI step (`stage=uart-3m` at the end) |
 | 28f292c33 | fix round 1 (section 8): full expander validation before/after every P0_7 write with an unsafe latch, BT_REG_ON state OFF/ON/ON (bootloader)/UNKNOWN, power cycle from ON (bootloader), ttySAC1 lookup, tty release order, PM/shutdown quiesce, no SYSREG reads |
 | 4a086cc3b | `exynos-usi`, DTS comments: hardware evidence for the wrapper readbacks, trial descriptions |
+| e57473e08 | fix round 2 (section 8): complete expander baseline required; no extension-register fallback |
 
 Hardware path (from 4.9, see the design): HCI on `uart@10840000` = ttySAC1 (SPI 422, gpq0-0..3
 RXD/TXD/RTS/CTS function 2 pull-up, 256-byte FIFO); BT_REG_ON = PCAL6524 P0_7 at 0x22 on
@@ -35,7 +36,8 @@ assert); BT_HOST_WAKE = gpa2-3 (EINT, high = chip has data).
   (`OFF`, `ON`, `ON (bootloader)`, `UNKNOWN`, plus ` unsafe` once latched):
   - probe writes nothing. P0_7 an output driven high (the bootloader leaves it so, section 7) and
     everything else sane (port 0 push-pull, P0_7 polarity not inverted, input level = output) ->
-    `ON (bootloader)`; driven low or an input -> `OFF`; expander unreadable/bound/insane ->
+    `ON (bootloader)`; driven low or an input -> `OFF`; expander bound/insane, or any register of
+    the baseline unreadable (one failed read is enough, also a transient one) ->
     `UNKNOWN` + unsafe (never written; BT_WAKE stays low, the driver never asserted power).
   - unblock from `OFF`: BT_WAKE=1, P0_7 output bit 1, P0_7 direction output (4.9 order), 100 ms
     (4.9), host-wake edge counting on -> `ON`. Unblock from `ON (bootloader)`: power cycle
@@ -69,13 +71,15 @@ register back. Instead:
 - No GPIO driver binds to the node (`compatible = "nxp,pcal6524"`, `CONFIG_GPIO_PCA953X` off). The
   BT driver looks up the I2C client by phandle (`samsung,bt-reg-on-expander`) and refuses to touch it
   if any driver is bound to it.
-- Probe reads every readable register once (baseline, below) and writes nothing. 4.9 drove
+- Probe reads every readable register once (baseline, below) and writes nothing. The baseline
+  must be complete: if any read fails, the expander is latched unsafe at probe and never written
+  (`expander 0-0022 reg 0xNN unreadable (<err>): no complete baseline, BT power disabled`). 4.9 drove
   BT_REG_ON low at probe right after its own full expander init; 6.12 does neither, the first
   rfkill block/unblock (or the B1-hci self-test) drives it low.
 - Every P0_7 write (rfkill on/off, power cycle, self-test, self-test cleanup) is
   validate -> record `UNKNOWN` -> write -> read back -> validate:
-  - validate = no driver bound; all registers of the dump read without error (the extension
-    registers too if they answered at probe); not one constant value (stuck bus); every
+  - validate = no driver bound; all registers of the dump read without error (no exceptions,
+    the PCAL6524 extensions included); not one constant value (stuck bus); every
     non-volatile register equal to the probe baseline; output/configuration port 0 equal to the
     tracked expected value (bit 7 ignored only while `UNKNOWN`); P0_7, if an output, reading the
     level it drives.
@@ -93,8 +97,9 @@ register back. Instead:
 Registers dumped (2 log lines): `in` 0x00-02, `out` 0x04-06, `pol` 0x08-0a, `cfg` 0x0c-0e, `drv`
 0x40-45, `latch` 0x48-4a, `pull_en` 0x4c-4e, `pull_sel` 0x50-52, `int_mask` 0x54-56, `int_stat`
 0x58-5a, `out_cfg` 0x5c, and the PCAL6524 extensions 4.9 never read: `int_edge` 0x60-65, `in_stat`
-0x6c-6e, `out_indcfg` 0x70-72, `debounce` 0x74-76 (all answered on hardware; `--` if they ever do
-not answer at probe, then they are left out of the comparison). Volatile, never compared: `in`,
+0x6c-6e, `out_indcfg` 0x70-72, `debounce` 0x74-76 (all answered on hardware;
+this board has a PCAL6524, so all are mandatory: a failed read is a
+transfer error, not an absent register, and latches unsafe like any other). Volatile, never compared: `in`,
 `int_stat`, `in_stat`. Reading the input ports clears a pending expander interrupt; nothing on
 6.12 uses that interrupt.
 
@@ -145,38 +150,42 @@ With `CONFIG_RFKILL=y`, cfg80211 also registers a wiphy rfkill (type wlan) when 
 
 ## 3. Artifacts
 
-gekko `/mnt/ssd/host-builds/kernel-upgrade/`, built from crownlte-bt 4a086cc3b (fix round 1; the
-documentation commit after it changes no built file). Config unchanged (same `.config` as the first
-build, e94d322e).
+gekko `/mnt/ssd/host-builds/kernel-upgrade/`, built from crownlte-bt e57473e08 (fix round 2; the
+documentation commit after it changes no built file), clean build (fresh `O=`), clang 18.1.3.
+Config unchanged (same `.config` as the first build, e94d322e).
 
 | file | sha256 |
 |---|---|
-| `panel-bright-work/ko-bt-b1-r1/Image` (25,053,192 B) | 34cbe71170bddcb1e2de3119ae5722451b531a29e8d8780c81092bf583de4f45 |
-| `panel-bright-work/ko-bt-b1-r1/config` | e94d322ef72eac75fc9507959106a001d47a35e199b5b42ecbe1bde77b5c30bc (unchanged) |
+| `panel-bright-work/ko-bt-b1-r2/Image` (25,053,192 B) | c08c45b8e246cd827c8ac4259be3c0e98ac346954f228a8eb092d49c95673c57 |
+| `panel-bright-work/ko-bt-b1-r2/config` | e94d322ef72eac75fc9507959106a001d47a35e199b5b42ecbe1bde77b5c30bc (unchanged) |
 | `.../exynos9810-crownlte-delayed-ufs-bt-diag.dtb` (B1-read) | 786eedbb9dfcc3ce6d9947e705ff7858e16e9a6d34e3555e0cf88c9baad2b8fa (unchanged) |
 | `.../exynos9810-crownlte-delayed-ufs-bt-hci-diag.dtb` (B1-hci) | 0be846a462f1403322e95f43521ef2478a96a978a2b3b22eaf6dd5efa5948027 (unchanged) |
 | `.../exynos9810-crownlte-romram-bt-b1.dtb` (B1-hal, unchanged) | adedcd7dff302ccd7f14400e061fcf8d71a3289b5b8e4f58b500edb124f559c5 |
 
-`panel-bright-work/ko-bt-b1-r1/` is in the `KO=` layout (Image, config,
-`arch/arm64/boot/dts/exynos/*.dtb`, SHA256SUMS); hard links `images/Image-bt-b1-r1-4a086cc3b`,
-`images/config-bt-b1-r1-4a086cc3b`. The DTS sources changed only in comments; the two diag DTBs are bit-identical to the first round. The ROM-RAM
+`panel-bright-work/ko-bt-b1-r2/` is in the `KO=` layout (Image, config,
+`arch/arm64/boot/dts/exynos/*.dtb`, SHA256SUMS); hard links `images/Image-bt-b1-r2-e57473e08`,
+`images/config-bt-b1-r2-e57473e08`. Both diag DTBs are bit-identical to rounds 0 and 1. The ROM-RAM
 DTB is the one from the first round (`panel-bright-work/dtb/`, `romram-bt-b1-gen.py`:
-`romram-wifi-s1` DTS plus exactly the BT nodes, no-power BT self-test at 40 s).
+`romram-wifi-s1` DTS plus exactly the BT nodes, no-power BT self-test at 40 s). Kernel footprint
+`_end - _text` = 0x18c0000 (unchanged).
 
 Packed trials (all with shim bbea9590, parent RECOVERY a8198be0, restore RECOVERY 8763860c; each
 directory has `PROVENANCE.txt`, because the delayed-UFS packer writes a fixed purpose/kernel_source
-into `manifest.json`):
+into `manifest.json`; the shim worktrees and `shim-out` were removed after packing):
 
 | trial | directory | DTB | ramdisk | recovery.img sha256 |
 |---|---|---|---|---|
-| B1-read | `bt-b1-read-r1-20261107` | delayed-ufs-bt-diag | delayed-UFS 506232b1 | 8e70229f1ead59de66c7d106f4519fba3193f5809b6e1bd2a1b74285562b4878 |
-| B1-hci | `bt-b1-hci-r1-20261107` | delayed-ufs-bt-hci-diag | delayed-UFS 506232b1 | 142e9e02c3ab775571dd785672710a6b8178577172d24f78d944c1c4951de901 |
-| B1-hal | `rom-ram/pack-romram-bt-b1-hal-r1` | romram-bt-b1 | build-30 e615cc8d (ADB, early DONE) | 4da04c783c7af73377f3d9c6d105b912adaf04b205e430eb15a56ce9c07e057b |
+| B1-read | `bt-b1-read-r2-20261107` | delayed-ufs-bt-diag | delayed-UFS 506232b1 | 75befc417b0c040b4639fcf792a7a868605e626f18c5c9c3134c64e91e58d73e |
+| B1-hci | `bt-b1-hci-r2-20261107` | delayed-ufs-bt-hci-diag | delayed-UFS 506232b1 | b966a225b57d500b645b3fc99c94cfb4f635fffcb991924eccf29b75483e68a0 |
+| B1-hal | `rom-ram/pack-romram-bt-b1-hal-r2` | romram-bt-b1 | build-30 e615cc8d (ADB, early DONE) | 5cd59700ae61c361297456ccee39d6b1f4e81a84f337272873d3d0f3409c391b |
 
-The first-round packs (`bt-b1-read-20261107` 218efc06, `bt-b1-hci-20261107` e9dc9073,
-`rom-ram/pack-romram-bt-b1-hal` f458213d) and `panel-bright-work/ko-bt-b1` were deleted on gekko
-(copies on the PC). Do not run the old B1-hci or B1-hal packs: that driver refuses power (taint)
-and lacks the fixes.
+Superseded and deleted on gekko (copies on the PC): first-round packs (`bt-b1-read-20261107`
+218efc06, `bt-b1-hci-20261107` e9dc9073, `rom-ram/pack-romram-bt-b1-hal` f458213d,
+`panel-bright-work/ko-bt-b1`) and round-1 packs (`bt-b1-read-r1-20261107` 8e70229f,
+`bt-b1-hci-r1-20261107` 142e9e02, `rom-ram/pack-romram-bt-b1-hal-r1` 4da04c78; Image 34cbe711 in
+`panel-bright-work/ko-bt-b1-r1` is still on gekko). Run only the r2 packs: the first-round driver
+refuses power and lacks the fixes; the round-1 driver weakens validation after a failed
+extension-register read at probe.
 
 ## 4. Trials, expected lines, failure signatures
 
@@ -219,10 +228,12 @@ The probe dump should equal the 2026-11-07 one (section 7); any other value ther
 before B1-hci (bootloader variation or a reset expander).
 
 Failure signatures:
-- `expander N-0022 unreadable (-6): BT power disabled` (NACK) + `exp_reset ... level=0`: expander held
+- `expander N-0022 reg 0x00 unreadable (-6): no complete baseline, BT power disabled` (NACK) +
+  `exp_reset ... level=0`: expander held
   in reset by gpg3-6 (design risk 2). Do nothing; report. Releasing reset would return all 24 pins
   to inputs (NFC VEN, wpc_en, DP switch): owner decision.
-- `unreadable (-110)` or `-5` / i2c timeouts without NACK, or `exynos5-hsi2c ... 9810 timing` missing
+- `reg 0xNN unreadable (-110)` or `-5` / i2c timeouts without NACK (any register, the extensions
+  0x60-0x76 included: no complete baseline, nothing is written), or `exynos5-hsi2c ... 9810 timing` missing
   or `-EINVAL`: bus / clock problem.
 - `deferred probe pending: ... expander i2c client not yet registered`: the I2C adapter never came up
   (look for `USIv2 configuration readback failed` on 109300c0 or hsi2c probe errors).
@@ -286,7 +297,7 @@ Failure signatures:
 
 ### B1-hal (ROM-in-RAM + adb, Wi-Fi present, real vendor HAL)
 
-`rom-ram/pack-romram-bt-b1-hal-r1`, READY -> PROBE -> START, adb as in the Wi-Fi trial (wifi-adb2).
+`rom-ram/pack-romram-bt-b1-hal-r2`, READY -> PROBE -> START, adb as in the Wi-Fi trial (wifi-adb2).
 Kernel: the B1-read probe lines plus the Wi-Fi lines; at 40 s `bt selftest: ... RESULT
 PASS-NOPOWER` with `rfkill rfkill0 ...` (Wi-Fi's phy rfkill must be rfkill1); at 150 s the Wi-Fi
 self-test as before (it skips if userspace owns wlan0). If the HAL already unblocked BT before 40 s:
@@ -409,3 +420,12 @@ Reading:
 | M5 | `tty_kclose()` before restoring client ops (HAL open race, NULL deref) | release order: reception off, TX flush, close, flip buffers dropped, flip worker joined (`flush_work(&port->buf.work)` = `tty_buffer_flush_work()`), ops restored under the kopen, `tty_kclose()` last; same path on open failure |
 | M6 | partial power-on could leave the chip powered while software thinks off | state OFF/ON/ON (bootloader)/UNKNOWN; UNKNOWN recorded before the first write, replaced only by a validated result; BT_WAKE high while power may be asserted; logged in every failure line and in sysfs `bt_reg_on_state`; recovery = rfkill block -> validated power-off (one tolerated write transfer error per boot; unsafe latch otherwise) |
 | M7 | delayed self-test on `system_long_wq` not quiesced | `prepare`/`complete` and `shutdown`: cancel or abort+join the self-test, wait out an rfkill transition, reject transitions with `-EBUSY` while quiescing |
+
+### Round 2 (2026-11-07): Sol review R2 (CHANGES, one major)
+
+| Item | Problem | Fix |
+|---|---|---|
+| R2 major | A failed read of an extension register (0x60 and up) at probe set `baseline.ext_missing`, skipped the rest of the extensions and still gave a valid baseline; every later validation ignored all extension registers, so a change of `out_indcfg` or `debounce` went undetected while rfkill or the self-test kept writing the shared expander. Section 7 shows this PCAL6524 has them; a transfer error is not evidence of absence. | Fallback removed (`pcal_dump_group.ext`, `pcal_dump.ext_missing`): every register of `pcal_groups` is mandatory in every dump. Any read error at probe -> no baseline, expander latched unsafe, BT_REG_ON state `UNKNOWN`, nothing is ever written: `expander 0-0022 reg 0xNN unreadable (<err>): no complete baseline, BT power disabled` + `expander UNSAFE (baseline incomplete at probe, <err>)`. A stuck bus (one constant value) logs `reads one constant value`. Every validation reads and compares all registers. Dump failures name the register (`exp dump failed: reg 0xNN read error <err>`); a dump never taken prints `exp dump not taken`. |
+
+Build: clean (fresh `O=`, -j3), W=1 on the driver without warnings; config, both diag DTBs and the
+footprint unchanged. Artifacts and packs in section 3.
