@@ -86,6 +86,8 @@
  * device (the cpuidle probe runs first, link order) or offline are retried
  * every second for up to 60 s; an offline one is then armed when it comes
  * online.
+ * S2 (samsung,c2-little-local-timer): LITTLE C2 only on CPUs whose tick runs
+ * on their own MCT local timer, as on 4.9 (Documentation/crownlte/c2-s2.md).
  */
 
 #define pr_fmt(fmt) "exynos9810-cpuidle: " fmt
@@ -229,6 +231,7 @@ struct e9810_stats {
 	u64 wfi_fallback;	/* any C2 request that ran WFI instead */
 	u64 stale_grp2;		/* own GRP2 event latched before arming */
 	u64 guarded;		/* C2 refused by the cluster-0 limit: WFI */
+	u64 no_ltimer;		/* LITTLE C2 refused: tick not on the MCT local timer */
 	int last_err;
 	unsigned int fail_streak;
 };
@@ -310,6 +313,17 @@ static int e9810_little_limit_cfg = E9810_LITTLE_LIMIT_DEFAULT;
 static bool e9810_little_c2;
 static bool e9810_little_c2_cfg;	/* DT value, restored after the loss drill */
 static atomic_t e9810_little_in_c2 = ATOMIC_INIT(0);
+
+/*
+ * Stage S2 (DT samsung,c2-little-local-timer): LITTLE C2 only on a CPU whose
+ * tick runs on its own MCT local timer (exynos9810-mct-bc, DT
+ * samsung,mct-local-timers), as on 4.9. Its C2 periods are then ended by
+ * that timer's own SPI, never by an IPI_TIMER from the tick broadcast,
+ * which wakes several LITTLE cores with one SGI (the suspected trigger of
+ * the 3-core EL3 loss, roadmap/c2-runtime-design.md 2.4 H1). Checked at
+ * arming and again at every LITTLE C2 entry (no_ltimer: WFI instead).
+ */
+static bool e9810_little_ltimer;
 
 /*
  * Quarantine in force this boot, from the record an earlier boot wrote
@@ -394,6 +408,11 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	}
 	if (atomic_read(&e9810_deep_off))
 		goto wfi;
+	if (little && READ_ONCE(e9810_little_ltimer) &&
+	    !exynos9810_mct_local_active(dev->cpu)) {
+		st->no_ltimer++;
+		goto wfi;
+	}
 
 	/* The slot is held until cal_cpu_enable() has run (see "out"). */
 	if (little) {
@@ -732,6 +751,10 @@ static const char *e9810_arm_refused(unsigned int cpu)
 		return "deep idle disabled";
 	if (!exynos9810_mct_bc_ready())
 		return e9810_why_no_mct;
+	/* Final: mct-bc sets up the local timers before it reports ready. */
+	if (e9810_cluster_of[cpu] == 0 && e9810_little_ltimer &&
+	    !exynos9810_mct_local_active(cpu))
+		return "LITTLE C2 needs the CPU's tick on its MCT local timer (DT samsung,c2-little-local-timer), and it is not (see the exynos9810-mct-bc local timer lines)";
 	return NULL;
 }
 
@@ -2512,12 +2535,13 @@ static void e9810_log_stats(void)
 			time_ms = div_u64(dev->states_usage[cl->c2_idx].time_ns,
 					  NSEC_PER_MSEC);
 		}
-		pr_info("c2 stats: cpu%u enter=%llu resumed=%llu early=%llu psci_fail=%llu last_err=%d unarmed=%llu guarded=%llu wfi_fallback=%llu stale_grp2=%llu stage=%s c2_usage=%llu c2_time_ms=%llu\n",
+		pr_info("c2 stats: cpu%u enter=%llu resumed=%llu early=%llu psci_fail=%llu last_err=%d unarmed=%llu guarded=%llu wfi_fallback=%llu stale_grp2=%llu stage=%s c2_usage=%llu c2_time_ms=%llu ltimer=%d no_ltimer=%llu\n",
 			cpu, st.c2_enter, st.c2_resumed, st.early, st.psci_fail,
 			st.last_err, st.unarmed, st.guarded, st.wfi_fallback,
 			st.stale_grp2,
 			e9810_stage_str(READ_ONCE(per_cpu(e9810_stage, cpu))),
-			usage, time_ms);
+			usage, time_ms, exynos9810_mct_local_active(cpu),
+			st.no_ltimer);
 	}
 }
 
@@ -2861,13 +2885,15 @@ static ssize_t c2_stats_show(struct device *dev, struct device_attribute *a,
 	for_each_possible_cpu(cpu) {
 		struct e9810_stats st = per_cpu(e9810_stats, cpu);
 
-		n += sysfs_emit_at(buf, n, "cpu%u armed=%d stage=%s fw_gen=%u enter=%llu resumed=%llu early=%llu psci_fail=%llu unarmed=%llu guarded=%llu wfi_fallback=%llu stale_grp2=%llu last_err=%d\n",
+		n += sysfs_emit_at(buf, n, "cpu%u armed=%d stage=%s fw_gen=%u enter=%llu resumed=%llu early=%llu psci_fail=%llu unarmed=%llu guarded=%llu wfi_fallback=%llu stale_grp2=%llu last_err=%d ltimer=%d no_ltimer=%llu\n",
 				   cpu, cpumask_test_cpu(cpu, &e9810_armed),
 				   e9810_stage_str(READ_ONCE(per_cpu(e9810_stage, cpu))),
 				   READ_ONCE(per_cpu(e9810_fw_gen, cpu)),
 				   st.c2_enter, st.c2_resumed, st.early,
 				   st.psci_fail, st.unarmed, st.guarded,
-				   st.wfi_fallback, st.stale_grp2, st.last_err);
+				   st.wfi_fallback, st.stale_grp2, st.last_err,
+				   exynos9810_mct_local_active(cpu),
+				   st.no_ltimer);
 	}
 	n += sysfs_emit_at(buf, n, "deep_off=%d det_scans=%llu det_pings=%llu det_enq_fail=%llu det_revalidated=%llu det_hp_unlocked=%llu boot_pending=%*pbl\n",
 			   atomic_read(&e9810_deep_off), e9810_det_scans,
@@ -3510,10 +3536,14 @@ static int e9810_cpuidle_probe(struct platform_device *pdev)
 	}
 	e9810_little_c2 = of_property_read_bool(np, "samsung,c2-little-enable");
 	e9810_little_c2_cfg = e9810_little_c2;
-	pr_info("LITTLE C2 %s, cluster-0 C2 limit %d%s\n",
+	e9810_little_ltimer = of_property_read_bool(np,
+					"samsung,c2-little-local-timer");
+	pr_info("LITTLE C2 %s, cluster-0 C2 limit %d%s%s\n",
 		e9810_little_c2 ? "enabled" : "disabled (WFI only)",
 		e9810_little_limit_cfg,
-		e9810_little_limit_cfg ? "" : " (none)");
+		e9810_little_limit_cfg ? "" : " (none)",
+		e9810_little_ltimer ?
+		", only on a CPU that ticks on its MCT local timer" : "");
 	/* The quarantine an earlier boot recorded applies to every arming. */
 	e9810_qm_init(&pdev->dev);
 	e9810_setup_why = e9810_setup(pdev);

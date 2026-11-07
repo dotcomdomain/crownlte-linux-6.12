@@ -67,6 +67,17 @@ struct tick_device *tick_get_device(int cpu)
 	return &per_cpu(tick_cpu_device, cpu);
 }
 
+/*
+ * The clock event device that runs @cpu's tick, or NULL. A snapshot for
+ * drivers that must know whether a CPU depends on the tick broadcast
+ * (crownlte: exynos9810-mct-bc, cpuidle-exynos9810). No reference is taken;
+ * the answer changes when a device is replaced or the CPU goes offline.
+ */
+struct clock_event_device *tick_cpu_evtdev(unsigned int cpu)
+{
+	return READ_ONCE(per_cpu(tick_cpu_device, cpu).evtdev);
+}
+
 /**
  * tick_is_oneshot_available - check for a oneshot capable event device
  */

@@ -189,6 +189,9 @@ extern void clockevents_config_and_register(struct clock_event_device *dev,
 
 extern int clockevents_update_freq(struct clock_event_device *ce, u32 freq);
 
+/* The device that runs @cpu's tick now, or NULL (kernel/time/tick-common.c). */
+extern struct clock_event_device *tick_cpu_evtdev(unsigned int cpu);
+
 static inline void
 clockevents_calc_mult_shift(struct clock_event_device *ce, u32 freq, u32 maxsec)
 {

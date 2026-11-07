@@ -14,13 +14,40 @@ struct exynos9810_mct_bc_stats {
 	u64 write_timeouts;	/* MCT write status never confirmed */
 };
 
+/* Per-CPU MCT local timer (L0-L7), DT samsung,mct-local-timers. */
+struct exynos9810_mct_local_stats {
+	u64 irqs;		/* local timer interrupts on this CPU */
+	u64 write_timeouts;	/* local register write never confirmed */
+	bool active;		/* the timer runs this CPU's tick now */
+};
+
 #ifdef CONFIG_EXYNOS9810_MCT_BROADCAST
 /* True once the MCT passed its self-check and is the broadcast device. */
 bool exynos9810_mct_bc_ready(void);
 /* Boot time (ms) the MCT became the broadcast device, 0 if never. */
 u64 exynos9810_mct_bc_ready_ms(void);
 void exynos9810_mct_bc_get_stats(struct exynos9810_mct_bc_stats *s);
+/*
+ * True if @cpu's tick runs on its MCT local timer now, i.e. a C2 period of
+ * @cpu is woken by that timer's own interrupt and never by the broadcast.
+ * Final once exynos9810_mct_bc_ready() is true (the local timers are set
+ * up first), except across CPU hotplug. Safe from the idle path.
+ */
+bool exynos9810_mct_local_active(unsigned int cpu);
+void exynos9810_mct_local_get_stats(unsigned int cpu,
+				    struct exynos9810_mct_local_stats *s);
 #else
+static inline bool exynos9810_mct_local_active(unsigned int cpu)
+{
+	return false;
+}
+
+static inline void exynos9810_mct_local_get_stats(unsigned int cpu,
+					struct exynos9810_mct_local_stats *s)
+{
+	*s = (struct exynos9810_mct_local_stats){ };
+}
+
 static inline bool exynos9810_mct_bc_ready(void)
 {
 	return false;
