@@ -178,6 +178,23 @@ config EXYNOS9810_AUDIO_A1
 	  and exynos5-hsi2c drivers suppress their sysfs bind/unbind files.
 	  See Documentation/crownlte/audio-a1.md.
 
+config EXYNOS9810_ABOX_A2
+	bool "crownlte audio stage A2: ABOX DSP firmware boot test"
+	depends on ARM64 && OF && MFD_SYSCON && FW_LOADER
+	depends on EXYNOS_IOMMU && S3C2410_WATCHDOG
+	help
+	  Exynos 9810 (crownlte) audio stage A2: boots the ABOX ("Calliope")
+	  audio DSP firmware from /vendor/firmware (calliope_sram/dram/iva.bin
+	  and the DT ext firmware list) into its volatile SRAM/DRAM, waits for
+	  "Calliope is ready to sing", suspends and powers the DSP CPU off,
+	  twice, and reports "audio selftest A2:". The minimal boot path of
+	  the Samsung 4.9 ABOX driver: own IOMMU domain with the fixed
+	  firmware IOVAs, ABOX GIC, PMU ABOX CPU power/enable. The DT gate
+	  arms the CL0 watchdog deadline and takes the AUD clocks before the
+	  ABOX SysMMU (samsung,abox-a2-guard) may touch pd-aud. No codec,
+	  amp, PMIC, /efs, pad retention or pd-aud power control. Idle unless
+	  the DT enables the gate. See Documentation/crownlte/audio-a2.md.
+
 config EXYNOS9810_PM
 	bool "crownlte system suspend, stage S0 (no firmware sleep)"
 	depends on EXYNOS9810_LEGACY_CAL && OF && ARM64
