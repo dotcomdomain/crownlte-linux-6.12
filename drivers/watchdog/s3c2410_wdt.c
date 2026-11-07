@@ -902,11 +902,64 @@ static int s3c2410wdt_start(struct watchdog_device *wdd)
 	return 0;
 }
 
+/* Restart handler on a guarded instance: WTCNT is lowered to at most this. */
+#define S3C2410_WDT_RESTART_TICKS	0x80
+/* Bound for wdt->lock in the restart handler (IRQs off, CPUs stopped). */
+#define S3C2410_WDT_RESTART_LOCK_US	100000
+
+/*
+ * .restart on a guarded (SBOOT reset guard) instance. Unlike the generic
+ * sequence below it never switches the counter off, never loads a longer
+ * count and never changes the prescaler, so a final countdown that is
+ * already running (restart notifier, C2-LOST, suspend deadline) can only get
+ * shorter. Under wdt->lock, taken with a bounded trylock (the restart
+ * handlers run with IRQs off after smp_send_stop(), and a stopped CPU may
+ * hold it; without the lock the same writes are made): the final stop is
+ * latched without a reload, WTCNT is lowered to S3C2410_WDT_RESTART_TICKS
+ * if it holds more (or loaded with it if the counter is off), and counter
+ * and reset are switched on if they are not, as .start does after the latch.
+ */
+static void s3c2410wdt_restart_guarded(struct s3c2410_wdt *wdt)
+{
+	void __iomem *base = wdt->reg_base;
+	unsigned int us;
+	bool locked;
+	u32 wtcon, cnt;
+
+	for (us = 0; !(locked = spin_trylock(&wdt->lock)) &&
+		     us < S3C2410_WDT_RESTART_LOCK_US; us += 10)
+		udelay(10);
+	if (!wdt->pet_stopped) {
+		WRITE_ONCE(wdt->pet_stopped, true);
+		wdt->stop_why = "restart handler";
+	}
+	wtcon = readl(base + S3C2410_WTCON);
+	cnt = readl(base + S3C2410_WTCNT);
+	if (!(wtcon & S3C2410_WTCON_ENABLE) || cnt > S3C2410_WDT_RESTART_TICKS)
+		writel(min_t(u32, cnt, S3C2410_WDT_RESTART_TICKS) ? :
+		       S3C2410_WDT_RESTART_TICKS, base + S3C2410_WTCNT);
+	if ((wtcon & (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) !=
+	    (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) {
+		wtcon &= ~S3C2410_WTCON_INTEN;
+		wtcon |= S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN;
+		writel(wtcon, base + S3C2410_WTCON);
+	}
+	if (locked)
+		spin_unlock(&wdt->lock);
+}
+
 static int s3c2410wdt_restart(struct watchdog_device *wdd, unsigned long action,
 			      void *data)
 {
 	struct s3c2410_wdt *wdt = watchdog_get_drvdata(wdd);
 	void __iomem *wdt_base = wdt->reg_base;
+
+	if (wdt->drv_data->quirks & QUIRK_SBOOT_RESET_GUARD) {
+		s3c2410wdt_restart_guarded(wdt);
+		/* wait for reset to assert... */
+		mdelay(500);
+		return 0;
+	}
 
 	/* disable watchdog, to be safe  */
 	writel(0, wdt_base + S3C2410_WTCON);
@@ -1244,13 +1297,15 @@ static void s3c2410wdt_selftest_work(struct work_struct *work)
 	}
 
 	/*
-	 * Short timeout, last reload and the stop in one wdt->lock section;
-	 * no reload if petting already stopped for good (deadline passed).
+	 * One wdt->lock section, like the restart notifier: the short timeout
+	 * without a reload, then the shared final stop, whose one last reload
+	 * (with the new count) happens only while reloading is still allowed.
+	 * Exactly one reload, none if petting already stopped for good.
 	 */
 	ret = s3c2410wdt_calc_heartbeat(wdt, S3C2410_SELFTEST_EXPIRE_S, &hb);
 	spin_lock_irqsave(&wdt->lock, flags);
 	if (!ret)
-		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, true);
+		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, false);
 	__s3c2410wdt_final_stop(wdt, "watchdog selftest");
 	wdt->selftest_fired = true;
 	spin_unlock_irqrestore(&wdt->lock, flags);
