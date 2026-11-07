@@ -135,6 +135,13 @@ enum cpuhp_state {
 	CPUHP_AP_IDLE_DEAD,
 	CPUHP_AP_OFFLINE,
 	CPUHP_AP_CACHECTRL_STARTING,
+	/*
+	 * Exynos 9810 (crownlte) PMU core/cluster power hooks, 4.9
+	 * CPUHP_AP_EXYNOS_CPU_{UP,DOWN}_POWER_CONTROL: the teardown runs on the
+	 * dying CPU right after sched_cpu_dying(), the last kernel code before
+	 * PSCI CPU_OFF.
+	 */
+	CPUHP_AP_EXYNOS9810_CPU_POWER_STARTING,
 	CPUHP_AP_SCHED_STARTING,
 	CPUHP_AP_RCUTREE_DYING,
 	CPUHP_AP_CPU_PM_STARTING,
