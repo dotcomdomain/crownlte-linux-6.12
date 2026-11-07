@@ -16,6 +16,7 @@
 #include <linux/regmap.h>
 
 #include <dt-bindings/soc/samsung,exynos-usi.h>
+#include <soc/samsung/exynos9810-audio-a1.h>
 
 /* USIv2: System Register: SW_CONF register bits */
 #define USI_V2_SW_CONF_NONE	0x0
@@ -267,6 +268,17 @@ static int exynos_usi_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct exynos_usi *usi;
 	int ret;
+
+	/*
+	 * crownlte audio A1 amp bus: no SYSREG, clock or wrapper access (and
+	 * no child bus) before the A1 driver armed the CL0 watchdog deadline.
+	 */
+	if (of_property_present(np, "samsung,audio-a1-guard")) {
+		ret = exynos9810_audio_a1_guard(dev);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "bring-up held back by the audio A1 guard\n");
+	}
 
 	usi = devm_kzalloc(dev, sizeof(*usi), GFP_KERNEL);
 	if (!usi)
