@@ -633,6 +633,29 @@ void clients_kill_sessions(void)
 }
 
 /*
+ * Secure object for a daemon-registry open (OPEN_SESSION, GP open-session).
+ * crownlte T3: with the session guard on, registry_guard.h decides: daemon
+ * bytes only if pinned for exactly this UUID, otherwise SWd selection only.
+ * Without the guard: unchanged (registry, then SWd selection on ENOENT).
+ */
+static struct tee_object *client_registry_object(const struct mc_uuid_t *uuid,
+						 bool is_gp, const char *what)
+{
+	struct tee_object *obj;
+
+	if (mc_session_guard_active())
+		return mc_guard_registry_object(uuid, is_gp, what);
+
+	/* Get secure object */
+	obj = tee_object_get(uuid, is_gp);
+	/* Try to select secure object inside the SWd if not found */
+	if (IS_ERR(obj) && (PTR_ERR(obj) == -ENOENT) && g_ctx.f_ta_auth)
+		obj = tee_object_select(uuid);
+
+	return obj;
+}
+
+/*
  * Open TA for given client. TA binary is provided by the daemon.
  * @param
  * @return driver error code
@@ -646,17 +669,14 @@ int client_open_session(struct tee_client *client, u32 *session_id,
 	u32 sid = 0;
 	struct tee_object *obj;
 
-	/* Get secure object */
-	obj = tee_object_get(uuid, is_gp_uuid);
-	if (IS_ERR(obj)) {
-		/* Try to select secure object inside the SWd if not found */
-		if ((PTR_ERR(obj) == -ENOENT) && g_ctx.f_ta_auth)
-			obj = tee_object_select(uuid);
+	err = mc_session_guard(uuid, is_gp_uuid, "open-session");
+	if (err)
+		return err;
 
-		if (IS_ERR(obj)) {
-			err = PTR_ERR(obj);
-			goto end;
-		}
+	obj = client_registry_object(uuid, is_gp_uuid, "open-session-registry");
+	if (IS_ERR(obj)) {
+		err = PTR_ERR(obj);
+		goto end;
 	}
 
 	/* Open session */
@@ -691,6 +711,10 @@ int client_open_trustlet(struct tee_client *client, u32 *session_id, u32 spid,
 	u32 sid = 0;
 	int err = 0;
 
+	err = mc_blob_guard_precheck(false, "open-trustlet");
+	if (err)
+		return err;
+
 	if (client_is_kernel(client))
 		/* Create secure object from kernel-space trustlet binary */
 		obj = tee_object_copy(trustlet, trustlet_len);
@@ -699,6 +723,13 @@ int client_open_trustlet(struct tee_client *client, u32 *session_id, u32 spid,
 		obj = tee_object_read(spid, trustlet, trustlet_len);
 	if (IS_ERR(obj)) {
 		err = PTR_ERR(obj);
+		goto end;
+	}
+
+	/* crownlte T3: pinned blob only; checked on the copy the SWd will map */
+	err = mc_blob_guard(obj, false, "open-trustlet");
+	if (err) {
+		tee_object_free(obj);
 		goto end;
 	}
 
@@ -1058,17 +1089,14 @@ int client_gp_open_session(struct tee_client *client, u32 *session_id,
 	struct tee_object *obj;
 	int ret = 0;
 
-	/* Get secure object */
-	obj = tee_object_get(uuid, true);
-	if (IS_ERR(obj)) {
-		/* Try to select secure object inside the SWd if not found */
-		if ((PTR_ERR(obj) == -ENOENT) && g_ctx.f_ta_auth)
-			obj = tee_object_select(uuid);
+	ret = mc_session_guard(uuid, true, "gp-open-session");
+	if (ret)
+		return ret;
 
-		if (IS_ERR(obj)) {
-			ret = PTR_ERR(obj);
-			goto end;
-		}
+	obj = client_registry_object(uuid, true, "gp-open-session-registry");
+	if (IS_ERR(obj)) {
+		ret = PTR_ERR(obj);
+		goto end;
 	}
 
 	/* Open session */

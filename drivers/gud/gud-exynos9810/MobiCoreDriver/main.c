@@ -25,6 +25,7 @@
 #include <linux/fs.h>
 #include <linux/workqueue.h>
 #include <linux/timekeeping.h>
+#include <crypto/sha2.h>		/* sha256(): T3 blob guard */
 
 #include "public/mc_user.h"
 #include "public/mc_admin.h"	/* MC_ADMIN_DEVNODE */
@@ -672,6 +673,194 @@ static inline void device_admin_exit(void)
 }
 
 #ifndef MC_DELAYED_TEE_START
+/*
+ * crownlte TEE staging (T2/T3): optional session guard. With DT
+ * samsung,tee-session-guard every session/trustlet open from any client (user
+ * ioctl, GP, kernel API, proxy) is logged with its UUID and refused unless the
+ * UUID is listed in samsung,tee-session-allow (16-byte UUIDs, max 8). Trustlet
+ * opens from a buffer are always refused while the guard is on. A malformed
+ * allow list leaves the guard on with an empty list (fail closed). Without the
+ * property the driver behaves exactly as before.
+ */
+#define MC_GUARD_MAX 8
+static bool mc_guard_on;
+/* Read-only proof for userspace staging: /sys/module/mcDrvModule/parameters/session_guard */
+module_param_named(session_guard, mc_guard_on, bool, 0444);
+static struct mc_uuid_t mc_guard_allow[MC_GUARD_MAX];
+static int mc_guard_n;
+
+/*
+ * T3: blob-pinned trustlet/driver opens. open-trustlet (TA from a client
+ * buffer) and admin LOAD_DRIVER are checked on the kernel's own copy of the
+ * blob: MCLF magic, service type (system trustlet resp. driver), UUID and
+ * SHA-256 over the whole copy must match a pin from
+ * samsung,tee-trustlet-allow resp. samsung,tee-driver-allow. An absent list
+ * keeps the old behaviour (refused before any user data is read); a
+ * malformed list allows nothing. LOAD_CHECK and SP trustlets stay refused.
+ * OPEN_SESSION / GP open-session (blob from the daemon registry) go through
+ * registry_guard.h: pinned UUIDs take only the pinned bytes for exactly that
+ * UUID, unpinned ones only SWd selection (the daemon is not asked).
+ */
+#include "blob_guard.h"
+#include "registry_guard.h"
+static struct mc_blob_pin mc_pin_tl[MC_PIN_MAX];
+static struct mc_blob_pin mc_pin_drv[MC_PIN_MAX];
+static int mc_pin_tl_n, mc_pin_drv_n;
+/* Read-only proof for userspace staging, next to session_guard */
+module_param_named(trustlet_pins, mc_pin_tl_n, int, 0444);
+module_param_named(driver_pins, mc_pin_drv_n, int, 0444);
+
+static int mc_pin_init(struct device_node *np, const char *prop,
+		       struct mc_blob_pin *pins)
+{
+	int n = of_property_count_u8_elems(np, prop);
+	int i, count;
+
+	BUILD_BUG_ON(sizeof(struct mc_blob_pin) != MC_PIN_LEN);
+	if (n == -EINVAL)	/* property absent */
+		return 0;
+	count = mc_blob_pins_count(n);
+	if (count < 0 || of_property_read_u8_array(np, prop, (u8 *)pins, n)) {
+		pr_err("tee session-guard: malformed %s (%d bytes): allowing nothing\n",
+		       prop, n);
+		return 0;
+	}
+	for (i = 0; i < count; i++)
+		pr_info("tee session-guard: %s pin uuid=%16phN sha256=%32phN\n",
+			prop, pins[i].uuid, pins[i].sha256);
+	return count;
+}
+
+static void mc_guard_init(struct device_node *np)
+{
+	int n;
+
+	if (!np || !of_property_read_bool(np, "samsung,tee-session-guard"))
+		return;
+	mc_guard_on = true;
+	n = of_property_count_u8_elems(np, "samsung,tee-session-allow");
+	if (n > 0 && !(n % 16) && n / 16 <= MC_GUARD_MAX &&
+	    !of_property_read_u8_array(np, "samsung,tee-session-allow",
+				       (u8 *)mc_guard_allow, n))
+		mc_guard_n = n / 16;
+	else if (n > 0)
+		pr_err("tee session-guard: malformed allow list (%d bytes): allowing nothing\n", n);
+	pr_info("tee session-guard: ON, %d allowed UUID(s)\n", mc_guard_n);
+	for (n = 0; n < mc_guard_n; n++)
+		pr_info("tee session-guard: allow %16phN\n", mc_guard_allow[n].value);
+	mc_pin_tl_n = mc_pin_init(np, "samsung,tee-trustlet-allow", mc_pin_tl);
+	mc_pin_drv_n = mc_pin_init(np, "samsung,tee-driver-allow", mc_pin_drv);
+	if (mc_pin_tl_n || mc_pin_drv_n)
+		pr_info("tee session-guard: blob pins trustlet=%d driver=%d\n",
+			mc_pin_tl_n, mc_pin_drv_n);
+}
+
+int mc_session_guard(const struct mc_uuid_t *uuid, bool gp, const char *what)
+{
+	static const u8 none[16];
+	int i;
+
+	if (!mc_guard_on)
+		return 0;
+	for (i = 0; uuid && i < mc_guard_n; i++) {
+		if (!memcmp(uuid->value, mc_guard_allow[i].value, 16)) {
+			pr_info("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: allowed\n",
+				what, uuid->value, gp, current->comm, task_pid_nr(current));
+			return 0;
+		}
+	}
+	pr_warn("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: REFUSED\n",
+		what, uuid ? uuid->value : none, gp, current->comm, task_pid_nr(current));
+	return -EPERM;
+}
+
+/*
+ * Before any user data is copied: with no pin list for this path the
+ * request is refused exactly as before T3 (same log line).
+ */
+int mc_blob_guard_precheck(bool driver, const char *what)
+{
+	if (!mc_guard_on || (driver ? mc_pin_drv_n : mc_pin_tl_n))
+		return 0;
+	return mc_session_guard(NULL, false, what);
+}
+
+/* On the kernel copy that is handed to the SWd; every decision is logged. */
+int mc_blob_guard(const struct tee_object *obj, bool driver, const char *what)
+{
+	static const u8 none[MC_PIN_UUID_LEN];
+	enum mc_blob_verdict v;
+	u8 digest[MC_PIN_SHA_LEN];
+	const u8 *uuid;
+	u32 type;
+
+	if (!mc_guard_on)
+		return 0;
+	v = mc_blob_check(obj->data, obj->length, obj->header_length,
+			  driver ? SERVICE_TYPE_DRIVER : SERVICE_TYPE_SYSTEM_TRUSTLET,
+			  NULL, driver ? mc_pin_drv : mc_pin_tl,
+			  driver ? mc_pin_drv_n : mc_pin_tl_n, digest, &uuid, &type);
+	if (v == MC_BLOB_ALLOWED) {
+		pr_info("tee session-guard: %s uuid=%16phN type=%u len=%u sha256=%32phN by %s[%d]: allowed\n",
+			what, uuid, type, obj->length, digest, current->comm,
+			task_pid_nr(current));
+		return 0;
+	}
+	pr_warn("tee session-guard: %s uuid=%16phN type=%u len=%u sha256=%32phN by %s[%d]: REFUSED (%s)\n",
+		what, uuid ? uuid : none, type, obj->length, digest, current->comm,
+		task_pid_nr(current), mc_blob_why[v]);
+	return -EPERM;
+}
+
+bool mc_session_guard_active(void)
+{
+	return mc_guard_on;
+}
+
+/*
+ * Guard on, UUID already accepted by mc_session_guard(): the object for
+ * OPEN_SESSION / GP open-session. Every decision is logged.
+ */
+struct tee_object *mc_guard_registry_object(const struct mc_uuid_t *uuid,
+					    bool gp, const char *what)
+{
+	static const u8 none[MC_PIN_UUID_LEN];
+	struct mc_reg_result r;
+	struct tee_object *obj;
+
+	obj = mc_registry_object(uuid, gp, g_ctx.f_ta_auth, mc_pin_tl,
+				 mc_pin_tl_n, &r);
+	switch (r.source) {
+	case MC_REG_REFUSED:
+		pr_warn("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: REFUSED (no pin, no SWd selection)\n",
+			what, uuid->value, gp, current->comm,
+			task_pid_nr(current));
+		break;
+	case MC_REG_SWD_SELECT:
+		pr_info("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: SWd selection only (no pin, daemon not asked)%s\n",
+			what, uuid->value, gp, current->comm,
+			task_pid_nr(current), IS_ERR(obj) ? ", no memory" : "");
+		break;
+	case MC_REG_PINNED:
+		if (r.err)
+			pr_warn("tee session-guard: %s uuid=%16phN gp=%d by %s[%d]: REFUSED (registry fetch error %d)\n",
+				what, uuid->value, gp, current->comm,
+				task_pid_nr(current), r.err);
+		else if (r.verdict == MC_BLOB_ALLOWED)
+			pr_info("tee session-guard: %s uuid=%16phN gp=%d type=%u len=%u sha256=%32phN by %s[%d]: allowed\n",
+				what, uuid->value, gp, r.type, r.length,
+				r.digest, current->comm, task_pid_nr(current));
+		else
+			pr_warn("tee session-guard: %s uuid=%16phN gp=%d blob_uuid=%16phN type=%u len=%u sha256=%32phN by %s[%d]: REFUSED (%s)\n",
+				what, uuid->value, gp,
+				r.have_uuid ? r.uuid : none, r.type, r.length,
+				r.digest, current->comm, task_pid_nr(current),
+				mc_blob_why[r.verdict]);
+		break;
+	}
+	return obj;
+}
+
 /* crownlte: 4.9's tail of mobicore_probe(), run in its own kthread */
 static int mobicore_start_thread(void *unused)
 {
@@ -841,6 +1030,7 @@ static int mobicore_probe(struct platform_device *pdev)
 
 	if (pdev)
 		g_ctx.mcd->of_node = pdev->dev.of_node;
+	mc_guard_init(pdev ? pdev->dev.of_node : NULL);
 
 #ifdef MOBICORE_COMPONENT_BUILD_TAG
 	mc_dev_info("MobiCore %s", MOBICORE_COMPONENT_BUILD_TAG);
