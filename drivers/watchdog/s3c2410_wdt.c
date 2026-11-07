@@ -650,30 +650,170 @@ static bool s3c2410wdt_pet_refused(struct s3c2410_wdt *wdt)
 	return refused;
 }
 
+/* A timeout turned into hardware values; computed without wdt->lock. */
+struct s3c2410wdt_hb {
+	unsigned int count;
+	unsigned int divisor;
+	unsigned int timeout;
+};
+
+/* clk_get_rate() may sleep: never called with wdt->lock held. */
+static int s3c2410wdt_calc_heartbeat(struct s3c2410_wdt *wdt,
+				     unsigned int timeout,
+				     struct s3c2410wdt_hb *hb)
+{
+	unsigned long freq = s3c2410wdt_get_freq(wdt);
+	unsigned int count;
+	unsigned int divisor = 1;
+
+	if (timeout < 1)
+		return -EINVAL;
+
+	freq = DIV_ROUND_UP(freq, 128);
+	count = timeout * freq;
+
+	dev_dbg(wdt->dev, "Heartbeat: count=%d, timeout=%d, freq=%lu\n",
+		count, timeout, freq);
+
+	/* if the count is bigger than the watchdog register,
+	   then work out what we need to do (and if) we can
+	   actually make this value
+	*/
+
+	if (count >= 0x10000) {
+		divisor = DIV_ROUND_UP(count, 0xffff);
+
+		if (divisor > 0x100) {
+			dev_err(wdt->dev, "timeout %d too big\n", timeout);
+			return -EINVAL;
+		}
+	}
+
+	dev_dbg(wdt->dev, "Heartbeat: timeout=%d, divisor=%d, count=%d (%08x)\n",
+		timeout, divisor, count, DIV_ROUND_UP(count, divisor));
+
+	hb->count = DIV_ROUND_UP(count, divisor);
+	hb->divisor = divisor;
+	hb->timeout = (hb->count * divisor) / freq;
+	return 0;
+}
+
+/*
+ * Program WTDAT and the prescaler, with wdt->lock held, so a prescaler
+ * change never interleaves with a reload, a deadline installation or a
+ * deadline check. The count already running keeps its value, so a larger
+ * prescaler stretches the time left until the reset. Once the counter may
+ * no longer be reloaded (deadline passed, petting stopped for good,
+ * restart, selftest), only a change that does not slow it down is made:
+ * -ETIME otherwise, nothing written. @pet: reload the counter with the new
+ * count in the same critical section; refused (-ETIME, nothing written)
+ * unless reloading is still allowed.
+ */
+static int __s3c2410wdt_apply_heartbeat(struct s3c2410_wdt *wdt,
+					const struct s3c2410wdt_hb *hb,
+					bool pet)
+{
+	unsigned long wtcon;
+	unsigned int cur_div;
+
+	lockdep_assert_held(&wdt->lock);
+	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	cur_div = ((wtcon & S3C2410_WTCON_PRESCALE_MASK) >> 8) + 1;
+	if (!s3c2410wdt_may_pet(wdt) && (pet || hb->divisor > cur_div))
+		return -ETIME;
+
+	wdt->count = hb->count;
+	/* update the pre-scaler */
+	wtcon &= ~S3C2410_WTCON_PRESCALE_MASK;
+	wtcon |= S3C2410_WTCON_PRESCALE(hb->divisor - 1);
+
+	writel(hb->count, wdt->reg_base + S3C2410_WTDAT);
+	writel(wtcon, wdt->reg_base + S3C2410_WTCON);
+	if (pet)
+		writel(hb->count, wdt->reg_base + S3C2410_WTCNT);
+
+	wdt->wdt_device.timeout = hb->timeout;
+	return 0;
+}
+
+static int __s3c2410wdt_set_heartbeat(struct s3c2410_wdt *wdt,
+				      unsigned int timeout, bool pet)
+{
+	struct s3c2410wdt_hb hb;
+	unsigned long flags;
+	int ret;
+
+	ret = s3c2410wdt_calc_heartbeat(wdt, timeout, &hb);
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&wdt->lock, flags);
+	ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, pet);
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	if (ret == -ETIME)
+		s3c2410wdt_deadline_report(wdt);
+	return ret;
+}
+
+/* New timeout, no reload; never slows down a counter that is no longer petted. */
+static int s3c2410wdt_set_heartbeat(struct watchdog_device *wdd,
+				    unsigned int timeout)
+{
+	return __s3c2410wdt_set_heartbeat(watchdog_get_drvdata(wdd), timeout,
+					  false);
+}
+
+/* New timeout and a reload, atomically; -ETIME if reloading is refused. */
+static int s3c2410wdt_set_heartbeat_pet(struct s3c2410_wdt *wdt,
+					unsigned int timeout)
+{
+	return __s3c2410wdt_set_heartbeat(wdt, timeout, true);
+}
+
 /*
  * watchdog core .stop / .set_timeout: once a crownlte deadline is installed
  * or petting stopped for good, the guarded watchdog can be neither stopped
- * nor given a longer count by user space. Internal callers use
- * s3c2410wdt_stop() / s3c2410wdt_set_heartbeat() directly.
+ * nor given another timeout by user space. Both decide under wdt->lock,
+ * the lock s3c2410wdt_crownlte_set_deadline() installs the deadline under,
+ * so neither can slip in after a deadline was installed. Internal callers
+ * use s3c2410wdt_stop() / s3c2410wdt_set_heartbeat() directly.
  */
 static int s3c2410wdt_ops_stop(struct watchdog_device *wdd)
 {
 	struct s3c2410_wdt *wdt = watchdog_get_drvdata(wdd);
+	unsigned long flags;
+	int ret = 0;
 
-	if (READ_ONCE(wdt->pet_deadline_ns) || s3c2410wdt_pet_refused(wdt))
-		return -EBUSY;
-	return s3c2410wdt_stop(wdd);
+	spin_lock_irqsave(&wdt->lock, flags);
+	if (wdt->pet_deadline_ns || !s3c2410wdt_may_pet(wdt))
+		ret = -EBUSY;
+	else
+		__s3c2410wdt_stop(wdt);
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	if (ret)
+		s3c2410wdt_deadline_report(wdt);
+	return ret;
 }
-
-static int s3c2410wdt_set_heartbeat(struct watchdog_device *wdd,
-				    unsigned int timeout);
 
 static int s3c2410wdt_ops_set_timeout(struct watchdog_device *wdd,
 				      unsigned int timeout)
 {
-	if (s3c2410wdt_pet_refused(watchdog_get_drvdata(wdd)))
-		return -EBUSY;
-	return s3c2410wdt_set_heartbeat(wdd, timeout);
+	struct s3c2410_wdt *wdt = watchdog_get_drvdata(wdd);
+	struct s3c2410wdt_hb hb;
+	unsigned long flags;
+	int ret;
+
+	ret = s3c2410wdt_calc_heartbeat(wdt, timeout, &hb);
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&wdt->lock, flags);
+	if (wdt->pet_deadline_ns || !s3c2410wdt_may_pet(wdt))
+		ret = -EBUSY;
+	else
+		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, false);
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	if (ret)
+		s3c2410wdt_deadline_report(wdt);
+	return ret;
 }
 
 static int s3c2410wdt_start(struct watchdog_device *wdd)
@@ -712,57 +852,6 @@ static int s3c2410wdt_start(struct watchdog_device *wdd)
 	writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
 	writel(wtcon, wdt->reg_base + S3C2410_WTCON);
 	spin_unlock_irqrestore(&wdt->lock, flags);
-
-	return 0;
-}
-
-static int s3c2410wdt_set_heartbeat(struct watchdog_device *wdd,
-				    unsigned int timeout)
-{
-	struct s3c2410_wdt *wdt = watchdog_get_drvdata(wdd);
-	unsigned long freq = s3c2410wdt_get_freq(wdt);
-	unsigned int count;
-	unsigned int divisor = 1;
-	unsigned long wtcon;
-
-	if (timeout < 1)
-		return -EINVAL;
-
-	freq = DIV_ROUND_UP(freq, 128);
-	count = timeout * freq;
-
-	dev_dbg(wdt->dev, "Heartbeat: count=%d, timeout=%d, freq=%lu\n",
-		count, timeout, freq);
-
-	/* if the count is bigger than the watchdog register,
-	   then work out what we need to do (and if) we can
-	   actually make this value
-	*/
-
-	if (count >= 0x10000) {
-		divisor = DIV_ROUND_UP(count, 0xffff);
-
-		if (divisor > 0x100) {
-			dev_err(wdt->dev, "timeout %d too big\n", timeout);
-			return -EINVAL;
-		}
-	}
-
-	dev_dbg(wdt->dev, "Heartbeat: timeout=%d, divisor=%d, count=%d (%08x)\n",
-		timeout, divisor, count, DIV_ROUND_UP(count, divisor));
-
-	count = DIV_ROUND_UP(count, divisor);
-	wdt->count = count;
-
-	/* update the pre-scaler */
-	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
-	wtcon &= ~S3C2410_WTCON_PRESCALE_MASK;
-	wtcon |= S3C2410_WTCON_PRESCALE(divisor-1);
-
-	writel(count, wdt->reg_base + S3C2410_WTDAT);
-	writel(wtcon, wdt->reg_base + S3C2410_WTCON);
-
-	wdd->timeout = (count * divisor) / freq;
 
 	return 0;
 }
@@ -1092,6 +1181,7 @@ static void s3c2410wdt_selftest_work(struct work_struct *work)
 {
 	struct s3c2410_wdt *wdt = container_of(to_delayed_work(work),
 					       struct s3c2410_wdt, selftest_work);
+	struct s3c2410wdt_hb hb;
 	unsigned long flags;
 	int ret;
 
@@ -1104,15 +1194,15 @@ static void s3c2410wdt_selftest_work(struct work_struct *work)
 		return;
 	}
 
-	spin_lock_irqsave(&wdt->lock, flags);
-	wdt->selftest_stopped = true;
-	spin_unlock_irqrestore(&wdt->lock, flags);
-
-	ret = s3c2410wdt_set_heartbeat(&wdt->wdt_device,
-				       S3C2410_SELFTEST_EXPIRE_S);
+	/*
+	 * Short timeout, last reload and the stop in one wdt->lock section;
+	 * no reload if petting already stopped for good (deadline passed).
+	 */
+	ret = s3c2410wdt_calc_heartbeat(wdt, S3C2410_SELFTEST_EXPIRE_S, &hb);
 	spin_lock_irqsave(&wdt->lock, flags);
 	if (!ret)
-		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, true);
+	wdt->selftest_stopped = true;
 	spin_unlock_irqrestore(&wdt->lock, flags);
 
 	dev_emerg(wdt->dev,
@@ -1473,31 +1563,41 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 				    unsigned long action, void *data)
 {
 	struct s3c2410_wdt *wdt = container_of(nb, struct s3c2410_wdt, reboot_nb);
+	struct s3c2410wdt_hb hb;
 	unsigned long flags;
+	bool hb_ok;
+	int ret;
 
 	if (action != SYS_RESTART)
 		return NOTIFY_DONE;
 	if (!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
 		return NOTIFY_DONE;
-	/* Petting already stopped for good: the reset is due, leave it. */
-	if (s3c2410wdt_pet_refused(wdt)) {
-		spin_lock_irqsave(&wdt->lock, flags);
-		wdt->reboot_pending = true;
-		spin_unlock_irqrestore(&wdt->lock, flags);
-		dev_info(wdt->dev, "restart: petting already stopped, reset due within %u s\n",
-			 wdt->wdt_device.timeout);
-		return NOTIFY_DONE;
-	}
+	hb_ok = !s3c2410wdt_calc_heartbeat(wdt, S3C2410_WDT_RESTART_TIMEOUT, &hb);
 
-	s3c2410wdt_set_heartbeat(&wdt->wdt_device, S3C2410_WDT_RESTART_TIMEOUT);
+	/*
+	 * One wdt->lock section: the short timeout and the last reload only
+	 * if petting is still allowed; once it has stopped for good (or the
+	 * deadline passed) the reset is due and nothing is written.
+	 */
 	spin_lock_irqsave(&wdt->lock, flags);
-	/* Re-checked under the lock: the deadline may have passed since. */
-	if (s3c2410wdt_may_pet(wdt))
+	if (hb_ok) {
+		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, true);
+	} else if (s3c2410wdt_may_pet(wdt)) {
 		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+		ret = 0;
+	} else {
+		ret = -ETIME;
+	}
 	wdt->reboot_pending = true;
 	spin_unlock_irqrestore(&wdt->lock, flags);
-	dev_info(wdt->dev, "restart: armed for %u s and no longer petted\n",
-		 wdt->wdt_device.timeout);
+	if (ret) {
+		s3c2410wdt_deadline_report(wdt);
+		dev_info(wdt->dev, "restart: petting already stopped, reset due within %u s\n",
+			 wdt->wdt_device.timeout);
+	} else {
+		dev_info(wdt->dev, "restart: armed for %u s and no longer petted\n",
+			 wdt->wdt_device.timeout);
+	}
 	return NOTIFY_DONE;
 }
 
@@ -1536,36 +1636,32 @@ static int s3c2410wdt_suspend_keep_armed(struct s3c2410_wdt *wdt, u32 wtcon)
 			wtcon);
 		return -EIO;
 	}
-	if (s3c2410wdt_pet_refused(wdt)) {
+	wdt->resume_timeout = wdt->wdt_device.timeout;
+	/*
+	 * Slower prescaler and reload in one wdt->lock section: refused, with
+	 * nothing written, once petting has stopped for good or the deadline
+	 * has passed, so the suspend count can never stretch a due reset.
+	 */
+	ret = s3c2410wdt_set_heartbeat_pet(wdt, t);
+	if (ret == -ETIME) {
 		dev_err(dev, "suspend refused: petting stopped for good, the reset stays due (WTCON %#x WTCNT %#x)\n",
 			wtcon, readl(wdt->reg_base + S3C2410_WTCNT));
 		return -EBUSY;
 	}
-
-	wdt->resume_timeout = wdt->wdt_device.timeout;
-	/* Fails only before touching the hardware (bad timeout). */
-	ret = s3c2410wdt_set_heartbeat(&wdt->wdt_device, t);
 	if (ret) {
+		/* Bad timeout: nothing was written. */
 		s3c2410wdt_keepalive(&wdt->wdt_device);
 		dev_err(dev, "suspend refused: keep-armed timeout %u s failed (%d), left running at %u s\n",
 			t, ret, wdt->wdt_device.timeout);
 		return ret;
 	}
-	if (!__s3c2410wdt_keepalive(wdt)) {
-		/*
-		 * The deadline passed in between: the reset is due. Put the
-		 * run-time prescaler back so the slower suspend count cannot
-		 * stretch the time left (no reload either way).
-		 */
-		s3c2410wdt_set_heartbeat(&wdt->wdt_device, wdt->resume_timeout);
-		dev_err(dev, "suspend refused: petting stopped for good while arming\n");
-		return -EBUSY;
-	}
 	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
 	if ((wtcon & (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) !=
 	    (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) {
-		s3c2410wdt_set_heartbeat(&wdt->wdt_device, wdt->resume_timeout);
-		s3c2410wdt_keepalive(&wdt->wdt_device);
+		/* Back to the run-time count; without a reload if refused. */
+		if (s3c2410wdt_set_heartbeat_pet(wdt, wdt->resume_timeout))
+			s3c2410wdt_set_heartbeat(&wdt->wdt_device,
+						 wdt->resume_timeout);
 		dev_err(dev, "suspend refused: WTCON %#x after setting the suspend timeout\n",
 			wtcon);
 		return -EIO;
@@ -1627,10 +1723,15 @@ static int s3c2410wdt_resume(struct device *dev)
 			s3c2410wdt_set_heartbeat(&wdt->wdt_device,
 						 wdt->resume_timeout);
 			s3c2410wdt_start(&wdt->wdt_device);
-		} else {
+		} else if (s3c2410wdt_set_heartbeat_pet(wdt,
+						       wdt->resume_timeout)) {
+			/*
+			 * No reload allowed any more: still go back to the
+			 * faster run-time prescaler, which only shortens the
+			 * time left.
+			 */
 			s3c2410wdt_set_heartbeat(&wdt->wdt_device,
 						 wdt->resume_timeout);
-			s3c2410wdt_keepalive(&wdt->wdt_device);
 		}
 		dev_info(dev, "resume: armed, timeout %u s, WTCON %#x\n",
 			 wdt->wdt_device.timeout,
