@@ -171,6 +171,17 @@ static const char * const fdbg_name[] = { "sw_flag", "ap_sleep", "mif_sleep" };
 
 #define E9810_SYS_SLEEP			8	/* enum sys_powerdown SYS_SLEEP */
 #define E9810_MAX_WMASK			8
+/*
+ * Wakeup-mask bits that do not keep a written value, per offset. Hardware
+ * evidence: S0 r2 (pack 03198f44, 2026-11-07 01:59) wrote 0xd00f7e7e to
+ * 0x610 and read back 0xd00f6e7e after syscore suspend and again after
+ * resume, so bit 12 reads as 0 whatever is written. 0x614/0x618 read back
+ * the written 0xffff00ff, 0x644 the written 0. 4.9 never reads these
+ * registers back (exynos_set_wakeupmask() only writes), so it never
+ * noticed. The register check ignores exactly these bits; every log line
+ * still prints the raw value.
+ */
+#define E9810_WMASK_610_RO		BIT(12)
 
 /* S0 defaults (all DT-overridable) */
 #define S0_START_MS_DEFAULT		20000
@@ -423,15 +434,26 @@ static void e9810_snap_print(const char *tag, const struct e9810_snap *s)
 }
 
 /*
+ * Bits of wakeup mask @off that read as 0 whatever is written
+ * (E9810_WMASK_610_RO); the register check compares only the others.
+ */
+static u32 e9810_wmask_ro_bits(u32 off)
+{
+	return off == 0x610 ? E9810_WMASK_610_RO : 0;
+}
+
+/*
  * Kernel-owned configuration that every stage must leave as it found it:
  * the CPU_INFORM slots and GRP2 enables the CAL core/cluster/system
  * sequences write, the cluster flag in the APM mailbox and the EINT masks.
  * The PMU masks this driver writes are compared with its software-owned
  * baseline (e9810_write_sleep_masks()) once it has written them, before
- * that with @a. Each difference is printed (expected -> found); returns
- * their number. Not compared: INTR_GEN GRP1 enables and the other mailbox
- * bits (the APM firmware writes those) and PAD_RETENTION (cal_pm_exit()
- * writes the 4.9 release value; printed by step 50 instead).
+ * that with @a, in both cases without their read-only bits
+ * (e9810_wmask_ro_bits()). Each difference is printed (expected -> found,
+ * raw values); returns their number. Not compared: INTR_GEN GRP1 enables
+ * and the other mailbox bits (the APM firmware writes those) and
+ * PAD_RETENTION (cal_pm_exit() writes the 4.9 release value; printed by
+ * step 50 instead).
  */
 static unsigned int e9810_snap_diff(const char *tag, const struct e9810_snap *a,
 				    const struct e9810_snap *b)
@@ -447,10 +469,16 @@ static unsigned int e9810_snap_diff(const char *tag, const struct e9810_snap *a,
 	} while (0)
 
 	DIFF("0x60c", 0, a->eint_wmask, b->eint_wmask);
-	for (i = 0; i < e9pm.nr_wmask; i++)
-		DIFF("wakeup mask", i,
-		     e9pm.masks_owned ? e9pm.wmask_val[i] : a->wmask[i],
-		     b->wmask[i]);
+	for (i = 0; i < e9pm.nr_wmask; i++) {
+		u32 want = e9pm.masks_owned ? e9pm.wmask_val[i] : a->wmask[i];
+		u32 ro = e9810_wmask_ro_bits(e9pm.wmask_off[i]);
+
+		if ((want ^ b->wmask[i]) & ~ro) {
+			pr_warn("%s changed wakeup mask[%u]: %#x -> %#x (%#x, read-only bits %#x not compared)\n",
+				tag, i, want, b->wmask[i], e9pm.wmask_off[i], ro);
+			n++;
+		}
+	}
 	for (i = 0; i < PMU_NR_IDLE_IP; i++)
 		DIFF("IDLE_IP_MASK", i,
 		     e9pm.masks_owned ? E9810_IDLE_IP_MASK_SLEEP :
