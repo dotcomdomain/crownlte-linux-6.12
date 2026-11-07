@@ -263,6 +263,8 @@ struct s3c2410_wdt {
 	bool			keep_armed_suspend;
 	bool			suspended_armed;
 	unsigned int		resume_timeout;
+	/* WTCON as left by a kept-armed suspend, for the early re-arm */
+	u32			wtcon_armed;
 	/*
 	 * Petting stopped for good: s3c2410wdt_crownlte_stop_petting(), or the
 	 * absolute deadline below has passed. Never cleared.
@@ -1372,6 +1374,88 @@ bool s3c2410wdt_crownlte_state(struct crownlte_wdt_state *st)
 }
 EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_state);
 
+static void s3c2410wdt_crownlte_pmu_read(struct s3c2410_wdt *wdt, u32 *adis,
+					 u32 *mrst)
+{
+	unsigned int v;
+
+	*adis = *mrst = 0;
+	if ((wdt->drv_data->quirks & QUIRK_HAS_PMU_AUTO_DISABLE) &&
+	    !regmap_read(wdt->pmureg, wdt->drv_data->disable_reg, &v))
+		*adis = v;
+	if ((wdt->drv_data->quirks & QUIRK_HAS_PMU_MASK_RESET) &&
+	    !regmap_read(wdt->pmureg, wdt->drv_data->mask_reset_reg, &v))
+		*mrst = v;
+}
+
+/*
+ * Early re-arm after a firmware sleep (suspend S1 design C4; 4.9
+ * s3c2410_wdt.c syscore resume). For the S1 real-sleep stages: called on
+ * CPU0 right after cpu_suspend() returns, interrupts off, before syscore
+ * resume. If PERIS lost power in SLEEP the block came back at its reset
+ * values (WTCON 0x8021, WTDAT 0x8000: enabled, about 2.6 s) and the PMU
+ * reset bits may have moved; device resume would reach the watchdog too
+ * late. First records what it finds (WTCON, WTDAT, WTCNT, PMU 0x408 and
+ * 0x40c), then, in the 4.9 order: PMU AUTOMATIC_WDT_RESET_DISABLE bit off,
+ * WTDAT = WTCNT = the kept-armed count, WTCON = the kept-armed WTCON saved
+ * at suspend, PMU MASK_WDT_RESET bit off. It is a reload and obeys the
+ * crownlte rules: once petting has stopped for good or the deadline has
+ * passed, a counter found running with the reset enabled is left alone
+ * (-ETIME); one found stopped is started again with the full count (as
+ * s3c2410wdt_resume() does), so the due reset still happens.
+ * Only after a kept-armed suspend (-ENOENT otherwise, nothing written).
+ * Device resume then restores the run-time timeout as before.
+ * Not called by suspend S1a/S1b, which never sleep.
+ */
+int s3c2410wdt_crownlte_resume_early(struct crownlte_wdt_early *e)
+{
+	struct s3c2410_wdt *wdt = smp_load_acquire(&s3c2410wdt_crownlte);
+	const u32 on = S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN;
+	unsigned long flags;
+	bool may, running;
+	int ret = 0;
+
+	memset(e, 0, sizeof(*e));
+	if (!wdt)
+		return -ENODEV;
+	e->found_wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	e->found_wtdat = readl(wdt->reg_base + S3C2410_WTDAT);
+	e->found_wtcnt = readl(wdt->reg_base + S3C2410_WTCNT);
+	s3c2410wdt_crownlte_pmu_read(wdt, &e->found_auto_disable,
+				     &e->found_mask_reset);
+	running = (e->found_wtcon & on) == on;
+
+	spin_lock_irqsave(&wdt->lock, flags);
+	if (!wdt->suspended_armed || !(wdt->wtcon_armed & S3C2410_WTCON_ENABLE)) {
+		ret = -ENOENT;
+	} else {
+		may = s3c2410wdt_may_pet(wdt);
+		if (may || !running) {
+			if (wdt->drv_data->quirks & QUIRK_HAS_PMU_AUTO_DISABLE)
+				s3c2410wdt_disable_wdt_reset(wdt, false);
+			writel(wdt->count, wdt->reg_base + S3C2410_WTDAT);
+			writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+			writel(wdt->wtcon_armed, wdt->reg_base + S3C2410_WTCON);
+			if (wdt->drv_data->quirks & QUIRK_HAS_PMU_MASK_RESET)
+				s3c2410wdt_mask_wdt_reset(wdt, false);
+			e->reloaded = true;
+		} else {
+			ret = -ETIME;
+		}
+	}
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	if (ret == -ETIME)
+		s3c2410wdt_deadline_report(wdt);
+
+	e->wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	e->wtdat = readl(wdt->reg_base + S3C2410_WTDAT);
+	e->wtcnt = readl(wdt->reg_base + S3C2410_WTCNT);
+	s3c2410wdt_crownlte_pmu_read(wdt, &e->auto_disable, &e->mask_reset);
+	e->timeout = wdt->wdt_device.timeout;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_resume_early);
+
 static int s3c2410wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1666,6 +1750,7 @@ static int s3c2410wdt_suspend_keep_armed(struct s3c2410_wdt *wdt, u32 wtcon)
 			wtcon);
 		return -EIO;
 	}
+	wdt->wtcon_armed = wtcon;
 	wdt->suspended_armed = true;
 	dev_info(dev, "suspend: kept armed, timeout %u s, WTCON %#x\n",
 		 wdt->wdt_device.timeout, wtcon);

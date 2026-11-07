@@ -20,11 +20,22 @@ struct crownlte_wdt_state {
 	u64 deadline_ns;		/* CLOCK_BOOTTIME reload deadline, 0: none */
 };
 
+/* s3c2410wdt_crownlte_resume_early(): what it found, and what it left */
+struct crownlte_wdt_early {
+	u32 found_wtcon, found_wtdat, found_wtcnt;
+	u32 found_auto_disable, found_mask_reset;	/* PMU 0x408, 0x40c */
+	u32 wtcon, wtdat, wtcnt;
+	u32 auto_disable, mask_reset;
+	unsigned int timeout;		/* seconds, kept-armed setting */
+	bool reloaded;			/* counter and control written */
+};
+
 #if IS_REACHABLE(CONFIG_S3C2410_WATCHDOG)
 int s3c2410wdt_crownlte_ping(void);
 int s3c2410wdt_crownlte_stop_petting(const char *why);
 int s3c2410wdt_crownlte_set_deadline(u64 boot_ns);
 bool s3c2410wdt_crownlte_state(struct crownlte_wdt_state *st);
+int s3c2410wdt_crownlte_resume_early(struct crownlte_wdt_early *e);
 #else
 static inline int s3c2410wdt_crownlte_ping(void)
 {
@@ -44,6 +55,11 @@ static inline int s3c2410wdt_crownlte_set_deadline(u64 boot_ns)
 static inline bool s3c2410wdt_crownlte_state(struct crownlte_wdt_state *st)
 {
 	return false;
+}
+
+static inline int s3c2410wdt_crownlte_resume_early(struct crownlte_wdt_early *e)
+{
+	return -ENODEV;
 }
 #endif
 

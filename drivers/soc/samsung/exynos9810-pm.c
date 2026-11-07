@@ -349,6 +349,9 @@ static struct e9810_pm {
 	enum s0_result s1_res[2];
 	char s1_why[2][96];
 	bool s1_spi31_enabled;		/* S1a: GICD ISENABLER1 bit 31 */
+	/* S1c..S1e post-return block (not called in this build) */
+	struct crownlte_wdt_early wdt_early;
+	int wdt_early_ret;
 } e9pm;
 
 static DEFINE_PER_CPU(struct e9810_hp, e9810_hp);
@@ -2271,6 +2274,32 @@ static void s1_run(void)
 	s1a_run();
 	if (e9pm.s1_want[1])
 		s1b_run();
+}
+
+/*
+ * S1c..S1e only (design C3/C4); nothing calls these in S1a/S1b, which never
+ * sleep. e9810_s1_post_return() is the first thing .enter must run after a
+ * real cpu_suspend() returns: CPU0, interrupts off, before syscore resume
+ * (timekeeping, cpu_pm, this driver's cal_pm_exit). If PERIS lost power in
+ * SLEEP the CL0 watchdog is back at its ~2.6 s reset value; this restores
+ * the kept-armed 60 s at once, as 4.9's syscore resume did. Store only:
+ * e9810_s1_post_return_print() logs once printk is safe again.
+ */
+static void __maybe_unused e9810_s1_post_return(void)
+{
+	e9pm.wdt_early_ret = s3c2410wdt_crownlte_resume_early(&e9pm.wdt_early);
+}
+
+static void __maybe_unused e9810_s1_post_return_print(void)
+{
+	const struct crownlte_wdt_early *e = &e9pm.wdt_early;
+
+	s1_info("step 40 wdt found WTCON=%#x WTDAT=%#x WTCNT=%#x auto_disable=%#x mask=%#x -> %s (%d): WTCON=%#x WTDAT=%#x WTCNT=%#x auto_disable=%#x mask=%#x, %u s\n",
+		e->found_wtcon, e->found_wtdat, e->found_wtcnt,
+		e->found_auto_disable, e->found_mask_reset,
+		e->reloaded ? "re-armed" : "NOT re-armed", e9pm.wdt_early_ret,
+		e->wtcon, e->wtdat, e->wtcnt, e->auto_disable, e->mask_reset,
+		e->timeout);
 }
 
 static void s1_summary(void)
