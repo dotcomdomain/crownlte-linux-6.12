@@ -158,3 +158,16 @@ config EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET
 	  STOP, matching the original 4.9 best-effort reset policy.
 	  This may fail to reset or return. Manual Download Mode restore and an
 	  available owner are still required. Never enable for Android production.
+
+config EXYNOS9810_PM
+	bool "crownlte system suspend, stage S0 (no firmware sleep)"
+	depends on EXYNOS9810_LEGACY_CAL && OF && ARM64
+	depends on SUSPEND && HOTPLUG_CPU
+	help
+	  Exynos 9810 (crownlte) suspend-to-RAM platform driver, stage S0:
+	  4.9 CPU hotplug power hooks, platform suspend and syscore ops for
+	  SYS_SLEEP with the APM hand-off withheld, and a .enter that never
+	  calls the firmware (dry run). DT-gated: only DTBs that enable the
+	  samsung,exynos9810-pm node and list samsung,suspend-s0 stages use
+	  it. The S0c pm_test stage needs PM_DEBUG.
+	  See Documentation/crownlte/suspend-s0.md.
