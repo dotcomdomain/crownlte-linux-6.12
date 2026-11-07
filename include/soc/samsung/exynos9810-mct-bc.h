@@ -17,11 +17,18 @@ struct exynos9810_mct_bc_stats {
 #ifdef CONFIG_EXYNOS9810_MCT_BROADCAST
 /* True once the MCT passed its self-check and is the broadcast device. */
 bool exynos9810_mct_bc_ready(void);
+/* Boot time (ms) the MCT became the broadcast device, 0 if never. */
+u64 exynos9810_mct_bc_ready_ms(void);
 void exynos9810_mct_bc_get_stats(struct exynos9810_mct_bc_stats *s);
 #else
 static inline bool exynos9810_mct_bc_ready(void)
 {
 	return false;
+}
+
+static inline u64 exynos9810_mct_bc_ready_ms(void)
+{
+	return 0;
 }
 
 static inline void exynos9810_mct_bc_get_stats(struct exynos9810_mct_bc_stats *s)

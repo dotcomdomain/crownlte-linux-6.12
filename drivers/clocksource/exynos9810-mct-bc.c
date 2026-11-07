@@ -98,6 +98,7 @@ static void __iomem *mct_base;
 static int mct_irq = -1;
 static u32 mct_rate;
 static bool mct_ready;
+static u64 mct_ready_ms;		/* boot time of registration, 0 = never */
 static bool mct_irq_stuck;
 static const char *mct_why = "not probed";
 
@@ -350,6 +351,11 @@ bool exynos9810_mct_bc_ready(void)
 	return READ_ONCE(mct_ready);
 }
 
+u64 exynos9810_mct_bc_ready_ms(void)
+{
+	return READ_ONCE(mct_ready_ms);
+}
+
 void exynos9810_mct_bc_get_stats(struct exynos9810_mct_bc_stats *s)
 {
 	s->irqs = atomic64_read(&mct_irqs);
@@ -506,6 +512,7 @@ static int mct_bc_probe(struct platform_device *pdev)
 	if (mct_why) {
 		pr_warn("not used, hrtimer broadcast stays: %s\n", mct_why);
 	} else {
+		WRITE_ONCE(mct_ready_ms, ktime_to_ms(ktime_get_boottime()));
 		WRITE_ONCE(mct_ready, true);
 		pr_info("tick broadcast device registered: rate=%u Hz rate_ppm=%lld test_late_max_us=%llu irq=%d\n",
 			mct_rate, mct_probe.rate_ppm,
