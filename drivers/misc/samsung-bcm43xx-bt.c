@@ -73,31 +73,33 @@ struct pcal_dump_group {
 	u8 reg;
 	u8 n;
 	bool volatile_reg;	/* changes on its own: not compared */
-	bool ext;		/* PCAL6524 extension: 4.9 never read it */
 };
 
 /*
  * Every readable PCAL6524 register (interrupt clear 0x68-0x6a is write-only
  * and skipped). Reads have no side effects except that reading the input
  * ports clears a pending expander interrupt, which nothing uses on 6.12.
- * All of them answered on hardware (B1-read, 2026-11-07).
+ * All of them answered on hardware (B1-read, 2026-11-07), including the
+ * PCAL6524 extensions from 0x60 on that 4.9 never read. This board has a
+ * PCAL6524, so every one of them is mandatory: a failed read is a transfer
+ * error, never evidence that a register is absent.
  */
 static const struct pcal_dump_group pcal_groups[] = {
-	{ "in",		0x00, 3, true,  false },
-	{ "out",	0x04, 3, false, false },
-	{ "pol",	0x08, 3, false, false },
-	{ "cfg",	0x0c, 3, false, false },
-	{ "drv",	0x40, 6, false, false },
-	{ "latch",	0x48, 3, false, false },
-	{ "pull_en",	0x4c, 3, false, false },
-	{ "pull_sel",	0x50, 3, false, false },
-	{ "int_mask",	0x54, 3, false, false },
-	{ "int_stat",	0x58, 3, true,  false },
-	{ "out_cfg",	0x5c, 1, false, false },
-	{ "int_edge",	0x60, 6, false, true },
-	{ "in_stat",	0x6c, 3, true,  true },
-	{ "out_indcfg",	0x70, 3, false, true },
-	{ "debounce",	0x74, 3, false, true },
+	{ "in",		0x00, 3, true },
+	{ "out",	0x04, 3, false },
+	{ "pol",	0x08, 3, false },
+	{ "cfg",	0x0c, 3, false },
+	{ "drv",	0x40, 6, false },
+	{ "latch",	0x48, 3, false },
+	{ "pull_en",	0x4c, 3, false },
+	{ "pull_sel",	0x50, 3, false },
+	{ "int_mask",	0x54, 3, false },
+	{ "int_stat",	0x58, 3, true },
+	{ "out_cfg",	0x5c, 1, false },
+	{ "int_edge",	0x60, 6, false },
+	{ "in_stat",	0x6c, 3, true },
+	{ "out_indcfg",	0x70, 3, false },
+	{ "debounce",	0x74, 3, false },
 };
 
 #define PCAL_DUMP_BYTES		49	/* sum of pcal_groups[].n */
@@ -105,8 +107,8 @@ static const struct pcal_dump_group pcal_groups[] = {
 
 struct pcal_dump {
 	bool valid;
-	bool ext_missing;	/* extension registers did not answer */
 	int err;
+	int err_reg;		/* register whose read failed, -1: none */
 	u8 v[PCAL_DUMP_BYTES];
 };
 
@@ -205,18 +207,14 @@ static int pcal_dump_read(struct bcm43xx_bt *bt, struct pcal_dump *d)
 	int ret;
 
 	memset(d, 0, sizeof(*d));
+	d->err_reg = -1;
 	for (g = 0; g < ARRAY_SIZE(pcal_groups); g++) {
 		for (i = 0; i < pcal_groups[g].n; i++, k++) {
-			if (pcal_groups[g].ext && d->ext_missing)
-				continue;
+			/* every register is mandatory (see pcal_groups) */
 			ret = pcal_read(bt, pcal_groups[g].reg + i, &d->v[k]);
-			if (ret && pcal_groups[g].ext) {
-				/* checked by the caller against the baseline */
-				d->ext_missing = true;
-				continue;
-			}
 			if (ret) {
 				d->err = ret;
+				d->err_reg = pcal_groups[g].reg + i;
 				return ret;
 			}
 			if (k && d->v[k] != d->v[0])
@@ -241,20 +239,22 @@ static void pcal_dump_print(struct bcm43xx_bt *bt, const char *tag,
 	int n = 0;
 
 	if (!d->valid) {
-		dev_info(bt->dev, "%s exp dump failed: %d\n", tag, d->err);
+		if (!d->err)	/* never read, e.g. no baseline at probe */
+			dev_info(bt->dev, "%s exp dump not taken\n", tag);
+		else if (d->err_reg >= 0)
+			dev_info(bt->dev, "%s exp dump failed: reg 0x%02x read error %d\n",
+				 tag, d->err_reg, d->err);
+		else
+			dev_info(bt->dev, "%s exp dump failed: %d (all registers read one value)\n",
+				 tag, d->err);
 		return;
 	}
 	for (g = 0; g < ARRAY_SIZE(pcal_groups); g++) {
 		n += scnprintf(line + n, sizeof(line) - n, " %s=",
 			       pcal_groups[g].name);
-		for (i = 0; i < pcal_groups[g].n; i++, k++) {
-			if (pcal_groups[g].ext && d->ext_missing)
-				n += scnprintf(line + n, sizeof(line) - n,
-					       "%s--", i ? "," : "");
-			else
-				n += scnprintf(line + n, sizeof(line) - n,
-					       "%s%02x", i ? "," : "", d->v[k]);
-		}
+		for (i = 0; i < pcal_groups[g].n; i++, k++)
+			n += scnprintf(line + n, sizeof(line) - n,
+				       "%s%02x", i ? "," : "", d->v[k]);
 		/* two lines: input..config, then the rest */
 		if (g == PCAL_LAST_BASE_GROUP || g == ARRAY_SIZE(pcal_groups) - 1) {
 			dev_info(bt->dev, "%s exp%s\n", tag, line);
@@ -310,8 +310,6 @@ static int pcal_dump_compare(struct bcm43xx_bt *bt, const char *tag,
 
 			if (pcal_groups[g].volatile_reg)
 				continue;
-			if (pcal_groups[g].ext && bt->baseline.ext_missing)
-				continue;
 			if (k == out0)
 				ref = bt->exp_out0;
 			if (k == cfg0)
@@ -331,8 +329,8 @@ static int pcal_dump_compare(struct bcm43xx_bt *bt, const char *tag,
 
 /*
  * Mandatory check before and after every expander write: no driver bound,
- * every register readable (extension registers too if they answered at
- * probe), every non-volatile register as expected, and P0_7, if it is an
+ * every register of pcal_groups readable (no exceptions), every
+ * non-volatile register as expected, and P0_7, if it is an
  * output, at the level it is driven to. Any failure latches the expander
  * unsafe. @tag: print the dump (self-test); failures always print it.
  */
@@ -364,10 +362,6 @@ static int pcal_validate(struct bcm43xx_bt *bt, const char *tag,
 	if (ret) {
 		pcal_set_unsafe(bt, "register read failed", ret);
 		return ret;
-	}
-	if (d->ext_missing && !bt->baseline.ext_missing) {
-		pcal_set_unsafe(bt, "extension registers stopped answering", -EIO);
-		return -EIO;
 	}
 	diffs = pcal_dump_compare(bt, t, d, mask_bit7);
 	out0 = pcal_dump_reg(d, PCAL_OUT0);
@@ -1283,11 +1277,21 @@ static void bt_probe_expander(struct bcm43xx_bt *bt)
 		pcal_set_unsafe(bt, "driver bound at probe", -EBUSY);
 		return;
 	}
+	/*
+	 * The baseline must be complete: every register, the PCAL6524
+	 * extensions included. Any read error (also a transient one) leaves
+	 * no baseline and latches unsafe, so nothing is ever written.
+	 */
 	if (pcal_dump_read(bt, &bt->baseline)) {
-		dev_err(dev, "expander %s unreadable (%d): BT power disabled\n",
-			dev_name(&bt->exp->dev), bt->baseline.err);
+		if (bt->baseline.err_reg >= 0)
+			dev_err(dev, "expander %s reg 0x%02x unreadable (%d): no complete baseline, BT power disabled\n",
+				dev_name(&bt->exp->dev), bt->baseline.err_reg,
+				bt->baseline.err);
+		else
+			dev_err(dev, "expander %s reads one constant value (%d): no baseline, BT power disabled\n",
+				dev_name(&bt->exp->dev), bt->baseline.err);
 		bt->baseline.valid = false;
-		pcal_set_unsafe(bt, "unreadable at probe", bt->baseline.err);
+		pcal_set_unsafe(bt, "baseline incomplete at probe", bt->baseline.err);
 		return;
 	}
 	pcal_dump_print(bt, "probe", &bt->baseline);
