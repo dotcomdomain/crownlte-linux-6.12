@@ -1,0 +1,12 @@
+# crownlte runtime C2, S0 generic backstop (Documentation/crownlte/c2-runtime.md).
+# Apply on top of the ROM-in-RAM diagnostic .config, then olddefconfig.
+
+# Buddy hard-lockup detector: a CPU whose watchdog hrtimer stops (a core
+# lost in C2/EL3) is found by its buddy within about 12-24 s, and that
+# panics (panic=30 bootarg, the watchdog is no longer petted). arm64 has no
+# pseudo-NMI on GICv2, so the perf detector is not usable and the buddy
+# detector is selected without HARDLOCKUP_DETECTOR_PREFER_BUDDY.
+CONFIG_HARDLOCKUP_DETECTOR=y
+CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=y
+# A soft lockup is reported only.
+# CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC is not set
