@@ -293,6 +293,40 @@
 			};
 		};
 
+		/*
+		 * PCIe RC channel 0 (BCM4361 Wi-Fi), 4.9 pcie0@116A0000. Same
+		 * register windows as 4.9 ("sysreg" is the 16-byte PHY/PCS lane
+		 * control window in SYSREG_FSYS1), ip-ver 0x981000, Gen2 x1,
+		 * INTx only (4.9 use-msi = "false"). No dma-coherent and no
+		 * SysMMU: see Documentation/crownlte/wifi-port.md.
+		 */
+		pcie0: pcie@116a0000 {
+			compatible = "samsung,exynos9810-pcie";
+			reg = <0x116a0000 0x1000>,
+			      <0x116d0000 0x1000>,
+			      <0x11411044 0x10>,
+			      <0x11700000 0x1000>,
+			      <0x116c0000 0x1fc>,
+			      <0x127fe000 0x2000>,
+			      <0x11680000 0x1000>;
+			reg-names = "elbi", "phy", "sysreg", "dbi", "pcs", "config", "ia";
+			interrupts = <GIC_SPI 253 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			device_type = "pci";
+			ranges = <0x82000000 0x0 0x11800000 0x11800000 0x0 0xff0000>;
+			bus-range = <0x00 0xff>;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 0>;
+			interrupt-map = <0 0 0 0 &gic GIC_SPI 253 IRQ_TYPE_LEVEL_HIGH>;
+			num-lanes = <1>;
+			max-link-speed = <2>;
+			samsung,channel = <0>;
+			samsung,use-ia;
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			status = "disabled";
+		};
+
 		pmu_system_controller: system-controller@14060000 {
 			compatible = "samsung,exynos9810-pmu",
 				     "samsung,exynos7-pmu", "syscon";

@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Wi-Fi stage 1: the delayed-UFS diagnostic plus PCIe channel 0 and the
+ * BCM4361. Kept out of the base diagnostic DTS so that no other DTB powers
+ * the Wi-Fi chip; see Documentation/crownlte/wifi-port.md.
+ *
+ * At boot: WLAN_REG_ON high, 200 ms, PCIe link training, enumeration, DHD
+ * attach (chip id read over BAR0), then DHD powers the chip off again.
+ * This kernel-only vehicle cannot reach /vendor/firmware and PID1 restarts
+ * at 120 s, so the self-test runs at 100 s and stops after the chip id
+ * (samsung,wifi-selftest-no-firmware): "wifi selftest: RESULT PASS-NOFW".
+ * The firmware/scan stage runs from the ROM-in-RAM DTB (wifi-s1).
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + Wi-Fi stage 1";
+};
+
+&pcie0 {
+	status = "okay";
+};
+
+&wlan {
+	samsung,wifi-selftest;
+	samsung,wifi-selftest-ms = <100000>;
+	samsung,wifi-selftest-no-firmware;
+	status = "okay";
+};

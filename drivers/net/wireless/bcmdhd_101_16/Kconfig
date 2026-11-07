@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Samsung bcmdhd 101.16 for the Galaxy Note9 (crownlte) on 6.12.
+# Trimmed from the 4.9 Kconfig: only the BCM4361/PCIe symbols that the
+# crownlte 4.9 build used are kept, with the same names and defaults,
+# because the Kbuild file and the sources test them.
+#
+
+config BROADCOM_WIFI
+	bool "Broadcom DHD Wi-Fi driver (Samsung bcmdhd 101.16)"
+	depends on WLAN && CFG80211=y && OF
+	help
+	  Samsung's Broadcom DHD driver as used by the crownlte 4.9 kernel.
+	  The Lineage Wi-Fi HAL on /vendor talks to this driver through
+	  nl80211 vendor commands, Android private commands and /sys/wifi,
+	  not to brcmfmac. Built in only: the HAL expects /sys/module/dhd.
+
+config BCM4361
+	bool "Broadcom BCM4361 PCIe (crownlte)"
+	depends on BROADCOM_WIFI && PCI && PCIE_EXYNOS9810
+	select FW_LOADER
+	help
+	  BCM4361 on Exynos 9810 PCIe channel 0. Nothing happens unless the
+	  samsung,brcm-wlan DT node is enabled.
+	  See Documentation/crownlte/wifi-port.md.
+
+config BCMDHD_PCIE
+	def_bool y
+	depends on BCM4361
+
+config BCMDHD_FW_PATH
+	string "Firmware path"
+	depends on BROADCOM_WIFI
+	default "/etc/wifi/bcmdhd_sta.bin"
+
+config BCMDHD_NVRAM_PATH
+	string "NVRAM path"
+	depends on BROADCOM_WIFI
+	default "/etc/wifi/nvram_net.txt"
+
+config BROADCOM_WIFI_RESERVED_MEM
+	bool "Preallocated memory for the Wi-Fi driver"
+	depends on BROADCOM_WIFI
+	default y
+
+config BCMDHD_PREALLOC_MEMDUMP
+	bool "Preallocated dongle memory dump buffer"
+	depends on BROADCOM_WIFI_RESERVED_MEM
+	default y
+
+config BCMDHD_OOB_HOST_WAKE
+	bool "Use the external WLAN_HOST_WAKE pin"
+	depends on BROADCOM_WIFI
+	default y
+
+config BCMDHD_GET_OOB_STATE
+	bool "Report the WLAN_HOST_WAKE pin level"
+	depends on BCMDHD_OOB_HOST_WAKE
+	default y
+
+config WLAN_REGION_CODE
+	int "Region code for Broadcom Wi-Fi featured functions"
+	depends on BROADCOM_WIFI
+	default 100
+
+config WLAIBSS
+	bool "Advanced IBSS mode"
+	depends on BCM4361
+	default y
+
+config WL_RELMCAST
+	bool "Reliable Multicast Support"
+	depends on BCM4361
+	default y
