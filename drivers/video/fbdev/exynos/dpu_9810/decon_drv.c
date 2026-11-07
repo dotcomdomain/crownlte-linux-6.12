@@ -430,7 +430,9 @@ static int dpu_bounce_plane(struct dpu_dev *d, struct dpu_buf *b, void *dst,
 
 /*
  * Copy the scattered buffers of a commit into the decon-pool double buffer
- * (stopgap until the DPU SysMMU, branch crownlte-dpu-iommu, is merged). An
+ * (only without the DPU SysMMU, or with it as the fallback for a dma-buf
+ * that got no usable IOVA in dpu_iova_get(); then iommu-dma allocates the
+ * slots and they need not be contiguous in memory). An
  * AFBC stream is position independent relative to its base, so a byte copy
  * scans out identically. Runs in the update worker after the acquire fences,
  * outside hw_lock. Every window has its own pair of slots, sized to its
@@ -846,6 +848,8 @@ static int dpu_pending_resolve(struct dpu_dev *d, const char *who)
 	return ret ? -EBUSY : 0;
 }
 
+static unsigned int dpu_sysmmu_enabled(struct dpu_dev *d);
+
 static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 {
 	ktime_t t0;
@@ -903,16 +907,120 @@ static int dpu_apply(struct dpu_dev *d, struct dpu_commit *c)
 			if (c->cfg[i].state != DECON_WIN_STATE_BUFFER)
 				continue;
 			act = dpu_hw_dma_active_rd(d, c->cfg[i].idma_type, IDMA_IN_BASE_ADDR_Y);
+			c->act_base[i] = act;
+			if (c->proof)
+				c->act_base_c[i] = dpu_hw_dma_active_rd(d, c->cfg[i].idma_type,
+									IDMA_IN_BASE_ADDR_C);
 			if (act == lower_32_bits(c->buf[i].addr))
 				continue;
 			d->nr_base_mismatch++;
 			dev_warn_ratelimited(d->dev, "win%d dpp%u: active IDMA base %#x, programmed %pad\n",
 					     i, c->cfg[i].idma_type, act, &c->buf[i].addr);
 		}
+		/* the DPU domain is on (dpu_hw_powered()), so are the SysMMU views */
+		if (c->proof)
+			c->mmu_on = dpu_sysmmu_enabled(d);
 	}
 out:
 	mutex_unlock(&d->hw_lock);
 	return ret;
+}
+
+/*
+ * SysMMU scan proof. For the first DPU_IOVA_PROOF_FIRST latched user
+ * commits that scan a dma-buf through its cached IOVA, and every
+ * DPU_IOVA_PROOF_EVERY-th after, log per buffer window: the IDMA base the
+ * hardware latched (read back in dpu_apply()), the IOVA of the mapping and
+ * the physical page it translates to; per commit: all three SysMMUs
+ * translating at the latch (CTRL bit 0), no window bounce-copied, no bounce
+ * slot allocated. PASS means the DPP fetched the HWC buffers in place.
+ */
+#define DPU_IOVA_PROOF_FIRST	3
+#define DPU_IOVA_PROOF_EVERY	1000
+
+/* buffer windows of @c that scan their dma-buf through a cached IOVA */
+static unsigned int dpu_commit_iova_wins(const struct dpu_commit *c)
+{
+	unsigned int n = 0;
+	int i;
+
+	for (i = 0; i < DECON_MAX_WIN; i++)
+		if (c->cfg[i].state == DECON_WIN_STATE_BUFFER && c->buf[i].iova &&
+		    !(c->bounced & BIT(i)))
+			n++;
+	return n;
+}
+
+static void dpu_iova_proof(struct dpu_dev *d, const struct dpu_commit *c)
+{
+	unsigned int want = BIT(DPU_NR_SYSMMU) - 1, nbuf = 0, nok = 0;
+	u32 cached, maps, hits, unmaps;
+	size_t slots = 0;
+	bool pass;
+	int i, s;
+
+	for (i = 0; i < DECON_MAX_WIN; i++)
+		for (s = 0; s < 2; s++)
+			slots += d->bounce[i][s].size;
+	d->nr_iova_proofs++;
+
+	for (i = 0; i < DECON_MAX_WIN; i++) {
+		const struct dpu_buf *b = &c->buf[i], *cb = &c->cbuf[i];
+		u32 dpp = c->cfg[i].idma_type;
+		dma_addr_t ca = c->cofs[i] ? b->addr + c->cofs[i] : cb->addr;
+		bool two = c->cofs[i] || cb->dmabuf;
+		phys_addr_t pa, cpa = 0;
+		const char *st;
+
+		if (c->cfg[i].state != DECON_WIN_STATE_BUFFER)
+			continue;
+		nbuf++;
+		if (!b->iova || (c->bounced & BIT(i))) {
+			dev_info(d->dev, DPU_IOMMU_PFX "scan proof #%u win%d dpp%u: active IDMA base %#x = %s %pad, not a SysMMU mapping: FAIL\n",
+				 d->nr_iova_proofs, i, dpp, c->act_base[i],
+				 (c->bounced & BIT(i)) ? "bounce slot" : "per-frame import at",
+				 &b->addr);
+			continue;
+		}
+		pa = iommu_iova_to_phys(d->iommu, b->addr);
+		if (two)
+			cpa = iommu_iova_to_phys(d->iommu, ca);
+		if (c->act_base[i] != lower_32_bits(b->addr))
+			st = "BASE != IOVA: FAIL";
+		else if (!pa || (two && !cpa))
+			st = "IOVA NOT MAPPED: FAIL";
+		else if (two && c->act_base_c[i] != lower_32_bits(ca))
+			st = "CHROMA BASE != IOVA: FAIL";
+		else
+			st = NULL;
+		if (!st) {
+			st = "OK";
+			nok++;
+		}
+		if (two)
+			dev_info(d->dev, DPU_IOMMU_PFX "scan proof #%u win%d dpp%u: active IDMA base Y %#x C %#x, IOVA Y %pad -> PA %pa, C %pad -> PA %pa (%zu-byte dma-buf, %u physical chunks): %s\n",
+				 d->nr_iova_proofs, i, dpp, c->act_base[i], c->act_base_c[i],
+				 &b->addr, &pa, &ca, &cpa, b->dmabuf->size, b->nsegs, st);
+		else
+			dev_info(d->dev, DPU_IOMMU_PFX "scan proof #%u win%d dpp%u: active IDMA base %#x, IOVA %pad -> PA %pa (%zu-byte dma-buf, %u physical chunks): %s\n",
+				 d->nr_iova_proofs, i, dpp, c->act_base[i], &b->addr, &pa,
+				 b->dmabuf->size, b->nsegs, st);
+	}
+
+	mutex_lock(&d->iova_lock);
+	cached = d->iova_nr;
+	maps = d->iova_maps;
+	hits = d->iova_hits;
+	unmaps = d->iova_unmaps;
+	mutex_unlock(&d->iova_lock);
+
+	pass = nbuf && nok == nbuf && c->mmu_on == want && !c->bounced && !slots;
+	if (!pass)
+		d->nr_iova_proof_fails++;
+	dev_info(d->dev, DPU_IOMMU_PFX "scan proof #%u: %u/%u buffer windows scanned via IOVA (latched base == IOVA), %u bounce-copied; SysMMUs %#x of %#x translating; bounce slots %zu bytes, bounce copies since boot %u; IOVA cache %u (maps %u, hits %u, unmapped %u), SysMMU faults %d: %s\n",
+		 d->nr_iova_proofs, nok, nbuf, (unsigned int)hweight_long(c->bounced),
+		 c->mmu_on, want, slots, d->nr_bounces, cached, maps, hits, unmaps, atomic_read(&d->iommu_faults),
+		 pass ? "PASS" : "FAIL");
 }
 
 /*
@@ -1576,6 +1684,12 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 			dpu_commit_free(p);
 		}
 		c->result = dpu_bounce(d, c);
+		/* SysMMU scan proof: dpu_apply() reads back what it needs */
+		if (!c->result && d->iommu && !c->internal && dpu_commit_iova_wins(c)) {
+			u32 n = d->nr_iova_commits;
+
+			c->proof = n < DPU_IOVA_PROOF_FIRST || !((n + 1) % DPU_IOVA_PROOF_EVERY);
+		}
 		if (!c->result)
 			c->result = dpu_apply(d, c);
 	}
@@ -1598,6 +1712,18 @@ static void dpu_process(struct dpu_dev *d, struct dpu_commit *c)
 		dma_fence_signal(c->fence);
 	}
 	dpu_diag_post(d, &txt);		/* thumbnails, printed from system_wq */
+
+	/* after the fence: c becomes d->active below and is not freed yet */
+	if (c->result == 0 && !c->internal) {
+		unsigned int nw = dpu_commit_iova_wins(c);
+
+		if (nw) {
+			d->nr_iova_commits++;
+			d->nr_iova_wins += nw;
+		}
+		if (c->proof && !READ_ONCE(d->stopping))
+			dpu_iova_proof(d, c);
+	}
 
 	/*
 	 * Once the new configuration latched, the previous buffers are no
@@ -1964,6 +2090,11 @@ static int dpu_fb_ioctl_cmd(struct fb_info *info, unsigned int cmd, unsigned lon
 			 atomic_read(&d->te_count), d->nr_base_mismatch, d->nr_afbc,
 			 d->nr_scaled, d->nr_yuv, d->nr_rot, d->nr_hdr, d->nr_block,
 			 d->nr_bounces, d->bounce_max_us);
+		if (d->iommu)
+			dev_info(d->dev, DPU_IOMMU_PFX "dump: IOVA commits=%u windows=%u proofs=%u proof_fails=%u cache=%u maps=%u hits=%u unmapped=%u faults=%d quiesced=%d\n",
+				 d->nr_iova_commits, d->nr_iova_wins, d->nr_iova_proofs,
+				 d->nr_iova_proof_fails, d->iova_nr, d->iova_maps, d->iova_hits,
+				 d->iova_unmaps, atomic_read(&d->iommu_faults), d->fault_quiesced);
 		return 0;
 
 	case S3CFB_POWER_MODE:

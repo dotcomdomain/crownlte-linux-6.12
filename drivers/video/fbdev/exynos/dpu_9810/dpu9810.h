@@ -106,7 +106,10 @@ struct dpu_buf {
 	struct dpu_iova *iova;		/* cached SysMMU mapping (att/sgt unused) */
 };
 
-/* contiguous copy target for scattered buffers until the DPU SysMMU is in */
+/*
+ * Contiguous copy target for scattered buffers: without the DPU SysMMU, or
+ * with it for a dma-buf that got no usable IOVA (fallback)
+ */
 struct dpu_bounce {
 	void *vaddr;
 	dma_addr_t dma;
@@ -134,6 +137,11 @@ struct dpu_commit {
 	ktime_t queued;
 	u32 latch_us;			/* filled by the worker */
 	u32 fc_before, fc_after;
+	/* read back after the latch (dpu_apply()), for the SysMMU scan proof */
+	u32 act_base[DECON_MAX_WIN];	/* active IDMA_IN_BASE_ADDR_Y */
+	u32 act_base_c[DECON_MAX_WIN];	/* active IDMA_IN_BASE_ADDR_C */
+	bool proof;			/* log dpu_iova_proof() for this commit */
+	unsigned int mmu_on;		/* SysMMU CTRL bit 0 mask at the latch */
 	int result;
 };
 
@@ -181,6 +189,8 @@ struct dpu_dev {
 	struct mutex iova_lock;			/* the IOVA cache */
 	struct list_head iova_lru;
 	u32 iova_nr, iova_maps, iova_hits, iova_unmaps;
+	/* latched user commits / windows scanned via IOVA, scan proofs logged */
+	u32 nr_iova_commits, nr_iova_wins, nr_iova_proofs, nr_iova_proof_fails;
 
 	/* adopted SBoot state */
 	int boot_win, boot_dpp;
