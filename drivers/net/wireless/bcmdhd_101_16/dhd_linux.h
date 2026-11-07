@@ -286,7 +286,7 @@ extern int dhd_sel_ant_from_file(dhd_pub_t *dhd);
 #ifdef DHD_EXPORT_CNTL_FILE
 extern char version_info[MAX_VERSION_LEN];
 #endif /* DHD_EXPORT_CNTL_FILE */
-extern uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_ver);
+extern uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, uint nvram_len, char *clm_ver);
 #endif /* WRITE_WLANINFO */
 #ifdef LOGTRACE_FROM_FILE
 extern int dhd_logtrace_from_file(dhd_pub_t *dhd);

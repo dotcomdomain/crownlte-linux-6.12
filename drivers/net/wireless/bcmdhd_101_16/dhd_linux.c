@@ -10506,7 +10506,7 @@ dhd_optimised_preinit_ioctls(dhd_pub_t * dhd)
 					DHD_ERROR(("Couldn't find New line character\n"));
 				} else {
 					snprintf(clm_version,
-						strlen(clm_ver_temp) + strlen(ver_temp_buf),
+						min_t(size_t, strlen(clm_ver_temp) + strlen(ver_temp_buf), CLM_VER_STR_LEN),
 						"%s%s", clm_ver_temp, ver_temp_buf);
 					DHD_INFO(("[INFO]CLM/Blob/project version = %s\n",
 						clm_version));
@@ -10514,10 +10514,10 @@ dhd_optimised_preinit_ioctls(dhd_pub_t * dhd)
 				}
 			} else if (tokenlim == '\n') {
 				snprintf(clm_version,
-					strlen(clm_ver_temp) + strlen(", Blob ver = Major : ") + 1,
+					min_t(size_t, strlen(clm_ver_temp) + strlen(", Blob ver = Major : ") + 1, CLM_VER_STR_LEN),
 					"%s, Blob ver = Major : ", clm_ver_temp);
 				snprintf(clm_version,
-					strlen(clm_ver_temp) + strlen(ver_temp_buf) + 1,
+					min_t(size_t, strlen(clm_ver_temp) + strlen(ver_temp_buf) + 1, CLM_VER_STR_LEN),
 					"%s%s", clm_ver_temp, ver_temp_buf);
 				DHD_INFO(("[INFO]CLM/Blob/project version = %s\n", clm_version));
 			}
@@ -10533,7 +10533,7 @@ dhd_optimised_preinit_ioctls(dhd_pub_t * dhd)
 
 #ifdef WRITE_WLANINFO
 #ifdef DHD_SUPPORT_VFS_CALL
-	sec_save_wlinfo(fw_version, EPI_VERSION_STR, dhd->info->nv_path, clm_version);
+	sec_save_wlinfo(fw_version, EPI_VERSION_STR, dhd->info->nv_path, 0, clm_version);
 #else
 	do {
 		uint len = MAX_NVRAMBUF_SIZE;
@@ -10545,7 +10545,7 @@ dhd_optimised_preinit_ioctls(dhd_pub_t * dhd)
 			break;
 		}
 
-		sec_save_wlinfo(fw_version, EPI_VERSION_STR, memblock, clm_version);
+		sec_save_wlinfo(fw_version, EPI_VERSION_STR, memblock, len, clm_version);
 		if (memblock) {
 			dhd_free_download_buffer(dhd, memblock, len);
 		}
@@ -11997,7 +11997,7 @@ dhd_legacy_preinit_ioctls(dhd_pub_t *dhd)
 					DHD_ERROR(("Couldn't find New line character\n"));
 				} else {
 					snprintf(clm_version,
-						strlen(clm_ver_temp) + strlen(ver_temp_buf),
+						min_t(size_t, strlen(clm_ver_temp) + strlen(ver_temp_buf), CLM_VER_STR_LEN),
 						"%s%s",	clm_ver_temp, ver_temp_buf);
 					DHD_INFO(("[INFO]CLM/Blob/project version = %s\n",
 						clm_version));
@@ -12005,10 +12005,10 @@ dhd_legacy_preinit_ioctls(dhd_pub_t *dhd)
 				}
 			} else if (tokenlim == '\n') {
 				snprintf(clm_version,
-					strlen(clm_ver_temp) + strlen(", Blob ver = Major : ") + 1,
+					min_t(size_t, strlen(clm_ver_temp) + strlen(", Blob ver = Major : ") + 1, CLM_VER_STR_LEN),
 					"%s, Blob ver = Major : ", clm_ver_temp);
 				snprintf(clm_version,
-					strlen(clm_ver_temp) + strlen(ver_temp_buf) + 1,
+					min_t(size_t, strlen(clm_ver_temp) + strlen(ver_temp_buf) + 1, CLM_VER_STR_LEN),
 					"%s%s",	clm_ver_temp, ver_temp_buf);
 				DHD_INFO(("[INFO]CLM/Blob/project version = %s\n", clm_version));
 			}
@@ -12024,7 +12024,7 @@ dhd_legacy_preinit_ioctls(dhd_pub_t *dhd)
 
 #ifdef WRITE_WLANINFO
 #ifdef DHD_SUPPORT_VFS_CALL
-	sec_save_wlinfo(fw_version, EPI_VERSION_STR, dhd->info->nv_path, clm_version);
+	sec_save_wlinfo(fw_version, EPI_VERSION_STR, dhd->info->nv_path, 0, clm_version);
 #else
 	do {
 		uint len = MAX_NVRAMBUF_SIZE;
@@ -12036,7 +12036,7 @@ dhd_legacy_preinit_ioctls(dhd_pub_t *dhd)
 			break;
 		}
 
-		sec_save_wlinfo(fw_version, EPI_VERSION_STR, memblock, clm_version);
+		sec_save_wlinfo(fw_version, EPI_VERSION_STR, memblock, len, clm_version);
 		if (memblock) {
 			dhd_free_download_buffer(dhd, memblock, len);
 		}

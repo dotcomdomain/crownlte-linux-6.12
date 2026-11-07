@@ -722,7 +722,7 @@ int write_filesystem(struct file *file, unsigned long long offset,
 	return ret;
 }
 
-uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_ver)
+uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, uint nvram_len, char *clm_ver)
 {
 #ifndef DHD_EXPORT_CNTL_FILE
 	struct file *fp = NULL;
@@ -787,7 +787,9 @@ uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_v
 #else
 		bzero(temp_buf, sizeof(temp_buf));
 		/* crownlte: keep a NUL inside temp_buf (FORTIFY strlen panicked on 6.12) */
-		(void)memcpy_s(temp_buf, sizeof(temp_buf), nvram_p, sizeof(temp_buf) - 1);
+		/* crownlte: the NVRAM buffer is exactly nvram_len bytes long */
+		(void)memcpy_s(temp_buf, sizeof(temp_buf), nvram_p,
+			min_t(size_t, nvram_len, sizeof(temp_buf) - 1));
 		temp_buf[sizeof(temp_buf) - 1] = '\0';
 		DHD_INFO(("[WIFI_SEC] NVRAM version_info exits\n"));
 #endif /* DHD_SUPPORT_VFS_CALL */

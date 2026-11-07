@@ -81,7 +81,8 @@ static int crownlte_selftest_fn(void *arg)
 	const char *fail = NULL;
 	bool opened = false, shared = false, nofw = false;
 	u64 t0;
-	u32 chip = 0, rev = 0;
+	u32 chip = 0, rev = 0, pkg = 0;
+	int busstate = 0, up = 0;
 	int ret;
 
 	while (!kthread_should_stop()) {
@@ -136,18 +137,33 @@ static int crownlte_selftest_fn(void *arg)
 		goto out;
 	}
 
-	/* 4. chip id (read by si_attach() at DHD attach, no new access) */
+	/*
+	 * 4. chip id (read by si_attach() at DHD attach, no new access). Wi-Fi off
+	 * (si_detach, bus->sih = NULL) runs under the DHD power-transition mutex,
+	 * so hold it, via a referenced wlan0, across the check and all reads.
+	 */
+	ndev = dev_get_by_name(&init_net, "wlan0");
+	if (!ndev) {
+		pr_info(WST "no wlan0\n");
+		fail = "wlan0";
+		goto out;
+	}
+	dhd_net_if_lock(ndev);
 	dhdp = g_dhd_pub;
-	pr_info(WST "chip: dhd_pub %p bus %p\n", dhdp, dhdp ? dhdp->bus : NULL);
 	if (!dhdp || !dhdp->bus || !dhd_bus_sih_ok(dhdp)) {
-		pr_info(WST "chip: DHD not attached\n");
+		dhd_net_if_unlock(ndev);
+		pr_info(WST "chip: DHD not attached or si torn down\n");
 		fail = "dhd-attach";
 		goto out;
 	}
 	chip = dhd_bus_chip_id(dhdp);
 	rev = dhd_bus_chiprev_id(dhdp);
+	pkg = dhd_bus_chippkg_id(dhdp);
+	busstate = dhdp->busstate;
+	up = dhdp->up;
+	dhd_net_if_unlock(ndev);
 	pr_info(WST "chip 0x%04x rev %u pkg %u busstate %d up %d\n", chip, rev,
-		dhd_bus_chippkg_id(dhdp), dhdp->busstate, dhdp->up);
+		pkg, busstate, up);
 	if (chip != BCM4361_CHIP_ID) {
 		fail = "chip-id";
 		goto out;
@@ -158,13 +174,7 @@ static int crownlte_selftest_fn(void *arg)
 		goto out;
 	}
 
-	/* 5. wlan0 up: firmware download and dongle init */
-	ndev = dev_get_by_name(&init_net, "wlan0");
-	if (!ndev) {
-		pr_info(WST "no wlan0\n");
-		fail = "wlan0";
-		goto out;
-	}
+	/* 5. wlan0 up: firmware download and dongle init (ndev referenced in 4) */
 	/* check and open atomically under RTNL: never adopt a userspace-owned wlan0 */
 	t0 = ktime_get_boottime_ns();
 	rtnl_lock();
