@@ -311,6 +311,12 @@ int cal_pm_earlywakeup(int mode)
 	return pmucal_system_earlywakeup(mode);
 }
 
+/* crownlte suspend S0: cal_pm_enter() minus the APM GRP2 hand-off. */
+int cal_pm_enter_unarmed(int mode, unsigned int *skipped)
+{
+	return pmucal_system_enter_unarmed(mode, skipped);
+}
+
 int cal_cpu_enable(unsigned int cpu)
 {
 	int ret;

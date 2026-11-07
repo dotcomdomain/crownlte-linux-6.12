@@ -38,6 +38,7 @@ enum sys_powerdown {
 extern int pmucal_system_enter(int mode);
 extern int pmucal_system_exit(int mode);
 extern int pmucal_system_earlywakeup(int mode);
+extern int pmucal_system_enter_unarmed(int mode, unsigned int *skipped);
 extern int pmucal_system_init(void);
 
 extern struct pmucal_seq pmucal_lpm_init[];

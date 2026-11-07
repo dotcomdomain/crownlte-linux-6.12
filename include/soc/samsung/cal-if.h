@@ -36,6 +36,8 @@ extern int cal_pd_set_smc_id(unsigned int id, int need_smc);
 extern int cal_pm_enter(int mode);
 extern int cal_pm_exit(int mode);
 extern int cal_pm_earlywakeup(int mode);
+/* crownlte suspend S0: cal_pm_enter() without the APM GRP2 hand-off */
+extern int cal_pm_enter_unarmed(int mode, unsigned int *skipped);
 
 extern int cal_cpu_enable(unsigned int cpu);
 extern int cal_cpu_disable(unsigned int cpu);
