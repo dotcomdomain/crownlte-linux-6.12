@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ROM-in-RAM integration 6 + runtime C2 stage S2: every CPU ticks on its own
- * MCT local timer (4.9 parity), and C2 is armed on LITTLE cpu1-3 (no
- * cluster-0 concurrency limit, as on 4.9) plus big cpu4-7 from 45 s boot
- * time. CPU0 stays out of C2. Needs the S0 chain of crownlte-c2-runtime
- * (lost-core detector, watchdog final stop, quarantine record v3, buddy
- * hard-lockup panic). See Documentation/crownlte/c2-s2.md.
+ * ROM-in-RAM integration 6 + runtime C2 stage S2, fix round 1: LITTLE
+ * cpu1-3 tick on their own MCT local timers (4.9 parity for the LITTLE
+ * cluster only), and C2 is armed on LITTLE cpu1-3 (no cluster-0
+ * concurrency limit, as on 4.9) plus big cpu4-7 from 45 s boot time. CPU0
+ * and the big cores keep the arch timer + MCT G0 broadcast (S1a). CPU0
+ * stays out of C2. The local timer takeover happens at the C2 boot arming,
+ * after the quarantine record (v4) holds the local-timer session. Needs the
+ * S0 chain of crownlte-c2-runtime (lost-core detector, watchdog final
+ * stop, quarantine record, buddy hard-lockup panic). See
+ * Documentation/crownlte/c2-s2.md.
+ *
+ * Supersedes exynos9810-crownlte-romram-v23a-int6-c2s2 (token 0xc2c20003,
+ * never booted, retired).
  *
  * Build with rom-ram/src/build-dtb.sh (KSRC = this tree, KO = its build
  * directory).
@@ -14,7 +21,7 @@
 #include "exynos9810-crownlte-c2.dtsi"
 
 &{/} {
-	model = "Samsung Note9 ROM-in-RAM v23a integration 6 + C2 S2 (MCT local timers, LITTLE 1-3 + big 4-7)";
+	model = "Samsung Note9 ROM-in-RAM v23a integration 6 + C2 S2 r1 (MCT local timers LITTLE 1-3, C2 LITTLE 1-3 + big 4-7)";
 };
 
 /*
@@ -22,7 +29,8 @@
  * through mct-map with flags 0; level-high as the G0 entry here). The local
  * timers' registers run to 0xa44 (L7 = 0xa00), past the 0x800 of the G0-only
  * node; nothing else sits in 0x10040800-0x10040fff (the CL0 watchdog is at
- * 0x10050000).
+ * 0x10050000). The property only prepares L0-L7; cpuidle requests the
+ * takeover for the LITTLE CPUs it arms.
  */
 &{/soc@0/timer@10040000} {
 	reg = <0x10040000 0x1000>;
@@ -43,9 +51,10 @@
 	samsung,c2-little-local-timer;
 	/*
 	 * One increasing token sequence over all trial DTBs
-	 * (c2-runtime.md section 6): 0xc2c20001 S1a, 0xc2c20002 drill (b).
-	 * Clears a TRUSTED record once if above its trial floor (now
-	 * 0xc2c20001 on the phone), then becomes the floor.
+	 * (c2-runtime.md section 6): 0xc2c20001 S1a, 0xc2c20002 drill (b),
+	 * 0xc2c20003 S2 round 0 (retired, never booted). Clears a TRUSTED
+	 * record once if above its trial floor (0xc2c20001 on the phone),
+	 * then becomes the floor.
 	 */
-	samsung,c2-quarantine-trial-token = <0xc2c20003>;
+	samsung,c2-quarantine-trial-token = <0xc2c20004>;
 };
