@@ -511,6 +511,15 @@ u32 words at byte offsets 0 (slot 0) and 2048 (slot 1). v3 has the same layout a
 The version, the SHUTDOWN session word, the reasons 6/7 and the meaning of word 12 are
 new; a v1/v2 record is invalid.
 
+**v4 (crownlte-c2-s2 from ec753284a, c2-s2.md section 8).** Same 14-word layout. A
+v4 kernel still reads v3 slots (v3 and v4 slots chain, so the phone's trusted v3
+record stays trusted), and every write is v4. A v3 kernel treats a v4 slot as invalid
+and fails closed. New in v4: session words `0x4c41524d` LT_ARMED (MCT local timers
+may run CPU ticks; covers an armed C2 session too) and `0x4c534844` LT_SHUTDOWN (its
+drained form), flags bit5 LTIMER (no local-timer takeover, LITTLE C2 off) and reason
+8 `ltimer`. A session found LT_ARMED or LT_SHUTDOWN at boot adds LTIMER to UNCLEAN.
+The tables below describe v3; the v4 transitions are in c2-s2.md section 8.
+
 | Word | Name | Meaning |
 |---|---|---|
 | 0 | magic | `0x51324339` |
@@ -563,8 +572,10 @@ new DTB with a higher token, or root. Issued tokens:
 | 0xc2b10001 | drill (b) round 1 | retired |
 | 0xc2c20001 | S1a round 2 (`romram-v23a-int6-c2`) | current |
 | 0xc2c20002 | drill (b) round 2 (`delayed-ufs-c2-drill-loss-diag`) | current |
+| 0xc2c20003 | S2 round 0 (`romram-v23a-int6-c2s2`, crownlte-c2-s2) | retired, never booted |
+| 0xc2c20004 | S2 fix round 1 (`romram-v23a-int6-c2s2r1`, crownlte-c2-s2) | current |
 
-The next token must be above 0xc2c20002.
+The next token must be above 0xc2c20004.
 
 **Write (`e9810_qm_commit()`, under `e9810_qm_lock`):**
 1. Build the full new record in RAM with seq = newest + 1.
@@ -660,7 +671,7 @@ reboot                                                            # a clean rest
   later boot of that pack;
 - on a missing or ambiguous record (first boot after a cold boot, the page overwritten
   or damaged) the token clears nothing and is spent. That pack can no longer clear
-  anything: you need a new DTB with a higher token (the next one above 0xc2c20002) in a
+  anything: you need a new DTB with a higher token (the next one above 0xc2c20004) in a
   new pack, booted after a boot that left a trusted record;
 - a boot with no token (for example drill (a)) leaves a trusted record (UNINIT if it
   found none) without spending anything. That is how to prepare the page for a token
