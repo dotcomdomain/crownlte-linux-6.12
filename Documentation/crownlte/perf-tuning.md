@@ -432,3 +432,10 @@ zone policies, as a runtime cross-check of the source evidence above.
     build dir);
   - the preprocessed source is kept next to it as `.dts`.
 - sha256 values are in the `.sha256` files next to them and in the report.
+
+Input booster timing (review rounds 2-5): every tail expiry is computed from the
+release time stored by booster_touch() (tail_deadline, written before pressed is
+cleared), and the head from head_deadline under the lock; late callbacks re-arm for the
+remaining time instead of ending or extending a phase. The boot self-test covers the
+plain head/tail/idle sequence with release during the head; the late-worker
+interleavings are covered by construction, not by the self-test.

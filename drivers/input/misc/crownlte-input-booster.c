@@ -139,8 +139,12 @@ static void booster_event_work(struct work_struct *work)
 			return;
 		}
 	} else if (!pressed && b->phase == PHASE_TAIL) {
-		mod_delayed_work(system_highpri_wq, &b->tail_work,
-				 msecs_to_jiffies(b->tail_ms));
+		/* expire tail_ms after the release itself, not after this (late) work */
+		long left;
+
+		smp_rmb();
+		left = (long)(READ_ONCE(b->tail_deadline) - jiffies);
+		mod_delayed_work(system_highpri_wq, &b->tail_work, left > 0 ? left : 0);
 	}
 	mutex_unlock(&b->lock);
 }
