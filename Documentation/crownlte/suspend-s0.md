@@ -58,6 +58,7 @@ none are expected.
 | `watchdog: s3c2410_wdt: crownlte deadline in the ping path, keep-armed suspend never stops it` (fix round 1) | `s3c2410wdt_crownlte_set_deadline()`; every counter reload checks the deadline; the kept-armed suspend fails instead of stopping (§10). |
 | `PM: suspend: run pm_suspend_test_level() under one system_transition_mutex ownership` (fix round 1) | `enter_state_check()` / `enter_state_locked()` split (§10). |
 | `soc: samsung: exynos9810-pm: S0 fix round 1: ...` (fix round 1) | CP_CTRL reads removed, register audit (§9), bounded cross-CPU calls, recovery gate (§10). |
+| `watchdog: s3c2410_wdt: no stretched or late reload when crownlte petting stops` (fix round 1) | Keep-armed refusal puts the run-time timeout back; the restart notifier re-checks the deadline under the lock (§10). |
 
 ### Why the generic files change
 
@@ -121,16 +122,16 @@ after S0 has ended.
 
 | Item | Path (gekko `/mnt/ssd/host-builds/kernel-upgrade/`) | sha256 |
 |---|---|---|
-Fix round 1 (code at `536117c66`):
+Fix round 1 (code at `7c0493496`):
 
 | Item | Path (gekko `/mnt/ssd/host-builds/kernel-upgrade/`) | sha256 |
 |---|---|---|
-| Image | `panel-bright-work/images/Image-suspend-s0-536117c66` | `5271f987592c60021695b810e02d69d2de182867b16586b50d28bdea25a9e817` |
-| config (unchanged) | `panel-bright-work/images/config-suspend-s0-536117c66` | `1ec1bef6e867e455921af6dd6f57ace26a543d9257bf56ff71fde350b6e4fa6a` |
-| S0 DTB (a..d), unchanged | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0-diag-536117c66.dtb` | `61e670ec5078b8e9f8c1a07b520beb102a7476c545e69cd9de1165c4c7259050` |
-| S0ab DTB (a+b), unchanged | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0ab-diag-536117c66.dtb` | `362e56d366f53a87394f24969452c254991362824819b9ae358fa18c69a8b4de` |
-| Trial 1: S0ab RECOVERY | `acpm-suspend-s0ab-r1-s2/recovery.img` | `9aedb718d7551fbd01f4fd3fa40d489dc44ba6d7c014c0b0c7b0fbee905d8eae` |
-| Trial 2: S0 RECOVERY | `acpm-suspend-s0-r1-s2/recovery.img` | `1e6e131719d59a60514b907baea054bd6659ac5b6ac9e314513cb1a3c0c85a5c` |
+| Image | `panel-bright-work/images/Image-suspend-s0-7c0493496` | `fea8dbe1913f95e59d93b1cfaf4ae35a7eba0db0a606c72ae29277f769314fc7` |
+| config (unchanged) | `panel-bright-work/images/config-suspend-s0-7c0493496` | `1ec1bef6e867e455921af6dd6f57ace26a543d9257bf56ff71fde350b6e4fa6a` |
+| S0 DTB (a..d), unchanged | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0-diag-7c0493496.dtb` | `61e670ec5078b8e9f8c1a07b520beb102a7476c545e69cd9de1165c4c7259050` |
+| S0ab DTB (a+b), unchanged | `panel-bright-work/dtb/exynos9810-crownlte-delayed-ufs-suspend-s0ab-diag-7c0493496.dtb` | `362e56d366f53a87394f24969452c254991362824819b9ae358fa18c69a8b4de` |
+| Trial 1: S0ab RECOVERY | `acpm-suspend-s0ab-r1-s2/recovery.img` | `0b956baad13d1b7cbe5923e1726f8565e14c7b9ca81746f5033380b7c93a72fe` |
+| Trial 2: S0 RECOVERY | `acpm-suspend-s0-r1-s2/recovery.img` | `c39885265bb9587db27cba96fc7aacb44190ec129f866c62bf4078e30ae2df74` |
 
 Superseded (code at `4877cf53b`, panics in probe on PMU 0x30; gekko
 copies of the packs deleted, PC copies in
@@ -422,7 +423,7 @@ of these lists on 6.12.
 
 ## 10. Fix log
 
-### Fix round 1 (2026-11-07): commits `766bcf035`, `dca7ce452`, `536117c66`
+### Fix round 1 (2026-11-07): commits `766bcf035`, `dca7ce452`, `536117c66`, `7c0493496`
 
 Input: the S0ab hardware run (pack `7b48380b`, 2026-11-06 23:46) and Sol
 R1 (verdict CHANGES) on `dfb1db390`.
@@ -430,14 +431,14 @@ R1 (verdict CHANGES) on `dfb1db390`.
 | Finding | Fix |
 |---|---|
 | HW: synchronous external abort at 0.348 s, `regmap_mmio_read32le` ← `e9810_snap+0x50` ← `e9810_pm_probe`, PMU+0x30 | CP_CTRL_NS/S reads removed, no SMC added. Every access audited (§9). Unproven ones dropped (INTR_GEN GRP0/3, GICD_SPENDSGIRn, CPU CONFIGURATION) or justified (IDLE_IP_MASK, wakeup-mask and CPU_INFORM reads). Wakeup-mask offsets limited to the four 4.9 ones. The phone came back by itself (panic → reboot → shim bounce). |
-| B1: both deadline hrtimers end up on CPU0 after S0b offlines CPU7 | `s3c2410wdt_crownlte_set_deadline()`. Every reload path (`keepalive` from any CPU or context, `start` of a running counter, crownlte ping, `stop_petting`, restart notifier) checks the deadline under `wdt->lock` and refuses after it. One hrtimer is kept as a supplement, armed locally (no IPI). Once a deadline is set, user space can neither stop the watchdog nor change its timeout. |
+| B1: both deadline hrtimers end up on CPU0 after S0b offlines CPU7 | `s3c2410wdt_crownlte_set_deadline()`. Every reload path (`keepalive` from any CPU or context, `start` of a running counter, crownlte ping, `stop_petting`, restart notifier, the last re-checked under the lock in `7c0493496`) checks the deadline under `wdt->lock` and refuses after it. One hrtimer is kept as a supplement, armed locally (no IPI). Once a deadline is set, user space can neither stop the watchdog nor change its timeout. |
 | B2: S0b starts without verifying recovery | `s0_recovery_refused()` needs the guarded watchdog enabled, reset enabled, still petted, with the deadline installed and WTCNT seen moving (at most 20 × 2-3 ms). It is required before S0b (else SKIPPED, no hotplug) and checked again, without the liveness wait, before every single CPU-off. S0c/S0d use it plus keep-armed-in-suspend. |
 | B3: probe `smp_call_function_single(wait=1)` unbounded | `e9810_xcall()`: `smp_call_function_single_async()` with a heap request that is leaked on a timeout (valid memory for a late runner), a 200 ms bound and `stop_petting` on a timeout. Used for the MPIDR read, the hook reset and all pings. The deadline is installed before the first request, probe fails without an armed watchdog, and the deadline property is mandatory. |
-| B4: keep-armed suspend falls through to stopping the watchdog | `s3c2410wdt_suspend_keep_armed()` needs the reset enabled and petting alive. A failed suspend timeout leaves the watchdog running at the old timeout, WTCON is checked afterwards, and every failure returns an error so the suspend aborts. Suspend never stops a watchdog that is under a deadline. |
+| B4: keep-armed suspend falls through to stopping the watchdog | `s3c2410wdt_suspend_keep_armed()` needs the reset enabled and petting alive. A failed suspend timeout leaves the watchdog running at the old timeout, WTCON is checked afterwards, and every failure returns an error so the suspend aborts. A refusal after the switch to the 60 s count puts the run-time timeout back, so the slower prescaler cannot stretch a due reset (`7c0493496`). Suspend never stops a watchdog that is under a deadline. |
 | M5: the `pm_suspend_test_level()` transaction is not serialized | One `mutex_trylock(&system_transition_mutex)` covers set + suspend + restore. `enter_state()` is split into `enter_state_check()` / `enter_state_locked()`; nothing locks recursively. |
 
-Build: `config-suspend-s0-536117c66` (unchanged), clang 18. `W=1` on the
-three changed objects gave no warnings. `exynos9810-pm.o` has no
+Build: `config-suspend-s0-7c0493496` (unchanged), clang 18. `W=1` on the
+changed objects gave no warnings. `exynos9810-pm.o` has no
 `smc`/`hvc` instruction (`llvm-objdump`), no PSCI symbol and no
 `smp_call_function_single`. Artifacts in §3.
 
