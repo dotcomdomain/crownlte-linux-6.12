@@ -158,3 +158,35 @@ config EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET
 	  STOP, matching the original 4.9 best-effort reset policy.
 	  This may fail to reset or return. Manual Download Mode restore and an
 	  available owner are still required. Never enable for Android production.
+
+config EXYNOS9810_AUDIO_A1
+	bool "crownlte audio stage A1: read-only hardware probe"
+	depends on ARM64 && OF && I2C && MFD_SYSCON && MFD_S2MPS18_ACPM
+	# i2c-dev would give userspace a /dev/i2c-N for the amp bus (I2C_RDWR)
+	depends on I2C_CHARDEV = n
+	help
+	  Exynos 9810 (crownlte) audio stage A1: a DT-started self-test
+	  ("audio selftest A1:") that only reads the pd-aud and ABOX CPU
+	  status in the PMU, the codec/amp GPIOs, S2MPS18 LDO33/LDO34 over
+	  the read-only ACPM path and the MAX98512 revision and enable
+	  registers over HSI2C18, on a CPU other than CPU0. Nothing inside
+	  pd-aud is read. The CL0 watchdog deadline is armed at probe; the
+	  amp bus (DT samsung,audio-a1-guard) only comes up after that. No
+	  SPI traffic, no amp or codec driver. Idle unless the node has
+	  samsung,audio-a1-selftest-ms. Not available with I2C_CHARDEV:
+	  userspace must not reach the amp bus. Also makes the exynos-usi
+	  and exynos5-hsi2c drivers suppress their sysfs bind/unbind files.
+	  See Documentation/crownlte/audio-a1.md.
+
+config EXYNOS9810_PM
+	bool "crownlte system suspend, stage S0 (no firmware sleep)"
+	depends on EXYNOS9810_LEGACY_CAL && OF && ARM64
+	depends on SUSPEND && HOTPLUG_CPU
+	help
+	  Exynos 9810 (crownlte) suspend-to-RAM platform driver, stage S0:
+	  4.9 CPU hotplug power hooks, platform suspend and syscore ops for
+	  SYS_SLEEP with the APM hand-off withheld, and a .enter that never
+	  calls the firmware (dry run). DT-gated: only DTBs that enable the
+	  samsung,exynos9810-pm node and list samsung,suspend-s0 stages use
+	  it. The S0c pm_test stage needs PM_DEBUG.
+	  See Documentation/crownlte/suspend-s0.md.

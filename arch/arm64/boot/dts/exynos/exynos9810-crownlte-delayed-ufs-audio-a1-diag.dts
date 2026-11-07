@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Audio stage A1 (Documentation/crownlte/audio-a1.md, gekko
+ * roadmap/audio-design.md section 5): read-only probe of the audio
+ * hardware at ~30 s ("audio selftest A1:"), before the PMIC read-only
+ * snapshot at ~106 s and the delayed-UFS PID1 restart at 120 s.
+ *
+ * Changes against the delayed-UFS diagnostic DTB:
+ *  - the audio-a1 node: at probe it installs and verifies the CL0
+ *    watchdog deadline (145 s) and only then opens its guard; at ~30 s,
+ *    on a CPU other than CPU0, PMU status, GPIO and PMIC (ACPM, read-only
+ *    policy) reads. Nothing inside pd-aud is read (no ABOX, SYSREG_AUD,
+ *    SysMMU or pinctrl_aud window);
+ *  - HSI2C18 (USI07, the MAX98512 bus) enabled with no child: the amp
+ *    driver is never bound. The USI07 wrapper and the controller both
+ *    name the audio-a1 node in samsung,audio-a1-guard, so neither probes
+ *    (SYSREG, clocks, pin mux, controller) before that deadline is armed,
+ *    and never if A1 refused, and each comes up at most once per boot
+ *    (boot-lifetime latch, no sysfs bind/unbind). The controller runs in
+ *    A1 read-only mode: only [2-byte register address][1-byte read] of
+ *    the 7 registers on the A1 list at 0x39/0x3a (anything else refused
+ *    before the clocks), no retries, no stuck-bus recovery clocks,
+ *    closed for the boot after the first failure. The self-test reads
+ *    those 7 registers on 0x39/0x3a;
+ *  - every other self-test removed (as in the suspend S0 DTB), except the
+ *    read-only PMIC snapshot. The PMIC write policy stays sealed empty.
+ * No codec (SPI) node, no ABOX node, no pd-aud power control.
+ * UFS stays unbound (never send CROWNLTE-UFS-PROBE-1).
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 audio A1 read-only diagnostic";
+};
+
+/* Neither bus device probes before audio_a1 armed the watchdog deadline. */
+&usi_amp {
+	samsung,audio-a1-guard = <&audio_a1>;
+	status = "okay";
+};
+
+&hsi2c_amp {
+	samsung,audio-a1-guard = <&audio_a1>;
+	samsung,crownlte-a1-read-only;
+	/*
+	 * No "default" state: the driver core would mux gpp4-4/5 before the
+	 * probe, i.e. before the A1 bus latch and guard. The A1 mode selects
+	 * "a1-bus" (same pins, pinctrl-0 from the dtsi) itself after both.
+	 */
+	pinctrl-names = "a1-bus";
+	status = "okay";
+};
+
+&soc {
+	/*
+	 * Fixed always-on windows, mapped without claiming them (their owners
+	 * keep their regions). Nothing inside pd-aud.
+	 */
+	audio_a1: audio-a1@14050000 {
+		compatible = "samsung,exynos9810-audio-a1";
+		reg = <0x14050000 0x100>,	/* pinctrl_alive: gpa2 */
+		      <0x10430000 0x100>,	/* pinctrl_peric0: gpp0, gpg1 */
+		      <0x10830000 0x100>,	/* pinctrl_peric1: gpp4 */
+		      <0x14220000 0x100>,	/* pinctrl_cmgp: gpm2, gpm3 */
+		      <0x1041100c 0x4>;		/* PERIC0 SYSREG USI01 SW_CONF */
+		reg-names = "pinctrl-alive", "pinctrl-peric0", "pinctrl-peric1",
+			    "pinctrl-cmgp", "usi01-swconf";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,pmic = <&s2mps18_pmic>;
+		samsung,amp-i2c-bus = <&hsi2c_amp>;
+		samsung,audio-a1-selftest-ms = <30000>;
+		/* still up 25 s after the 120 s restart: stop petting, WDT resets */
+		samsung,audio-a1-deadline-ms = <145000>;
+		status = "okay";
+	};
+};
+
+/* No C2 is armed. */
+&cpuidle {
+	/delete-property/ samsung,cpuidle-selftest;
+};
+
+&mct {
+	/delete-property/ samsung,mct-bc-report;
+};
+
+&legacy_devfreq_mif {
+	/delete-property/ samsung,devfreq-selftest;
+};
+
+&acpm_tmu {
+	/delete-property/ samsung,tmu-selftest;
+};
+
+&{/cpufreq} {
+	/delete-property/ samsung,cpufreq-selftest;
+};
+
+&decon_handover {
+	/delete-property/ samsung,display-selftest;
+};
+
+&gpu {
+	status = "disabled";
+};
+
+&max77705_battery {
+	/delete-property/ samsung,selftest-ms;
+	/delete-property/ samsung,adc-selftest-ms;
+};
+
+&adc {
+	/delete-property/ samsung,adc-selftest-ms;
+};

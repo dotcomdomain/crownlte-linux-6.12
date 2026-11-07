@@ -571,18 +571,9 @@ static void suspend_finish(void)
 	pm_restore_console();
 }
 
-/**
- * enter_state - Do common work needed to enter system sleep state.
- * @state: System sleep state to enter.
- *
- * Make sure that no one else is trying to put the system into a sleep state.
- * Fail if that's not the case.  Otherwise, prepare for system suspend, make the
- * system enter the given sleep state and clean up after wakeup.
- */
-static int enter_state(suspend_state_t state)
+/* enter_state() argument checks; they do not need system_transition_mutex. */
+static int enter_state_check(suspend_state_t state)
 {
-	int error;
-
 	trace_suspend_resume(TPS("suspend_enter"), state, true);
 	if (state == PM_SUSPEND_TO_IDLE) {
 #ifdef CONFIG_PM_DEBUG
@@ -594,8 +585,15 @@ static int enter_state(suspend_state_t state)
 	} else if (!valid_state(state)) {
 		return -EINVAL;
 	}
-	if (!mutex_trylock(&system_transition_mutex))
-		return -EBUSY;
+	return 0;
+}
+
+/* enter_state() with system_transition_mutex already held by the caller. */
+static int enter_state_locked(suspend_state_t state)
+{
+	int error;
+
+	lockdep_assert_held(&system_transition_mutex);
 
 	if (state == PM_SUSPEND_TO_IDLE)
 		s2idle_begin();
@@ -605,7 +603,7 @@ static int enter_state(suspend_state_t state)
 
 		error = pm_sleep_fs_sync();
 		if (error)
-			goto Unlock;
+			return error;
 
 		trace_suspend_resume(TPS("sync_filesystems"), 0, false);
 	}
@@ -614,7 +612,7 @@ static int enter_state(suspend_state_t state)
 	pm_suspend_clear_flags();
 	error = suspend_prepare(state);
 	if (error)
-		goto Unlock;
+		return error;
 
 	if (suspend_test(TEST_FREEZER))
 		goto Finish;
@@ -629,9 +627,39 @@ static int enter_state(suspend_state_t state)
 	events_check_enabled = false;
 	pm_pr_dbg("Finishing wakeup.\n");
 	suspend_finish();
- Unlock:
+	return error;
+}
+
+/**
+ * enter_state - Do common work needed to enter system sleep state.
+ * @state: System sleep state to enter.
+ *
+ * Make sure that no one else is trying to put the system into a sleep state.
+ * Fail if that's not the case.  Otherwise, prepare for system suspend, make the
+ * system enter the given sleep state and clean up after wakeup.
+ */
+static int enter_state(suspend_state_t state)
+{
+	int error;
+
+	error = enter_state_check(state);
+	if (error)
+		return error;
+	if (!mutex_trylock(&system_transition_mutex))
+		return -EBUSY;
+	error = enter_state_locked(state);
 	mutex_unlock(&system_transition_mutex);
 	return error;
+}
+
+static void pm_suspend_account(int error)
+{
+	if (error) {
+		suspend_stats.fail++;
+		dpm_save_failed_errno(error);
+	} else {
+		suspend_stats.success++;
+	}
 }
 
 /**
@@ -650,13 +678,75 @@ int pm_suspend(suspend_state_t state)
 
 	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
 	error = enter_state(state);
-	if (error) {
-		suspend_stats.fail++;
-		dpm_save_failed_errno(error);
-	} else {
-		suspend_stats.success++;
-	}
+	pm_suspend_account(error);
 	pr_info("suspend exit\n");
 	return error;
 }
 EXPORT_SYMBOL(pm_suspend);
+
+#ifdef CONFIG_PM_DEBUG
+/**
+ * pm_suspend_test_level - Run suspend-to-RAM once at one pm_test level.
+ * @level: "freezer", "devices", "platform", "processors" or "core", as in
+ *         /sys/power/pm_test.
+ * @delay_s: wait at that level, in seconds (pm_test_delay for this call).
+ *
+ * For in-kernel self-tests that have no user space to drive /sys/power
+ * (crownlte suspend S0c, drivers/soc/samsung/exynos9810-pm.c). "none" is
+ * refused: that would really suspend.
+ *
+ * One transaction under one continuous ownership of
+ * system_transition_mutex, taken once (trylock, as pm_suspend() does):
+ * install the test level and delay, run the same suspend-to-RAM sequence
+ * as pm_suspend(PM_SUSPEND_MEM), restore both values, unlock. The
+ * /sys/power/pm_test store and every other system transition take the
+ * same mutex, so none of them can change the level or start in between.
+ * (pm_test_delay is also a writable module parameter, unserialized as
+ * upstream; it only changes the wait.)
+ *
+ * Returns the suspend result, -EINVAL for an unknown level, -EBUSY if a
+ * system transition is in progress.
+ */
+int pm_suspend_test_level(const char *level, unsigned int delay_s)
+{
+	static const struct {
+		const char *name;
+		int level;
+	} levels[] = {
+		{ "freezer", TEST_FREEZER },
+		{ "devices", TEST_DEVICES },
+		{ "platform", TEST_PLATFORM },
+		{ "processors", TEST_CPUS },
+		{ "core", TEST_CORE },
+	};
+	unsigned int old_delay;
+	int i, old_level, error;
+
+	for (i = 0; i < ARRAY_SIZE(levels); i++)
+		if (!strcmp(level, levels[i].name))
+			break;
+	if (i == ARRAY_SIZE(levels))
+		return -EINVAL;
+
+	if (!mutex_trylock(&system_transition_mutex))
+		return -EBUSY;
+	old_level = pm_test_level;
+	old_delay = pm_test_delay;
+	pm_test_level = levels[i].level;
+	pm_test_delay = delay_s;
+
+	pr_info("suspend entry (%s), pm_test %s\n",
+		mem_sleep_labels[PM_SUSPEND_MEM], level);
+	error = enter_state_check(PM_SUSPEND_MEM);
+	if (!error)
+		error = enter_state_locked(PM_SUSPEND_MEM);
+	pm_suspend_account(error);
+	pr_info("suspend exit\n");
+
+	pm_test_level = old_level;
+	pm_test_delay = old_delay;
+	mutex_unlock(&system_transition_mutex);
+	return error;
+}
+EXPORT_SYMBOL_GPL(pm_suspend_test_level);
+#endif /* CONFIG_PM_DEBUG */

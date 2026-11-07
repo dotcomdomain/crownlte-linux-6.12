@@ -359,6 +359,16 @@ static inline void s2idle_set_ops(const struct platform_s2idle_ops *ops) {}
 static inline void s2idle_wake(void) {}
 #endif /* !CONFIG_SUSPEND */
 
+#if defined(CONFIG_SUSPEND) && defined(CONFIG_PM_DEBUG)
+/* One suspend-to-RAM at a pm_test level, for in-kernel self-tests. */
+extern int pm_suspend_test_level(const char *level, unsigned int delay_s);
+#else
+static inline int pm_suspend_test_level(const char *level, unsigned int delay_s)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 /* struct pbe is used for creating lists of pages that should be restored
  * atomically during the resume from disk, because the page frames they have
  * occupied before the suspend are in use.

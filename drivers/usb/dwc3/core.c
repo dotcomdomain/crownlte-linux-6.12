@@ -2423,11 +2423,40 @@ assert_reset:
 	return ret;
 }
 
+/*
+ * crownlte suspend S0 diagnostic (CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART on
+ * samsung,crownlte only): one line at system suspend entry and one after
+ * system resume in device mode, with the run/stop and link state. Reads
+ * only, by this driver, while its core is initialised: never when runtime
+ * suspended (core exited, clocks may be off) and never in runtime PM.
+ * DCTL bit 31 = run/stop (pullup), DSTS bit 22 = DEVCTRLHLT, 21:18 = link
+ * state, 2:0 = connect speed.
+ */
+static void dwc3_crownlte_pm_dump(struct dwc3 *dwc, const char *when)
+{
+	if (!IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART) ||
+	    !of_machine_is_compatible("samsung,crownlte") ||
+	    dwc->current_dr_role != DWC3_GCTL_PRTCAP_DEVICE ||
+	    pm_runtime_suspended(dwc->dev))
+		return;
+
+	dev_info(dwc->dev, "crownlte %s: DCTL=%08x DSTS=%08x GCTL=%08x DEVTEN=%08x connected=%u softconnect=%u pullups=%u gadget=%s\n",
+		 when, dwc3_readl(dwc->regs, DWC3_DCTL),
+		 dwc3_readl(dwc->regs, DWC3_DSTS),
+		 dwc3_readl(dwc->regs, DWC3_GCTL),
+		 dwc3_readl(dwc->regs, DWC3_DEVTEN),
+		 dwc->connected, dwc->softconnect, dwc->pullups_connected,
+		 dwc->gadget ? usb_state_string(dwc->gadget->state) : "none");
+}
+
 static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 {
 	u32 reg;
 	int i;
 	int ret;
+
+	if (!PMSG_IS_AUTO(msg))
+		dwc3_crownlte_pm_dump(dwc, "system suspend entry");
 
 	if (!pm_runtime_suspended(dwc->dev) && !PMSG_IS_AUTO(msg)) {
 		dwc->susphy_state = (dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0)) &
@@ -2567,6 +2596,7 @@ static int dwc3_resume_common(struct dwc3 *dwc, pm_message_t msg)
 	if (!PMSG_IS_AUTO(msg)) {
 		/* restore SUSPHY state to that before system suspend. */
 		dwc3_enable_susphy(dwc, dwc->susphy_state);
+		dwc3_crownlte_pm_dump(dwc, "system resume done");
 	}
 
 	return 0;

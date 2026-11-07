@@ -16,6 +16,7 @@
 #include <linux/regmap.h>
 
 #include <dt-bindings/soc/samsung,exynos-usi.h>
+#include <soc/samsung/exynos9810-audio-a1.h>
 
 /* USIv2: System Register: SW_CONF register bits */
 #define USI_V2_SW_CONF_NONE	0x0
@@ -293,7 +294,30 @@ static int exynos_usi_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
 	struct exynos_usi *usi;
+	struct resource *res = NULL;
+	bool a1_guarded;
 	int ret;
+
+	/*
+	 * crownlte audio A1 amp bus: no SYSREG, clock or wrapper access (and
+	 * no child bus) before the A1 driver armed the CL0 watchdog deadline,
+	 * and only one bring-up per boot: a wrapper brought up once is refused
+	 * here before anything else (boot-lifetime latch in the A1 driver,
+	 * keyed by the MMIO base; suppress_bind_attrs in A1 builds).
+	 */
+	a1_guarded = of_property_present(np, "samsung,audio-a1-guard");
+	if (a1_guarded) {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (!res)
+			return dev_err_probe(dev, -EINVAL, "audio A1: no MMIO window\n");
+		ret = exynos9810_audio_a1_bus(dev, res->start, EXYNOS9810_A1_BUS_CHECK);
+		if (ret)
+			return ret;
+		ret = exynos9810_audio_a1_guard(dev);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "bring-up held back by the audio A1 guard\n");
+	}
 
 	usi = devm_kzalloc(dev, sizeof(*usi), GFP_KERNEL);
 	if (!usi)
@@ -320,6 +344,13 @@ static int exynos_usi_probe(struct platform_device *pdev)
 			return PTR_ERR(usi->regs);
 	}
 
+	/* crownlte audio A1: the first SYSREG / clock / wrapper access follows */
+	if (a1_guarded) {
+		ret = exynos9810_audio_a1_bus(dev, res->start, EXYNOS9810_A1_BUS_CLAIM);
+		if (ret)
+			return ret;
+	}
+
 	ret = exynos_usi_configure(usi);
 	if (ret)
 		return ret;
@@ -344,6 +375,8 @@ static struct platform_driver exynos_usi_driver = {
 		.name		= "exynos-usi",
 		.pm		= &exynos_usi_pm,
 		.of_match_table	= exynos_usi_dt_match,
+		/* crownlte audio A1 builds: no sysfs unbind/bind of the amp bus */
+		.suppress_bind_attrs = IS_ENABLED(CONFIG_EXYNOS9810_AUDIO_A1),
 	},
 	.probe = exynos_usi_probe,
 };

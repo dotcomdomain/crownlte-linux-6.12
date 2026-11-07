@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Suspend stage S0 (Documentation/crownlte/suspend-s0.md): S0a register
+ * snapshot, S0b CPU hotplug loops, S0c pm_test freezer..core, S0d early-wake
+ * dry run. Nothing enters SoC sleep: the S0 kernel has no CPU_SUSPEND call
+ * and withholds the APM GRP2 hand-off. Self-tests run from 20 s and end by
+ * 100 s, before the PMIC read-only snapshot at ~106 s and the delayed-UFS
+ * PID1 restart at 120 s; each stage runs only if the previous one passed.
+ * Log prefix "suspend s0:".
+ *
+ * Changes against the delayed-UFS diagnostic DTB:
+ *  - every other self-test removed (they would overlap S0 or veto it),
+ *    except the read-only PMIC snapshot (INTxM, rail CTRL, RTC registers;
+ *    this DT allows no PMIC write);
+ *  - Mali not bound: kbase vetoes system suspend on PM_SUSPEND_PREPARE;
+ *  - the CL0 watchdog stays armed through suspend (60 s);
+ *  - the suspend node enabled, CP-off sleep allowed (CP never booted).
+ * UFS stays unbound (never send CROWNLTE-UFS-PROBE-1): S0c/S0d refuse to
+ * run with a bound UFS host.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 suspend S0 diagnostic";
+};
+
+&system_suspend {
+	samsung,sleep-with-cp-off;
+	samsung,suspend-s0 = "a", "b", "c", "d";
+	samsung,suspend-s0-start-ms = <20000>;
+	samsung,suspend-s0-end-by-ms = <100000>;
+	/* still up 25 s after the 120 s restart: stop petting, WDT resets */
+	samsung,suspend-s0-deadline-ms = <145000>;
+	samsung,suspend-s0-hotplug-cycles = <20>;
+	samsung,suspend-s0-cluster-cycles = <5>;
+	samsung,suspend-s0-group-cycles = <5>;
+	samsung,suspend-s0-pm-test-delay-s = <5>;
+	status = "okay";
+};
+
+&watchdog_cl0 {
+	samsung,keep-armed-in-suspend;
+};
+
+/* No C2 is armed: only hotplug touches the core power paths. */
+&cpuidle {
+	/delete-property/ samsung,cpuidle-selftest;
+};
+
+&mct {
+	/delete-property/ samsung,mct-bc-report;
+};
+
+&legacy_devfreq_mif {
+	/delete-property/ samsung,devfreq-selftest;
+};
+
+&acpm_tmu {
+	/delete-property/ samsung,tmu-selftest;
+};
+
+&{/cpufreq} {
+	/delete-property/ samsung,cpufreq-selftest;
+};
+
+&decon_handover {
+	/delete-property/ samsung,display-selftest;
+};
+
+&gpu {
+	status = "disabled";
+};
+
+&max77705_battery {
+	/delete-property/ samsung,selftest-ms;
+	/delete-property/ samsung,adc-selftest-ms;
+};
+
+&adc {
+	/delete-property/ samsung,adc-selftest-ms;
+};

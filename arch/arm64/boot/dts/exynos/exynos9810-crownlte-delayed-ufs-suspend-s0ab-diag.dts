@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Suspend stage S0, first half only: S0a register snapshot and S0b CPU
+ * hotplug loops (Documentation/crownlte/suspend-s0.md). No suspend ops and
+ * no syscore ops are registered, so nothing of the system-sleep path runs.
+ * Run this before exynos9810-crownlte-delayed-ufs-suspend-s0-diag if the
+ * LITTLE hotplug result should be seen on its own.
+ */
+#include "exynos9810-crownlte-delayed-ufs-suspend-s0-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 suspend S0a/S0b diagnostic";
+};
+
+&system_suspend {
+	samsung,suspend-s0 = "a", "b";
+};
