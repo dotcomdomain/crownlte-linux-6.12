@@ -25,6 +25,7 @@
 #include <linux/ratelimit.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <soc/samsung/exynos9810-abox-a2.h>
 
 #include "dma-iommu.h"
 #include "iommu-pages.h"
@@ -971,6 +972,17 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 	const struct sysmmu_soc_data *soc = device_get_match_data(dev);
 	struct sysmmu_drvdata *data;
 	struct resource *res;
+
+	/*
+	 * crownlte audio A2: the ABOX SysMMU sits in pd-aud. It probes only
+	 * after the A2 gate armed the watchdog deadline, saw pd-aud on and
+	 * took the AUD clocks (Documentation/crownlte/audio-a2.md).
+	 */
+	if (of_property_present(dev->of_node, "samsung,abox-a2-guard")) {
+		ret = exynos9810_abox_a2_guard(dev);
+		if (ret)
+			return ret;
+	}
 
 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
