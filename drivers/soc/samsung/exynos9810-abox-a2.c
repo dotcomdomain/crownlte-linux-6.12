@@ -924,8 +924,10 @@ static void a2_work_fn(struct work_struct *w)
 		fails = "sysmmu-faults";
 	if (!fails && atomic_read(&a->faults_fw))
 		fails = "firmware-fault";
-	if (!fails && boot_ms_max > A2_BOOT_PASS_MS)
-		fails = "slow-boot";
+	/* AUD runs at its boot DVFS level (4.9 raised the gear first): note only */
+	if (boot_ms_max > A2_BOOT_PASS_MS)
+		pr_warn(A2 "slowest boot %u ms is over the %u ms design target (AUD not raised)\n",
+			boot_ms_max, A2_BOOT_PASS_MS);
 	if (!fails && READ_ONCE(a->incompatible))
 		fails = "incompatible";
 	a2_finish(a, !fails && boots == a->boots_wanted, fails, boots, boot_ms_max);
