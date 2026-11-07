@@ -215,10 +215,180 @@ latched.
   every new frame. That is ~17 ms at the v12 copy rate, ~30 ms together with a full-screen layer,
   so launcher animations may run at about 30 fps. Two slots per window: wallpaper 52 MB + launcher
   35 MB + bars, within the 192 MiB decon-pool. The real fix is the DPU SysMMU (`iommus`, see
-  display-iommu.md).
+  display-iommu.md and section 10). Hardware confirmed the risk (section 10.1): the pool
+  fragmented and win0 got no slot.
 - HDR10/HLG are now advertised (v23a-dpu DTB). HDR video then reaches VGF1 with the 4.9 LUTs,
   untested. To advertise none, use plain v23a.dtb: the driver change works without it.
 - The window-level checks are stricter than before in two places, both required by 4.9: dst
   inside `dst.f_w/f_h`, and dst width >= 16. All run4 dumps have `dst_f_w 1440 / dst_f_h 2960`.
 - Disabled windows have no release fence (-1).
 - Panel, brightness and PMIC paths: not touched.
+
+## 10. DPU SysMMU scanout (branch `crownlte-dpu-scale-iommu`)
+
+**Status: build-only, untested on hardware.** Base: `crownlte-dpu-scale` 4ac2e1d38.
+
+### 10.1 Problem (ROM-in-RAM adb-dpu run, 2026-11-06)
+
+Image dpu-scale 4ac2e1d38 + DTB v23a-dpu. SurfaceFlinger composed the home screen (`adb
+screencap` showed wallpaper, clock and dock), but the camera showed the panel frozen on the
+setup-wizard frame. The kernel log repeated:
+
+```
+exynos9810-decon 16030000.decon_f: win0 bounce buffer 0: cannot allocate 26628096 bytes below 4 GiB from decon-pool
+cma: decon-pool: alloc failed, req-size: 6501 pages
+```
+
+The v23a-dpu DTB has no `iommus` on decon_f, so every gralloc buffer (system dma-heap,
+scattered) is copied into a contiguous decon-pool slot pair per window. With six windows and
+slots of 17-26 MB, the 208 MB CMA pool had ~97 MB free but no contiguous 26 MB run. Every
+frame with the scaled wallpaper on win0 therefore failed (`-ENOMEM`, release fence with an
+error, nothing programmed).
+
+### 10.2 What the base already had
+
+`crownlte-dpu-scale` already contains the reviewed SysMMU series of `crownlte-followups`, through
+the `crownlte-integration-3` merge d4af69833:
+
+- 0b5ae748f: exynos-iommu 9810 mode;
+- 2baaea489: DT nodes;
+- cf8abdf68: IOVA cache;
+- 7f0bfdbe5..f8cd991c7: fault recovery and quiesce;
+- docs up to 5b6ef27b4.
+
+That series passed Sol R4 (APPROVE). It already ports the `crownlte-dpu-iommu` work (d41526fcb)
+to the corrected DT naming: `dpp-dma` = IDMA block 0x16071000 and `dpp` = DPP block 0x16021000,
+as in v23a. Trial v22b (2026-11-06 01:15, ROM-in-RAM with HWC) ran it: boot_completed and no
+SysMMU faults. Nothing needed another cherry-pick. `crownlte-dpu-iommu` itself sits on the old
+display-s2 base and is superseded. The dpu-scale composition (scaling, YUV, two planes) was
+written on top of the same import path, so it needs no separate IOMMU path: each plane goes
+through `dpu_iova_get()`.
+
+Two pieces were missing: a DTB that opts in, and proof on the phone that the windows really
+scan IOVAs.
+
+### 10.3 Design (decon_drv.c)
+
+| Requirement | Where |
+|---|---|
+| Map each HWC dma-buf through the DPU SysMMU | `dpu_buf_import()` -> `dpu_iova_get()`: `dma_buf_attach(db, decon_f)` + `dma_buf_map_attachment()`. decon_f uses iommu-dma DMA ops on the SysMMU domain with max segment size `UINT_MAX`, so the sg_table is one IOVA run below 4 GiB (domain aperture `U32_MAX`). That address is the DPP base (`b->addr`) |
+| Map before the fence / latch | in the `S3CFB_WIN_CONFIG` ioctl (`dpu_build_commit()` -> `dpu_import_win()`), before the commit is queued. The worker waits for the acquire fences and then programs the IOVA |
+| Two-plane YUV | each plane gets its own `dpu_iova_get()`; the derived NV12 chroma is luma IOVA + `cofs` |
+| IOVA cache | per dma-buf, an LRU of at most 32 entries (the reuse 4.9 got from `ion_iovmm_map()`). Each entry holds its own dma-buf reference, attachment and mapping; `users` counts the commits that scan it |
+| Unmap only after the hardware stopped reading | a commit holds its entries until it is freed, and it is freed only after a later update latched. `d->active` is freed after the next latch. After a latch timeout the old and the new commit both stay (`d->stale`) until a latch is seen. Unused entries are unmapped when the cache holds the last dma-buf reference, or when they fall beyond 32 |
+| 4.9 release fences | one fence per commit, signalled after its shadow update latched, or with an error if nothing was programmed. It is returned as the release fence of every buffer window and as the retire fence. Once commit N latched, the hardware no longer reads commit N-1's buffers |
+| Bounce only as a fallback | without `iommus` (plain v23a-dpu DTB) nothing changes. With `iommus`, a dma-buf that cannot be mapped to one IOVA run below 4 GiB is logged (`decon iommu: no IOVA for a …-byte dma-buf (…): per-frame import and bounce copy`) and bounced. The slots then come from iommu-dma (any pages, not decon-pool CMA) |
+| Boot framebuffer identity map | `iommu-addresses` on the 0xcc000000 reservation makes the IOMMU core map it 1:1 before the domain is attached. Probe refuses unless all 18 1 MiB probes translate 1:1. The fb0 adopt/takeover, the self-tests and the panel recovery scan 0xcc000000 = identity IOVA |
+| Faults never panic | in 9810 mode, exynos-iommu returns from the fault IRQ. `dpu_iommu_fault()` counts the fault, masks the TE trigger and logs it. Recovery is bounded (3 unmasks), then DECON quiesces until a latch (display-iommu.md) |
+
+New in this branch: the scan proof and its counters.
+
+- `dpu_process()` marks a latched user commit for proof if it scans at least one window through a
+  cached IOVA, and it is one of the first 3 such commits or every 1000th after that.
+- `dpu_apply()` runs under `hw_lock` with the DPU domain on. It reads back the **active**
+  (latched) IDMA base Y of every window, and C for two-plane formats. For proof commits it also
+  reads CTRL bit 0 of all three SysMMUs through the read-only views.
+- `dpu_iova_proof()` runs after the fence was signalled. It logs one line per buffer window, then
+  a verdict. PASS needs all of these:
+  - every buffer window was scanned through its cached IOVA, and the latched base equals that
+    IOVA (Y and C);
+  - the IOVA translates to a physical page (`iommu_iova_to_phys()`);
+  - all three SysMMUs translate (0x7);
+  - no window was bounce-copied in this commit;
+  - no bounce slot is allocated at all (0 bytes).
+- `EXYNOS_DPU_DUMP` prints a second line with the IOVA counters (only with `iommus`).
+
+### 10.4 DTB
+
+`arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-v23a-dpu-iommu.dts` includes v23a-dpu.
+The decompiled diff against v23a-dpu.dtb shows only these changes:
+
+- `sysmmu@160a0000/160b0000/160c0000`: compatible `"samsung,exynos9810-sysmmu",
+  "samsung,exynos-sysmmu"`, `samsung,qos = <15>`, `samsung,pmu-syscon` = PMU (0x0d),
+  `samsung,pd-status = <0x4024 0xf 0xf>`, `status = "okay"` (dtc phandles 0x2a..0x2c);
+- reserved-memory `framebuffer@cc000000`: `iommu-addresses = <decon_f 0x0 0xcc000000 0x1400000>`
+  (phandle 0x29);
+- decon_f: `reg`/`reg-names` without the sysmmu0..2 windows, `iommus = <0x2a 0x2b 0x2c>`,
+  `memory-region = <decon-pool framebuffer@cc000000>` (phandle 0x28).
+
+These are the changes of the v22b SysMMU DTB (romram-iommu, a patched decompiled v18), now as
+source. decon-pool stays 208 MB: nothing uses it while every buffer gets an IOVA, and the
+self-test DTBs still allocate from it. The DTB is built with
+`KSRC=<worktree> KO=<build dir> rom-ram/src/build-dtb.sh`. The same command rebuilds
+v23a-dpu.dtb byte-identical (fc7201b5).
+
+### 10.5 Trial (ROM-in-RAM, adb-dpu setup)
+
+Pack like adb-dpu (build-19 ADB ramdisk), with the Image and DTB from 10.7. Boot to Lineage,
+finish or skip setup, press Home, open a few apps and return Home. Point the camera at the
+panel: it must follow `adb screencap` (the failure was a panel frozen on the setup-wizard frame).
+
+Expected kernel lines (`dmesg | grep -E "decon|sysmmu"`):
+
+```
+exynos-sysmmu 160a0000.sysmmu: Exynos9810 SysMMU v7.x registered: 4.9 CFG 0x…f80 (QoS 15), …   (×3)
+exynos9810-decon 16030000.decon_f: decon iommu: boot fb 0x00000000cc000000+0x1042800 identity map: 18/18 probes 1:1
+exynos9810-decon 16030000.decon_f: decon iommu: SysMMUs translating (0x7 -> 0x7)…
+exynos9810-decon 16030000.decon_f: fb0 takeover: … : 0, latched …
+… once HWC runs:
+decon iommu: map #1: 17305600-byte dma-buf, N physical chunks -> IOVA 0x… (cached 1, hits 0, unmapped 0)
+decon iommu: scan proof #1 win0 dpp4: active IDMA base 0x…, IOVA 0x… -> PA 0x… (17305600-byte dma-buf, N physical chunks): OK
+decon iommu: scan proof #1: 1/1 buffer windows scanned via IOVA (latched base == IOVA), 0 bounce-copied; SysMMUs 0x7 of 0x7 translating; bounce slots 0 bytes, bounce copies since boot 0; IOVA cache 1 (maps 1, hits 0, unmapped 0), SysMMU faults 0: PASS
+… proofs #2 and #3, then one at every 1000th IOVA commit
+… after Home: a proof (or a later `map #k`) with the 26214400-byte (or larger) wallpaper on win0 dpp4
+```
+
+None of these may appear: `bounce buffer`, `scattered buffer (… segments …) copied`,
+`cma: decon-pool: alloc failed`, `decon iommu: no IOVA`, `SysMMU … fault`, `scan proof … FAIL`,
+`active IDMA base … programmed`. `N physical chunks` > 1 shows that the buffer is scattered in
+RAM and contiguous only through the SysMMU.
+
+Counters: `EXYNOS_DPU_DUMP` (and every proof line) reports `IOVA commits windows proofs
+proof_fails cache maps hits unmapped faults quiesced`. During steady animation `hits` grows with
+every frame. `maps` stays near the number of distinct gralloc buffers (HWC triple-buffers each
+layer).
+
+How to read failures:
+
+| Log | Meaning |
+|---|---|
+| no `decon iommu:` lines, `bounce buffer` lines | the DTB without `iommus` was packed |
+| `decon iommu: boot fb IOVA … not identity` / `"iommus" lists …` / `SysMMUs 0x… of 0x7 translating` | DECON refused to probe. The SysMMUs went back to bypass and the splash stays; see display-iommu.md |
+| `scan proof … BASE != IOVA: FAIL` | the DPP latched an address other than the IOVA: a driver bug (no buffer leaves the IOVA path silently) |
+| `scan proof … not a SysMMU mapping: FAIL` | that window took the fallback (a `no IOVA` warning comes before it) |
+| `scan proof …: SysMMUs 0x3 of 0x7 …: FAIL` | a SysMMU stopped translating (runtime PM), so IOVAs are fetched as physical addresses. Expect garbage or an SError |
+| `SysMMU read fault #n at IOVA …` | the DPP fetched an IOVA after it was unmapped (lifetime bug) or one that was never mapped. The TE trigger is masked and the panel holds its last frame; see the recovery in display-iommu.md |
+
+### 10.6 Kernel-only check
+
+There is no new self-test step. The v23a-dpu-selftest DTB's fb0 flips and compose steps C1-C3
+use in-kernel buffers. With `iommus` those are `dma_alloc_wc()` IOVAs, so their IDMA-base checks
+then compare IOVAs. The proof above needs gralloc buffers, so it runs in ROM-in-RAM. No selftest
+DTB with `iommus` was built; this branch does not change the self-test compose path.
+
+### 10.7 Artifacts (gekko)
+
+| File | sha256 |
+|---|---|
+| `panel-bright-work/images/Image-romram-dpu-scale-iommu-7d0935d7a` (commits 9d4fdf396 + 7d0935d7a) | `1a32a91d4c60873f14dcfb36dac6cea68205a3d04f1daf512a73a2ac56e76168` |
+| `panel-bright-work/dtb/exynos9810-crownlte-romram-v23a-dpu-iommu.dtb` | `a9747cb9d61fc8a86eaea7bc6bfd46699956d767be07acea346587baaa52223a` |
+| `panel-bright-work/dtb/exynos9810-crownlte-romram-v23a-dpu-iommu.dts` (source copy) | `e18537aded20cfce659d6c9abb33ae5fd68033faaa55e58fc95637c16545672f` |
+| config: `panel-bright-work/ko-dpu-scale/config-romram-dpu-scale` (unchanged; `CONFIG_EXYNOS_IOMMU=y`, `CONFIG_IOMMU_DMA=y`) | `9e144fd87da63406f35debd27215a04d5ea00735b2f0724a1c45a79e6af30712` |
+
+The kernel was built with clang 18 (`LLVM=-18`, -j3). `W=1` gives no warnings in `dpu_9810/`, and
+checkpatch reports nothing on the diff (long-line rules ignored).
+
+### 10.8 Untested and risks
+
+- Not run on hardware. The SysMMU path ran in v22b (bounce-free HWC frames, no faults), but not
+  with the dpu-scale composition (scaled VGF windows, YUV planes, rotation) and not with the scan
+  proof.
+- The IOVA cache keeps up to 32 dma-bufs mapped and referenced after HWC stops using them, until
+  the cache holds the last reference or they fall off the LRU. That pins at most those buffers'
+  pages.
+- TLB way/port tuning is not ported (display-iommu.md), so heavy multi-layer scaling could
+  underrun.
+- While DECON is quiesced after a held fault, ALPM and panel-recovery command windows return
+  -EBUSY. v23a arms panel recovery L2 only on the ELVDD error flag, as v22b did.
+- decon-pool keeps its 208 MB CMA reservation. CMA is reusable, so movable pages still use it.
+- Panel power, PMIC and brightness code: not touched.
