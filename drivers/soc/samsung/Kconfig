@@ -159,6 +159,19 @@ config EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET
 	  This may fail to reset or return. Manual Download Mode restore and an
 	  available owner are still required. Never enable for Android production.
 
+config EXYNOS9810_AUDIO_A1
+	bool "crownlte audio stage A1: read-only hardware probe"
+	depends on ARM64 && OF && I2C && MFD_SYSCON && MFD_S2MPS18_ACPM
+	help
+	  Exynos 9810 (crownlte) audio stage A1: a DT-started self-test
+	  ("audio selftest A1:") that only reads the pd-aud and ABOX CPU
+	  status in the PMU, the codec/amp GPIOs, S2MPS18 LDO33/LDO34 over
+	  the read-only ACPM path and the MAX98512 revision and enable
+	  registers over HSI2C18; ABOX, SYSREG_AUD, SysMMU and pinctrl_aud
+	  only while pd-aud reads on, behind a CL0 watchdog deadline. No
+	  SPI traffic, no amp or codec driver. Idle unless the node has
+	  samsung,audio-a1-selftest-ms. See Documentation/crownlte/audio-a1.md.
+
 config EXYNOS9810_PM
 	bool "crownlte system suspend, stage S0 (no firmware sleep)"
 	depends on EXYNOS9810_LEGACY_CAL && OF && ARM64

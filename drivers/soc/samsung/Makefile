@@ -21,3 +21,4 @@ obj-$(CONFIG_EXYNOS9810_LEGACY_CAL) += cal-if/ acpm/ ect_parser.o exynos9810-cal
 
 obj-$(CONFIG_EXYNOS9810_DIAGNOSTIC_RESTART) += exynos9810-diagnostic-restart.o
 obj-$(CONFIG_EXYNOS9810_PM) += exynos9810-pm.o
+obj-$(CONFIG_EXYNOS9810_AUDIO_A1) += exynos9810-audio-a1.o
