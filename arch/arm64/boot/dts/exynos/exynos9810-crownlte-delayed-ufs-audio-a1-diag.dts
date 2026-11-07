@@ -15,10 +15,13 @@
  *    driver is never bound. The USI07 wrapper and the controller both
  *    name the audio-a1 node in samsung,audio-a1-guard, so neither probes
  *    (SYSREG, clocks, pin mux, controller) before that deadline is armed,
- *    and never if A1 refused. The controller runs in A1 read-only mode:
- *    only [2-byte register address][1-byte read] transfers, no retries,
- *    no stuck-bus recovery clocks, closed for the boot after the first
- *    failure. The self-test reads 7 whitelisted registers on 0x39/0x3a;
+ *    and never if A1 refused, and each comes up at most once per boot
+ *    (boot-lifetime latch, no sysfs bind/unbind). The controller runs in
+ *    A1 read-only mode: only [2-byte register address][1-byte read] of
+ *    the 7 registers on the A1 list at 0x39/0x3a (anything else refused
+ *    before the clocks), no retries, no stuck-bus recovery clocks,
+ *    closed for the boot after the first failure. The self-test reads
+ *    those 7 registers on 0x39/0x3a;
  *  - every other self-test removed (as in the suspend S0 DTB), except the
  *    read-only PMIC snapshot. The PMIC write policy stays sealed empty.
  * No codec (SPI) node, no ABOX node, no pd-aud power control.
@@ -39,6 +42,12 @@
 &hsi2c_amp {
 	samsung,audio-a1-guard = <&audio_a1>;
 	samsung,crownlte-a1-read-only;
+	/*
+	 * No "default" state: the driver core would mux gpp4-4/5 before the
+	 * probe, i.e. before the A1 bus latch and guard. The A1 mode selects
+	 * "a1-bus" (same pins, pinctrl-0 from the dtsi) itself after both.
+	 */
+	pinctrl-names = "a1-bus";
 	status = "okay";
 };
 
