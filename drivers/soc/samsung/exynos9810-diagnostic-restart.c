@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Experimental crownlte headless diagnostic return, never an Android ABI. */
+#include <linux/cpumask.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/reboot.h>
 #include <linux/rcupdate.h>
+#include <linux/suspend.h>
+#include <linux/workqueue.h>
 #include <soc/samsung/acpm_ipc_ctrl.h>
 #include <soc/samsung/cal-if.h>
+#include <soc/samsung/exynos9810-diagnostic-restart.h>
 #include "cal-if/asv.h"
 
 #define INFORM2 0x808
@@ -207,6 +213,100 @@ static struct notifier_block diagnostic_guard = {
 	.notifier_call = diagnostic_restart_guard,
 	.priority = 255,
 };
+
+/*
+ * Kernel-internal emergency reset (crownlte audio A2: a DSP that could not
+ * be stopped while the CL0 watchdog cannot end the boot). It is the PMU
+ * sequence of a default restart(2) without device shutdown:
+ * diagnostic_prepare() (normal INFORM2/INFORM3, ACPM STOP per the reset
+ * policy), then emergency_restart() -> machine_restart() -> the restart
+ * guard above (prerequisites and INFORM re-checked, PMU SWRESET).
+ * The check below requires the DFD dump to be off, so the guard's DFD
+ * preparation is the read-only no-op it is in the default restart.
+ */
+static const char *diagnostic_check(struct diagnostic_restart *ctx)
+{
+	unsigned int main_rev, sub_rev;
+
+	if (!ctx)
+		return "no published diagnostic restart context";
+	if (!cal_if_is_initialized())
+		return "CAL not initialised";
+	id_get_rev(&main_rev, &sub_rev);
+	if (main_rev != ctx->revision)
+		return "chip revision differs from the one at probe";
+	if (!diagnostic_reasons_valid(ctx))
+		return "boot reasons INFORM2/INFORM3 are not the normal ones";
+	if (readl(ctx->pmu + DFD) & BIT(0))
+		return "DFD dump enabled";
+	return NULL;
+}
+
+const char *exynos9810_diagnostic_restart_check(void)
+{
+	const char *why;
+
+	mutex_lock(&diagnostic_context_lock);
+	why = diagnostic_check(rcu_dereference_protected(diagnostic_context,
+				lockdep_is_held(&diagnostic_context_lock)));
+	mutex_unlock(&diagnostic_context_lock);
+	return why;
+}
+
+static long diagnostic_emergency_on_cpu(void *arg)
+{
+	struct sys_off_data data = { .mode = reboot_mode, .cmd = NULL };
+	struct diagnostic_restart *ctx;
+	const char *reason = arg, *why;
+	bool transition;
+	int i;
+
+	/*
+	 * A concurrent restart(2) holds system_transition_mutex, and its
+	 * command notifier clears ->prepared until its own preparation runs.
+	 * Wait for it a bounded time (it ends in the same reset), then go on.
+	 */
+	for (i = 0; !(transition = mutex_trylock(&system_transition_mutex)) && i < 100; i++)
+		msleep(100);
+	if (!transition)
+		pr_emerg("Diagnostic emergency restart: a system transition is still running after 10 s; going on without it\n");
+	/* The context lock keeps ctx and its PMU mapping published. */
+	mutex_lock(&diagnostic_context_lock);
+	ctx = rcu_dereference_protected(diagnostic_context,
+					lockdep_is_held(&diagnostic_context_lock));
+	why = diagnostic_check(ctx);
+	if (!why) {
+		pr_emerg("Diagnostic emergency restart (%s) on CPU%d: normal boot reasons, STOP, PMU SWRESET; no device shutdown\n",
+			 reason, raw_smp_processor_id());
+		WRITE_ONCE(ctx->default_requested, true);
+		data.cb_data = ctx;
+		diagnostic_prepare(&data);
+		if (smp_load_acquire(&ctx->prepared)) {
+			emergency_restart();	/* does not return on arm64 */
+			why = "emergency_restart() returned";
+		} else {
+			why = "restart preparation refused (boot reasons or STOP)";
+		}
+		WRITE_ONCE(ctx->prepared, false);
+		WRITE_ONCE(ctx->default_requested, false);
+	}
+	mutex_unlock(&diagnostic_context_lock);
+	if (transition)
+		mutex_unlock(&system_transition_mutex);
+	pr_emerg("Diagnostic emergency restart (%s) refused: %s\n", reason, why);
+	return -EIO;
+}
+
+int exynos9810_diagnostic_emergency_restart(const char *reason)
+{
+	int cpu = reboot_cpu;
+
+	might_sleep();
+	/* the reboot CPU, as kernel_restart() -> migrate_to_reboot_cpu() */
+	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
+		cpu = cpumask_first(cpu_online_mask);
+	return work_on_cpu(cpu, diagnostic_emergency_on_cpu, (void *)reason);
+}
 
 static bool diagnostic_topology_valid(void)
 {

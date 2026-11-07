@@ -34,7 +34,10 @@
  *  SYSPOWER_CTRL, PMU ABOX CPU power + enable, wait for "Calliope is ready
  *  to sing", ABOX_RESUME, run, ABOX_SUSPEND, wait for WFI, CPU enable and
  *  power off (the 4.9 order of the 8895 secure-boot path). The PMU
- *  registers are left as found.
+ *  registers are left as found. Once turned on, the ABOX SysMMU keeps
+ *  translating with A2's domain until the next reset (never bypass), and
+ *  system suspend is refused. A DSP that cannot be stopped ends the boot
+ *  in a full-SoC reset: CL0 watchdog, else the diagnostic restart.
  *
  * Not touched: codec, amps, PMIC, /efs, UAIF/DSIF pins and pad retention,
  * pd-aud power (no DTZPC SMC: pd-aud stays on as SBoot left it), AUD DVFS.
@@ -69,6 +72,7 @@
 #include <linux/workqueue.h>
 #include <soc/samsung/crownlte-wdt.h>
 #include <soc/samsung/exynos9810-abox-a2.h>
+#include <soc/samsung/exynos9810-diagnostic-restart.h>
 
 #define A2 "audio selftest A2: "
 
@@ -440,7 +444,7 @@ struct abox_a2 {
 	atomic_t ipc_rx, faults_fw, faults_mmu, spi_irqs;
 
 	bool dsp_running;	/* ABOX CPU may run (enabled and not seen off) */
-	bool rpm_held;		/* SysMMU translating on our behalf */
+	bool rpm_held;		/* SysMMU translating with our domain: kept until reset */
 	bool aborting;
 	u32 pmu_cfg0, pmu_opt0;	/* PMU state as found */
 	char result[160];
@@ -726,13 +730,33 @@ enum a2_stop_result {
 };
 
 /*
- * Stop the DSP: 4.9 abox_cpu_pm_ipc(SUSPEND) + WFI poll, then the CPU
- * enable/power clear of the 4.9 8895 path, then status off. The SUSPEND
- * ack, the WFI poll and the CPU-off poll are three separate results; only
- * all three together are a clean stop. The DRAM request (SYSPOWER_CTRL) is
- * withdrawn only once the CPU reads off. If it does not, nothing the DSP
- * may still use is given back (DRAM request, clocks, buffers, SysMMU
- * translation) and the caller ends the boot via a2_end_left_running().
+ * CPU enable/power clear of the 4.9 8895 path, then poll status off. Only
+ * once the CPU reads off is the DRAM request (SYSPOWER_CTRL) withdrawn and
+ * the DSP counted as stopped. Nothing else is given back here: the SysMMU
+ * keeps translating with A2's domain and the buffers stay until the next
+ * reset in every case (a2_work_fn()).
+ */
+static int a2_cpu_off(struct abox_a2 *a, u32 *st)
+{
+	int ret;
+
+	regmap_update_bits(gate.pmu, PMU_ABOX_CPU_OPTION, ABOX_CPU_OPTION_ENABLE_CPU, 0);
+	regmap_update_bits(gate.pmu, PMU_ABOX_CPU_CONFIGURATION, ABOX_CPU_LOCAL_PWR_CFG, 0);
+	ret = regmap_read_poll_timeout(gate.pmu, PMU_ABOX_CPU_STATUS, *st,
+				       !(*st & ABOX_CPU_STATUS_ON), 100, A2_CPU_OFF_TIMEOUT_US);
+	if (ret)
+		return ret;
+	writel(0, a->sfr + ABOX_SYSPOWER_CTRL);	/* 4.9 abox_request_dram_on(false) */
+	WRITE_ONCE(a->dsp_running, false);
+	return 0;
+}
+
+/*
+ * Stop the DSP: 4.9 abox_cpu_pm_ipc(SUSPEND) + WFI poll, then
+ * a2_cpu_off(). The SUSPEND ack, the WFI poll and the CPU-off poll are
+ * three separate results; only all three together are a clean stop. If
+ * the CPU does not read off, the DRAM request is kept too and the caller
+ * ends the boot via a2_end_left_running().
  */
 static enum a2_stop_result a2_stop(struct abox_a2 *a, int n)
 {
@@ -747,17 +771,12 @@ static enum a2_stop_result a2_stop(struct abox_a2 *a, int n)
 	if (wfi)
 		a2_dump_gpr(a, "no WFI after ABOX_SUSPEND");
 
-	regmap_update_bits(gate.pmu, PMU_ABOX_CPU_OPTION, ABOX_CPU_OPTION_ENABLE_CPU, 0);
-	regmap_update_bits(gate.pmu, PMU_ABOX_CPU_CONFIGURATION, ABOX_CPU_LOCAL_PWR_CFG, 0);
-	off = regmap_read_poll_timeout(gate.pmu, PMU_ABOX_CPU_STATUS, st,
-				       !(st & ABOX_CPU_STATUS_ON), 100, A2_CPU_OFF_TIMEOUT_US);
+	off = a2_cpu_off(a, &st);
 	if (off) {
 		pr_err(A2 "boot %d: ABOX CPU still on after enable/power off (STATUS=%#x): DRAM request (SYSPOWER_CTRL) kept\n",
 		       n, st);
 		return A2_STOP_UNCONFIRMED;
 	}
-	writel(0, a->sfr + ABOX_SYSPOWER_CTRL);	/* 4.9 abox_request_dram_on(false) */
-	WRITE_ONCE(a->dsp_running, false);
 	pr_info(A2 "boot %d: ABOX CPU off (STATUS=%#x)%s\n", n, st,
 		ipc || wfi ? ", stop not clean (no SUSPEND ack or no WFI)" : "");
 	return ipc || wfi ? A2_STOP_OFF_DIRTY : A2_STOP_CLEAN;
@@ -766,13 +785,21 @@ static enum a2_stop_result a2_stop(struct abox_a2 *a, int n)
 /*
  * The ABOX CPU did not read off after a stop. The DSP may still execute
  * and DMA, so this boot keeps everything it may use: the DRAM request
- * (SYSPOWER_CTRL = 1), the AUD clocks (held by the gate), the firmware
- * buffers and the chip-ID snapshot, and the runtime-PM reference that
- * keeps the SysMMU translating with A2's domain; a2_abox_suspend() refuses
- * system suspend. The boot then ends through the CL0 watchdog: petting
- * stops for good, so the SoC resets within the watchdog timeout (the
- * counter is reloaded once, so the logs reach pstore). Only if the guarded
- * watchdog cannot do that (gone or not running), an orderly reboot.
+ * (SYSPOWER_CTRL = 1), the AUD clocks (held by the gate), and, as after
+ * every test that turned the SysMMU on, the firmware buffers, the chip-ID
+ * snapshot and the runtime-PM reference that keeps the SysMMU translating
+ * with A2's domain; a2_abox_suspend() refuses system suspend. The boot
+ * then ends in a full-SoC reset, with the containment kept until it:
+ *  1. the CL0 watchdog: petting stops for good, so the SoC resets within
+ *     the watchdog timeout (the counter is reloaded once, so the logs reach
+ *     pstore);
+ *  2. if the guarded watchdog cannot do that (gone or not running): the
+ *     diagnostic restart's PMU SWRESET, the same sequence as the vehicle's
+ *     default restart(2) but without device shutdown, run at once on the
+ *     reboot CPU. Its prerequisites were checked before the first boot and
+ *     again before each boot (a2_work_fn());
+ *  3. only if that refuses as well: an orderly reboot (unbounded: it needs
+ *     user space), which ends in the same diagnostic restart.
  */
 static void a2_end_left_running(struct abox_a2 *a)
 {
@@ -782,7 +809,11 @@ static void a2_end_left_running(struct abox_a2 *a)
 	ret = s3c2410wdt_crownlte_stop_petting("audio A2: ABOX CPU not stopped");
 	if (ret >= 0)
 		return;
-	pr_emerg(A2 "CL0 watchdog final stop not possible (%d): orderly reboot\n", ret);
+	pr_emerg(A2 "CL0 watchdog final stop not possible (%d): diagnostic emergency restart (PMU SWRESET, no device shutdown)\n",
+		 ret);
+	ret = exynos9810_diagnostic_emergency_restart("audio A2: ABOX CPU not stopped");
+	pr_emerg(A2 "diagnostic emergency restart refused (%d): orderly reboot, containment kept\n",
+		 ret);
 	orderly_reboot();
 }
 
@@ -895,6 +926,15 @@ static void a2_work_fn(struct work_struct *w)
 		a2_finish(a, false, "wdt", 0, 0);
 		goto out;
 	}
+	/* the reset fallback of a2_end_left_running() must be available */
+	why = exynos9810_diagnostic_restart_check();
+	if (why) {
+		pr_err(A2 "diagnostic restart (reset fallback) not ready: %s: nothing touched\n",
+		       why);
+		a2_finish(a, false, "restart (nothing touched)", 0, 0);
+		goto out;
+	}
+	pr_info(A2 "reset fallback: diagnostic restart ready (PMU SWRESET)\n");
 
 	/* PMU first (always on), then the first reads inside pd-aud */
 	a2_pmu_snapshot(a, "before");
@@ -947,6 +987,12 @@ static void a2_work_fn(struct work_struct *w)
 			fails = "wdt";
 			break;
 		}
+		why = exynos9810_diagnostic_restart_check();
+		if (why) {
+			pr_err(A2 "boot %d not started: diagnostic restart not ready: %s\n", i, why);
+			fails = "restart";
+			break;
+		}
 		ret = a2_boot_once(a, i, &boot_ms);
 		boot_ms_max = max(boot_ms_max, boot_ms);
 		if (ret) {
@@ -969,11 +1015,20 @@ static void a2_work_fn(struct work_struct *w)
 		/* leave the PMU as found (the boot state is CPU off) */
 		regmap_update_bits(gate.pmu, PMU_ABOX_CPU_CONFIGURATION, ABOX_CPU_LOCAL_PWR_CFG,
 				   a->pmu_cfg0 & ABOX_CPU_LOCAL_PWR_CFG);
-		pm_runtime_put_sync(a->dev);
-		a->rpm_held = false;
 	} else if (!fails) {
 		fails = "stop-unconfirmed";	/* cannot happen: every unconfirmed stop fails */
 	}
+	/*
+	 * The runtime-PM reference is never dropped in this boot. Dropping it
+	 * would let the SysMMU runtime-suspend and write CTRL_DISABLE, which
+	 * is bypass, and CPU off (PMU STATUS) does not prove that no ABOX DMA
+	 * engine is still active. So the SysMMU keeps translating with A2's
+	 * domain (DRAM/IVA buffers, chip-ID page; any other IOVA faults), the
+	 * domain stays attached and the buffers allocated until the next
+	 * reset, and a2_abox_suspend() refuses system suspend for the rest of
+	 * the boot.
+	 */
+	dev_info(a->dev, "audio A2: SysMMU kept translating with the A2 domain until the next reset (runtime PM held, buffers kept, system suspend refused)\n");
 	a2_pmu_snapshot(a, "after");
 
 	if (!fails && atomic_read(&a->faults_mmu))
@@ -1304,27 +1359,48 @@ static int a2_abox_suspend(struct device *dev)
 {
 	struct abox_a2 *a = dev_get_drvdata(dev);
 
-	/* a running DSP behind a SysMMU in bypass would DMA to physical memory */
+	/*
+	 * System suspend would force the SysMMU into bypass
+	 * (pm_runtime_force_suspend()), and an ABOX DMA engine behind a SysMMU
+	 * in bypass would reach physical memory. Once the test has turned the
+	 * SysMMU on (rpm_held, never cleared), suspend is refused for the rest
+	 * of the boot.
+	 */
 	if (READ_ONCE(a->dsp_running) || a->rpm_held || delayed_work_pending(&a->work) ||
 	    work_busy(&a->work.work)) {
-		dev_warn(dev, "audio A2: ABOX test pending or running: system suspend refused\n");
+		dev_warn(dev, "audio A2: ABOX test pending or running, or SysMMU containment held: system suspend refused\n");
 		return -EBUSY;
 	}
 	return 0;
 }
 
+/*
+ * Device shutdown (restart(2) or power off). The DSP can only still run if
+ * the test left it running, and a2_end_left_running() is then already
+ * ending the boot. Power the ABOX CPU off as a2_stop() does and confirm
+ * it, but give nothing back either way: the SysMMU keeps translating with
+ * A2's domain (the runtime-PM reference is never dropped, the SysMMU
+ * driver has no shutdown hook) and the buffers stay allocated until the
+ * reset or power off that follows. An unconfirmed stop also keeps the
+ * DRAM request.
+ */
 static void a2_abox_shutdown(struct platform_device *pdev)
 {
 	struct abox_a2 *a = platform_get_drvdata(pdev);
+	u32 st = 0;
 
 	if (!a)
 		return;
 	WRITE_ONCE(a->aborting, true);
 	cancel_delayed_work_sync(&a->work);
-	if (READ_ONCE(a->dsp_running)) {
-		regmap_update_bits(gate.pmu, PMU_ABOX_CPU_OPTION, ABOX_CPU_OPTION_ENABLE_CPU, 0);
-		dev_info(&pdev->dev, "audio A2: ABOX CPU disabled at shutdown\n");
-	}
+	if (!READ_ONCE(a->dsp_running))
+		return;
+	if (a2_cpu_off(a, &st))
+		dev_emerg(&pdev->dev, "audio A2: ABOX CPU still on at shutdown (STATUS=%#x): DRAM request and SysMMU translation kept until the reset\n",
+			  st);
+	else
+		dev_info(&pdev->dev, "audio A2: ABOX CPU off at shutdown (STATUS=%#x); SysMMU translation kept until the reset\n",
+			 st);
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(a2_abox_pm, a2_abox_suspend, NULL);
