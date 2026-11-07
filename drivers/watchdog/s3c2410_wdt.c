@@ -1491,7 +1491,9 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 
 	s3c2410wdt_set_heartbeat(&wdt->wdt_device, S3C2410_WDT_RESTART_TIMEOUT);
 	spin_lock_irqsave(&wdt->lock, flags);
-	writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	/* Re-checked under the lock: the deadline may have passed since. */
+	if (s3c2410wdt_may_pet(wdt))
+		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
 	wdt->reboot_pending = true;
 	spin_unlock_irqrestore(&wdt->lock, flags);
 	dev_info(wdt->dev, "restart: armed for %u s and no longer petted\n",
@@ -1550,13 +1552,20 @@ static int s3c2410wdt_suspend_keep_armed(struct s3c2410_wdt *wdt, u32 wtcon)
 		return ret;
 	}
 	if (!__s3c2410wdt_keepalive(wdt)) {
-		/* The deadline passed in between: the reset is due anyway. */
+		/*
+		 * The deadline passed in between: the reset is due. Put the
+		 * run-time prescaler back so the slower suspend count cannot
+		 * stretch the time left (no reload either way).
+		 */
+		s3c2410wdt_set_heartbeat(&wdt->wdt_device, wdt->resume_timeout);
 		dev_err(dev, "suspend refused: petting stopped for good while arming\n");
 		return -EBUSY;
 	}
 	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
 	if ((wtcon & (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) !=
 	    (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) {
+		s3c2410wdt_set_heartbeat(&wdt->wdt_device, wdt->resume_timeout);
+		s3c2410wdt_keepalive(&wdt->wdt_device);
 		dev_err(dev, "suspend refused: WTCON %#x after setting the suspend timeout\n",
 			wtcon);
 		return -EIO;
