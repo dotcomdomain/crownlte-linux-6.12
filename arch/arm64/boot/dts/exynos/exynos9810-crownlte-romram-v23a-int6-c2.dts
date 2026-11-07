@@ -20,10 +20,13 @@
 	/* After the 40 s boot QoS release. */
 	samsung,c2-arm-delay-ms = <45000>;
 	/*
-	 * One-shot explicit clear of a VALID quarantine record whose token
-	 * differs (no root shell on ROM-RAM). Never applies to a missing or
-	 * invalid record: that boot stays fail-closed and writes an UNINIT
-	 * record; the next boot of this pack clears it once. Bump to rerun.
+	 * Explicit clear without root (none on ROM-RAM): clears a TRUSTED
+	 * quarantine record once, if the token is above the record's trial
+	 * floor; the token then becomes the floor. One increasing sequence over
+	 * all trial DTBs (c2-runtime.md section 6): a used or superseded token
+	 * never clears again. On a missing or ambiguous record it clears
+	 * nothing and only raises the floor: a new DTB with a higher token (or
+	 * root) is needed then. 0xc251a001 (round 0/1) is retired.
 	 */
-	samsung,c2-quarantine-trial-token = <0xc251a001>;
+	samsung,c2-quarantine-trial-token = <0xc2c20001>;
 };
