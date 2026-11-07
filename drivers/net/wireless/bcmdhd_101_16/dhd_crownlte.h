@@ -29,6 +29,10 @@ struct dhd_crownlte_plat_status {
 bool dhd_crownlte_wlan_ready(void);
 void dhd_crownlte_get_plat_status(struct dhd_crownlte_plat_status *st);
 
+/* dhd_pcie.c */
+struct dhd_pub;
+bool dhd_bus_sih_ok(struct dhd_pub *dhdp);
+
 /* dhd_crownlte_selftest.c */
 void dhd_crownlte_selftest_arm(struct device *dev, u32 delay_ms, bool keep_up);
 

@@ -701,6 +701,8 @@ int sec_get_param_wfa_cert(dhd_pub_t *dhd, int mode, uint* read_val)
 #define CLM_PREFIX "CLM_ver:"
 #define max_len(a, b) ((sizeof(a)/(2)) - (strlen(b)) - (3))
 #define tstr_len(a, b) ((strlen(a)) + (strlen(b)) + (3))
+/* crownlte: never pass snprintf more room than version_info has left */
+#define VI_ROOM(len, used) min_t(size_t, (size_t)(len), sizeof(version_info) - (size_t)(used))
 
 char version_info[MAX_VERSION_LEN];
 char version_old_info[MAX_VERSION_LEN];
@@ -746,7 +748,7 @@ uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_v
 		min_len = min(strlen(dhd_ver), max_len(temp_buf, DHD_PREFIX));
 		min_len += strlen(DHD_PREFIX) + 3;
 		DHD_INFO(("[WIFI_SEC] DHD ver length : %d\n", min_len));
-		snprintf(version_info+str_len, min_len, DHD_PREFIX " %s\n", dhd_ver);
+		snprintf(version_info+str_len, VI_ROOM(min_len, str_len), DHD_PREFIX " %s\n", dhd_ver);
 		str_len = strlen(version_info);
 
 		DHD_INFO(("[WIFI_SEC] Driver version_info len : %d\n", str_len));
@@ -759,7 +761,7 @@ uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_v
 		min_len = min(strlen(firm_ver), max_len(temp_buf, FIRM_PREFIX));
 		min_len += strlen(FIRM_PREFIX) + 3;
 		DHD_INFO(("[WIFI_SEC] firmware ver length : %d\n", min_len));
-		snprintf(version_info+str_len, min_len, FIRM_PREFIX " %s\n", firm_ver);
+		snprintf(version_info+str_len, VI_ROOM(min_len, str_len), FIRM_PREFIX " %s\n", firm_ver);
 		str_len = strlen(version_info);
 
 		DHD_INFO(("[WIFI_SEC] Firmware version_info len : %d\n", str_len));
@@ -784,7 +786,9 @@ uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_v
 		}
 #else
 		bzero(temp_buf, sizeof(temp_buf));
-		(void)memcpy_s(temp_buf, sizeof(temp_buf), nvram_p, sizeof(temp_buf));
+		/* crownlte: keep a NUL inside temp_buf (FORTIFY strlen panicked on 6.12) */
+		(void)memcpy_s(temp_buf, sizeof(temp_buf), nvram_p, sizeof(temp_buf) - 1);
+		temp_buf[sizeof(temp_buf) - 1] = '\0';
 		DHD_INFO(("[WIFI_SEC] NVRAM version_info exits\n"));
 #endif /* DHD_SUPPORT_VFS_CALL */
 
@@ -793,7 +797,7 @@ uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_v
 			bcmstrtok(&nvram_buf, "\n", 0);
 			DHD_INFO(("[WIFI_SEC] nvram tolkening : %s(%zu) \n",
 				temp_buf, strlen(temp_buf)));
-			snprintf(version_info+str_len, tstr_len(temp_buf, NV_PREFIX),
+			snprintf(version_info+str_len, VI_ROOM(tstr_len(temp_buf, NV_PREFIX), str_len),
 				NV_PREFIX " %s\n", temp_buf);
 			str_len = strlen(version_info);
 			DHD_INFO(("[WIFI_SEC] NVRAM version_info : %s\n", version_info));
@@ -810,7 +814,7 @@ uint32 sec_save_wlinfo(char *firm_ver, char *dhd_ver, char *nvram_p, char *clm_v
 		min_len = min(strlen(clm_ver), max_len(temp_buf, CLM_PREFIX));
 		min_len += strlen(CLM_PREFIX) + 3;
 		DHD_INFO(("[WIFI_SEC] clm ver length : %d\n", min_len));
-		snprintf(version_info+str_len, min_len, CLM_PREFIX " %s\n", clm_ver);
+		snprintf(version_info+str_len, VI_ROOM(min_len, str_len), CLM_PREFIX " %s\n", clm_ver);
 		str_len = strlen(version_info);
 
 		DHD_INFO(("[WIFI_SEC] CLM version_info len : %d\n", str_len));

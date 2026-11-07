@@ -912,6 +912,14 @@ dhd_bus_txq(struct dhd_bus *bus)
 }
 
 /** Get Chip ID version */
+#ifdef DHD_CROWNLTE_612
+/* crownlte self-test: the cached si handle exists (not torn down) */
+bool dhd_bus_sih_ok(dhd_pub_t *dhdp)
+{
+	return dhdp && dhdp->bus && dhdp->bus->sih;
+}
+#endif
+
 uint dhd_bus_chip_id(dhd_pub_t *dhdp)
 {
 	dhd_bus_t *bus = dhdp->bus;

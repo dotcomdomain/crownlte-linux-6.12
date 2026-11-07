@@ -138,7 +138,8 @@ static int crownlte_selftest_fn(void *arg)
 
 	/* 4. chip id (read by si_attach() at DHD attach, no new access) */
 	dhdp = g_dhd_pub;
-	if (!dhdp || !dhdp->bus) {
+	pr_info(WST "chip: dhd_pub %p bus %p\n", dhdp, dhdp ? dhdp->bus : NULL);
+	if (!dhdp || !dhdp->bus || !dhd_bus_sih_ok(dhdp)) {
 		pr_info(WST "chip: DHD not attached\n");
 		fail = "dhd-attach";
 		goto out;
