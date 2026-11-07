@@ -627,6 +627,19 @@ config PKVM_SMC_FILTER
 
 	  Say N here unless you know what you are doing.
 
+config SAMSUNG_BCM43XX_BT
+	bool "Samsung BCM43xx Bluetooth power and rfkill (crownlte)"
+	depends on RFKILL=y && GPIOLIB && OF && I2C && TTY
+	help
+	  Power control and rfkill for the Bluetooth core of the BCM4361
+	  combo chip on the Samsung Galaxy Note9 (crownlte), port of the
+	  4.9 "samsung,bcm43xx" driver. BT_REG_ON is one pin of an I2C GPIO
+	  expander that is shared with NFC, wireless charging and the DP
+	  switch; this driver writes only that pin. HCI runs from userspace
+	  (vendor HAL) over the BT UART tty; kernel CONFIG_BT is not needed.
+	  An optional DT-armed self-test checks the bus, UART and rfkill and
+	  exchanges HCI Reset / Read Local Version with the chip.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

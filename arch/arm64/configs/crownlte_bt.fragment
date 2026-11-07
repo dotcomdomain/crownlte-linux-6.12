@@ -1,0 +1,19 @@
+# crownlte Bluetooth stage B1 (Documentation/crownlte/bluetooth-port.md).
+# Apply on top of the Wi-Fi .config (crownlte_wifi.fragment), then olddefconfig.
+
+# rfkill for the vendor HAL (/sys/class/rfkill/rfkill0, type bluetooth).
+# No RFKILL_INPUT: it would switch every BT rfkill at registration.
+CONFIG_RFKILL=y
+# CONFIG_RFKILL_INPUT is not set
+# CONFIG_RFKILL_GPIO is not set
+
+# BCM4361 BT power/rfkill; BT_REG_ON is P0_7 of the shared PCAL6524, which
+# must not get a GPIO driver (pca953x rewrites polarity at probe and every
+# register on resume)
+CONFIG_SAMSUNG_BCM43XX_BT=y
+# CONFIG_GPIO_PCA953X is not set
+
+# HCI is driven from userspace over /dev/ttySAC1: no kernel Bluetooth stack,
+# no serdev (a serdev child would take the tty away from libbt)
+# CONFIG_BT is not set
+# CONFIG_SERIAL_DEV_BUS is not set
