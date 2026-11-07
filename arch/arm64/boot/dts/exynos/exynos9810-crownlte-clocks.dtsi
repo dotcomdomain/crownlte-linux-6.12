@@ -424,9 +424,6 @@
 		};
 	};
 };
- 		};
- 	};
- };
 
 /*
  * Amplifier bus: PERIC1 USI07 as HSI2C (4.9 alias hsi2c18 = hsi2c@108C0000,
