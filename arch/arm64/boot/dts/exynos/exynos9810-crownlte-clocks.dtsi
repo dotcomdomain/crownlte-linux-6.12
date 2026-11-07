@@ -484,3 +484,63 @@
 		};
 	};
 };
+
+/*
+ * ABOX audio DSP, audio stage A2 (Documentation/crownlte/audio-a2.md):
+ * firmware boot test only, everything disabled here. 4.9 nodes:
+ * abox@17C50000 (sfr, sysreg 0x17C10000, sram 0x17D00000 0x31000; IPC
+ * tx 0x30000, rx 0x30300, tx_ack 0x302FC, rx_ack 0x305FC), abox_gic
+ * (gicd 0x17CF1000, gicc 0x17CF2000, SPI 76 rising), sysmmu@17E00000
+ * (SPI 79, qos 15, port "Abox"), clocks pll/cpu/audif/dmic/bus =
+ * PLL_OUT_AUD/GATE_ABOX_DUMMY/DOUT_CLK_ABOX_AUDIF/DOUT_CLK_ABOX_DMIC/
+ * DOUT_CLK_ABOX_ACLK. All of them are inside pd-aud: the SysMMU and the
+ * ABOX only probe after the A2 gate (samsung,abox-a2-guard) armed the
+ * watchdog deadline, saw AUD_STATUS on and took the AUD clocks.
+ */
+/ {
+	abox_a2: abox-a2 {
+		compatible = "samsung,exynos9810-abox-a2";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		clocks = <&legacy_cmu PLL_OUT_AUD>, <&legacy_cmu GATE_ABOX_DUMMY>,
+			 <&legacy_cmu DOUT_CLK_ABOX_AUDIF>, <&legacy_cmu DOUT_CLK_ABOX_DMIC>,
+			 <&legacy_cmu DOUT_CLK_ABOX_ACLK>;
+		clock-names = "pll", "cpu", "audif", "dmic", "bus";
+		status = "disabled";
+	};
+};
+
+&soc {
+	sysmmu_abox: sysmmu@17e00000 {
+		compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
+		reg = <0x17e00000 0x9000>;
+		interrupts = <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>;
+		samsung,qos = <15>;
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,pd-status = <0x4004 0xf 0xf>;
+		samsung,abox-a2-guard = <&abox_a2>;
+		#iommu-cells = <0>;
+		status = "disabled";
+	};
+
+	abox: abox@17c50000 {
+		compatible = "samsung,exynos9810-abox-boot";
+		reg = <0x17c50000 0x10000>, <0x17c10000 0x10000>,
+		      <0x17d00000 0x31000>, <0x17cf1000 0x1000>,
+		      <0x17cf2000 0x1004>;
+		reg-names = "sfr", "sysreg", "sram", "gicd", "gicc";
+		interrupts = <GIC_SPI 76 IRQ_TYPE_EDGE_RISING>;
+		iommus = <&sysmmu_abox>;
+		samsung,abox-a2-guard = <&abox_a2>;
+		samsung,ipc-tx-offset = <0x30000>;
+		samsung,ipc-rx-offset = <0x30300>;
+		samsung,ipc-tx-ack-offset = <0x302fc>;
+		samsung,ipc-rx-ack-offset = <0x305fc>;
+		/* 4.9 ext_bin@0..6, all area 1 (DRAM image) */
+		samsung,ext-firmware-names = "dsm.bin", "AP_AUDIO_SLSI.bin",
+			"APBargeIn_AUDIO_SLSI.bin", "SoundBoosterParam.bin",
+			"APDV_AUDIO_SLSI.bin", "APBiBF_AUDIO_SLSI.bin", "dsm_tune.bin";
+		samsung,ext-firmware-offsets = <0x502000 0x7e0000 0x7dc000 0x4fc000
+						0x4d0000 0x7df000 0x601000>;
+		status = "disabled";
+	};
+};
