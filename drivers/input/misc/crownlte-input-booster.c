@@ -299,7 +299,10 @@ static void booster_attach(struct booster *b, struct cpufreq_policy *policy)
 				policy->cpuinfo.max_freq);
 			continue;
 		}
+		/* start at the current phase (lock held): a policy created mid-boost */
 		ret = freq_qos_add_request(&policy->constraints, &t->req, FREQ_QOS_MIN,
+					   b->phase == PHASE_HEAD ? t->head_khz :
+					   b->phase == PHASE_TAIL ? t->tail_khz :
 					   FREQ_QOS_MIN_DEFAULT_VALUE);
 		t->max_khz = policy->cpuinfo.max_freq;
 		dev_info(b->dev, "policy%u (cpus %*pbl): head %u kHz, tail %u kHz (ret=%d)\n",
@@ -457,6 +460,12 @@ static int booster_probe(struct platform_device *pdev)
 	ret = input_register_handler(&b->handler);
 	if (ret) {
 		cpufreq_unregister_notifier(&b->policy_nb, CPUFREQ_POLICY_NOTIFIER);
+		/* the requests live in devm memory that probe failure frees */
+		mutex_lock(&b->lock);
+		for (i = 0; i < b->nt; i++)
+			if (freq_qos_request_active(&b->t[i].req))
+				freq_qos_remove_request(&b->t[i].req);
+		mutex_unlock(&b->lock);
 		return dev_err_probe(dev, ret, "input handler\n");
 	}
 	dev_info(dev, "touch boost: head %u ms, tail %u ms after release, %u cluster(s) (4.9 input_booster TOUCH level 2)\n",
