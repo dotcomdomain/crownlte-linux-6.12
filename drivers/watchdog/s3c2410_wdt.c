@@ -33,6 +33,8 @@
 #include <linux/timekeeping.h>
 #include <linux/workqueue.h>
 
+#include <soc/samsung/crownlte-wdt.h>
+
 #define S3C2410_WTCON		0x00
 #define S3C2410_WTDAT		0x04
 #define S3C2410_WTCNT		0x08
@@ -252,6 +254,15 @@ struct s3c2410_wdt {
 	struct notifier_block	reboot_nb;
 	bool			reboot_pending;
 };
+
+/* Armed QUIRK_SBOOT_RESET_GUARD instance, for crownlte_wdt_stop_petting(). */
+static struct s3c2410_wdt *s3c2410_guarded_wdt;
+
+static void s3c2410wdt_unpublish(void *data)
+{
+	if (READ_ONCE(s3c2410_guarded_wdt) == data)
+		WRITE_ONCE(s3c2410_guarded_wdt, NULL);
+}
 
 static const struct s3c2410_wdt_variant drv_data_s3c2410 = {
 	.quirks = 0
@@ -543,12 +554,17 @@ static int s3c2410wdt_stop(struct watchdog_device *wdd)
 {
 	struct s3c2410_wdt *wdt = watchdog_get_drvdata(wdd);
 	unsigned long flags;
+	int ret = 0;
 
 	spin_lock_irqsave(&wdt->lock, flags);
-	__s3c2410wdt_stop(wdt);
+	/* Once petting has stopped for good, nothing may disarm the reset. */
+	if (wdt->reboot_pending)
+		ret = -EBUSY;
+	else
+		__s3c2410wdt_stop(wdt);
 	spin_unlock_irqrestore(&wdt->lock, flags);
 
-	return 0;
+	return ret;
 }
 
 static int s3c2410wdt_start(struct watchdog_device *wdd)
@@ -558,6 +574,12 @@ static int s3c2410wdt_start(struct watchdog_device *wdd)
 	unsigned long flags;
 
 	spin_lock_irqsave(&wdt->lock, flags);
+
+	/* A (re)start would reload the counter: never after stop-petting. */
+	if (wdt->reboot_pending) {
+		spin_unlock_irqrestore(&wdt->lock, flags);
+		return 0;
+	}
 
 	__s3c2410wdt_stop(wdt);
 
@@ -1187,6 +1209,11 @@ static int s3c2410wdt_probe(struct platform_device *pdev)
 	if (guarded && (wtcon & S3C2410_WTCON_ENABLE)) {
 		dev_info(dev, "armed: timeout %u s, kernel pings until userspace opens it\n",
 			 wdt->wdt_device.timeout);
+		/* The guarded instance is the one a lost CPU must reset. */
+		ret = devm_add_action_or_reset(dev, s3c2410wdt_unpublish, wdt);
+		if (ret)
+			return ret;
+		smp_store_release(&s3c2410_guarded_wdt, wdt);
 		ret = s3c2410wdt_selftest_setup(wdt);
 		if (ret)
 			return ret;
@@ -1214,6 +1241,12 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 		return NOTIFY_DONE;
 	if (!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
 		return NOTIFY_DONE;
+	/*
+	 * crownlte_wdt_stop_petting() already started the final countdown:
+	 * reloading it here would push the reset further out.
+	 */
+	if (READ_ONCE(wdt->reboot_pending))
+		return NOTIFY_DONE;
 
 	s3c2410wdt_set_heartbeat(&wdt->wdt_device, S3C2410_WDT_RESTART_TIMEOUT);
 	spin_lock_irqsave(&wdt->lock, flags);
@@ -1224,6 +1257,53 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 		 wdt->wdt_device.timeout);
 	return NOTIFY_DONE;
 }
+
+/**
+ * crownlte_wdt_stop_petting - make a watchdog reset certain
+ * @why: logged reason
+ *
+ * For a fault the kernel cannot recover from while it otherwise keeps
+ * running, e.g. a CPU lost in firmware (cpuidle-exynos9810 C2-LOST): the
+ * same action as the restart guard above, but outside a restart. The
+ * timeout becomes S3C2410_WDT_RESTART_TIMEOUT, the counter is reloaded once
+ * and never again: keepalive, start and stop are refused from now on, and
+ * the restart notifier does not reload it. Process context only (the
+ * heartbeat update reads the clock rate).
+ *
+ * Return: the reset timeout in seconds, or -ENODEV if no armed guarded
+ * watchdog exists.
+ */
+int crownlte_wdt_stop_petting(const char *why)
+{
+	struct s3c2410_wdt *wdt = smp_load_acquire(&s3c2410_guarded_wdt);
+	unsigned long flags;
+	bool again;
+
+	if (!wdt || !(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
+		return -ENODEV;
+
+	/* Petting stops here; the running countdown (DT timeout) continues. */
+	spin_lock_irqsave(&wdt->lock, flags);
+	again = wdt->reboot_pending;
+	wdt->reboot_pending = true;
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	if (again) {
+		dev_emerg(wdt->dev, "stop petting (%s): already stopped, reset pending\n",
+			  why);
+		return wdt->wdt_device.timeout;
+	}
+
+	s3c2410wdt_set_heartbeat(&wdt->wdt_device, S3C2410_WDT_RESTART_TIMEOUT);
+	spin_lock_irqsave(&wdt->lock, flags);
+	writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	spin_unlock_irqrestore(&wdt->lock, flags);
+	dev_emerg(wdt->dev, "stop petting (%s): watchdog reset in %u s (WTCON=%#x WTCNT=%#x)\n",
+		  why, wdt->wdt_device.timeout,
+		  readl(wdt->reg_base + S3C2410_WTCON),
+		  readl(wdt->reg_base + S3C2410_WTCNT));
+	return wdt->wdt_device.timeout;
+}
+EXPORT_SYMBOL_GPL(crownlte_wdt_stop_petting);
 
 static void s3c2410wdt_shutdown(struct platform_device *dev)
 {
@@ -1245,6 +1325,10 @@ static int s3c2410wdt_suspend(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
+
+	/* A pending stop-petting reset must not be switched off by sleep. */
+	if (READ_ONCE(wdt->reboot_pending))
+		return -EBUSY;
 
 	/* Save watchdog state, and turn it off. */
 	wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);
