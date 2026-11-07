@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ROM-in-RAM integration 6 + runtime C2 stage S2: every CPU ticks on its own
+ * MCT local timer (4.9 parity), and C2 is armed on LITTLE cpu1-3 (no
+ * cluster-0 concurrency limit, as on 4.9) plus big cpu4-7 from 45 s boot
+ * time. CPU0 stays out of C2. Needs the S0 chain of crownlte-c2-runtime
+ * (lost-core detector, watchdog final stop, quarantine record v3, buddy
+ * hard-lockup panic). See Documentation/crownlte/c2-s2.md.
+ *
+ * Build with rom-ram/src/build-dtb.sh (KSRC = this tree, KO = its build
+ * directory).
+ */
+#include "exynos9810-crownlte-romram-v23a-int6.dts"
+#include "exynos9810-crownlte-c2.dtsi"
+
+&{/} {
+	model = "Samsung Note9 ROM-in-RAM v23a integration 6 + C2 S2 (MCT local timers, LITTLE 1-3 + big 4-7)";
+};
+
+/*
+ * The 4.9 node mct@10040000: G0-G3 then L0-L7 on SPI 466-477 (4.9 maps them
+ * through mct-map with flags 0; level-high as the G0 entry here). The local
+ * timers' registers run to 0xa44 (L7 = 0xa00), past the 0x800 of the G0-only
+ * node; nothing else sits in 0x10040800-0x10040fff (the CL0 watchdog is at
+ * 0x10050000).
+ */
+&{/soc@0/timer@10040000} {
+	reg = <0x10040000 0x1000>;
+	interrupts = <0 466 4>, <0 467 4>, <0 468 4>, <0 469 4>,
+		     <0 470 4>, <0 471 4>, <0 472 4>, <0 473 4>,
+		     <0 474 4>, <0 475 4>, <0 476 4>, <0 477 4>;
+	samsung,mct-local-timers;
+};
+
+&{/soc@0/cpuidle@14070000} {
+	samsung,c2-boot-cpus = <0xfe>;
+	/* After the 40 s boot QoS release. */
+	samsung,c2-arm-delay-ms = <45000>;
+	samsung,c2-little-enable;
+	/* 4.9 has no cluster-0 limit; S2 tests exactly that. */
+	samsung,c2-little-limit = <0>;
+	/* LITTLE C2 only while the CPU ticks on its MCT local timer. */
+	samsung,c2-little-local-timer;
+	/*
+	 * One increasing token sequence over all trial DTBs
+	 * (c2-runtime.md section 6): 0xc2c20001 S1a, 0xc2c20002 drill (b).
+	 * Clears a TRUSTED record once if above its trial floor (now
+	 * 0xc2c20001 on the phone), then becomes the floor.
+	 */
+	samsung,c2-quarantine-trial-token = <0xc2c20003>;
+};
