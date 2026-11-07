@@ -231,6 +231,10 @@ static struct s2mps18_acpm *st_pmic;
 static const char *st_probe_stage = "probe never ran";
 static int st_probe_ret = -ENODEV;
 static unsigned int st_errors;
+/* DT samsung,pmic-selftest-pwren-sel: also dump PWREN_SEL1/2 (suspend S1a) */
+static bool st_pwren_sel;
+#define S2MPS18_PMIC_PWREN_SEL1		0xc8
+#define S2MPS18_PMIC_PWREN_SEL2		0xc9
 
 static void st_dump(struct s2mps18_acpm *pmic, const char *blk, u8 type,
 		    u8 first, u8 last)
@@ -316,6 +320,14 @@ static void s2mps18_selftest_fn(struct work_struct *work)
 	/* buck CTRL/OUT, ramp, DVS; then LDO CTRL (bits 7:6 = enable mode) */
 	st_dump(pmic, "pmic", ACPM_MFD_TYPE_PMIC, S2MPS18_PMIC_B1CTRL, S2MPS18_PMIC_BUCK7_DVS);
 	st_dump(pmic, "pmic", ACPM_MFD_TYPE_PMIC, S2MPS18_PMIC_L1CTRL, S2MPS18_PMIC_L45CTRL);
+	/*
+	 * Suspend S1a compare with live 4.9 (read only): 4.9 writes
+	 * PWREN_SEL2 = 0xff at probe; B1..B4 OUT2 (0x1e 0x21 0x24 0x27, 4.9
+	 * writes 0x20) are already in the buck dump above.
+	 */
+	if (st_pwren_sel)
+		st_dump(pmic, "pmic", ACPM_MFD_TYPE_PMIC, S2MPS18_PMIC_PWREN_SEL1,
+			S2MPS18_PMIC_PWREN_SEL2);
 	/* RTC CTRL WTSR_SMPL UPDATE CAPSEL MSEC, alarm 0/1, OSCCTRL */
 	st_dump(pmic, "rtc", ACPM_MFD_TYPE_RTC, S2MPS18_RTC_CTRL, S2MPS18_RTC_MSEC);
 	st_dump(pmic, "rtc", ACPM_MFD_TYPE_RTC, S2MPS18_RTC_A0SEC, S2MPS18_RTC_OSCCTRL);
@@ -499,6 +511,8 @@ static int __init s2mps18_acpm_init(void)
 	for_each_compatible_node(np, NULL, "samsung,exynos9810-s2mps18-acpm") {
 		if (of_device_is_available(np) &&
 		    of_property_read_bool(np, "samsung,pmic-selftest")) {
+			st_pwren_sel = of_property_read_bool(np,
+						"samsung,pmic-selftest-pwren-sel");
 			queue_delayed_work(system_long_wq, &s2mps18_selftest_work,
 					   at > up ? at - up : 0);
 			pr_info("s2mps18-acpm: pmic selftest scheduled at ~%u s uptime\n",
