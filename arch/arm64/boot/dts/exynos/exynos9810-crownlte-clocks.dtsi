@@ -278,3 +278,149 @@
 		};
 	};
 };
+
+/*
+ * Bluetooth (BCM4361 BT core, Documentation/crownlte/bluetooth-port.md).
+ * 4.9: /bluetooth "samsung,bcm43xx", gpios = <expander 7>, <gpg2 0>,
+ * <gpa2 3> (bt_en, bt_wake, bt_hostwake); BT UART uart@10840000 = ttySAC1;
+ * expander pcal6524@22 on hsi2c@10930000 (USI10_I2C).
+ *
+ * BT_REG_ON is P0_7 of that PCAL6524, which also drives NFC VEN (P1_3),
+ * wireless charging wpc_en (P1_0) and the DP switch (P0_1, P0_4). No GPIO
+ * driver binds to it (GPIO_PCA953X stays off, the bluetooth driver refuses
+ * to touch it if any driver is bound); the bluetooth driver only does
+ * read-modify-write of bit 7 in output/configuration port 0. No reset-gpios:
+ * the expander reset (gpg3-6) is never driven by 6.12.
+ *
+ * Node name "bluetooth" is fixed: vendor sepolicy labels
+ * /sys/devices/platform/bluetooth/rfkill/rfkill0/state and the vendor rc
+ * chowns rfkill0. The serial1 alias makes the UART ttySAC1 (libbt opens
+ * /dev/ttySAC1). Everything is disabled here; diagnostic DTBs enable it.
+ */
+/ {
+	aliases {
+		serial1 = &serial_bt;
+	};
+
+	bluetooth: bluetooth {
+		compatible = "samsung,bcm43xx";
+		samsung,bt-reg-on-expander = <&bt_expander>;	/* P0_7, fixed */
+		samsung,bt-uart = <&serial_bt>;
+		bt-wake-gpios = <&gpg2 0 GPIO_ACTIVE_HIGH>;
+		bt-host-wake-gpios = <&gpa2 3 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&bt_hostwake &bt_btwake>;
+		status = "disabled";
+	};
+};
+
+/* alive banks have no power-down config fields on 6.12: 4.9 *-pdn dropped */
+&pinctrl_alive {
+	uart_bt_bus: uart-bt-bus-pins {
+		samsung,pins = "gpq0-3", "gpq0-2", "gpq0-1", "gpq0-0";
+		samsung,pin-function = <2>;
+		samsung,pin-pud = <3>;
+		samsung,pin-drv = <0>;
+	};
+
+	bt_hostwake: bt-hostwake-pins {
+		samsung,pins = "gpa2-3";
+		samsung,pin-function = <0xf>;
+		samsung,pin-pud = <0>;
+	};
+};
+
+&pinctrl_peric0 {
+	bt_btwake: bt-btwake-pins {
+		samsung,pins = "gpg2-0";
+		samsung,pin-function = <1>;
+		samsung,pin-pud = <0>;
+		samsung,pin-con-pdn = <3>;
+		samsung,pin-pud-pdn = <0>;
+	};
+};
+
+&pinctrl_peric1 {
+	hsi2c25_bus: hsi2c25-bus-pins {
+		samsung,pins = "gpp6-2", "gpp6-3";
+		samsung,pin-function = <3>;
+		samsung,pin-pud = <0>;
+		samsung,pin-drv = <0>;
+	};
+};
+
+&soc {
+	/*
+	 * BT UART (4.9 uart@10840000: SPI 422, clocks GATE_UART_BT + UART_BT,
+	 * fifo 256, usi-serial-v2). Fixed-function: no SYSREG SW_CONF; the 4.9
+	 * driver pulsed USI_CON reset and set USI_OPTION CLKREQ_ON.
+	 */
+	usi_uart_bt: usi@108400c0 {
+		compatible = "samsung,exynos9810-usi";
+		/* Wrapper owns +0xc4/+0xc8; the UART below owns [0, 0xc0). */
+		reg = <0x108400c0 0x20>;
+		clocks = <&legacy_cmu GATE_UART_BT>, <&legacy_cmu UART_BT>;
+		clock-names = "pclk", "ipclk";
+		samsung,mode = <USI_V2_UART>;
+		samsung,no-sw-conf;
+		samsung,clkreq-on;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		status = "disabled";
+
+		serial_bt: serial@10840000 {
+			compatible = "samsung,exynos9810-uart";
+			reg = <0x10840000 0xc0>;
+			interrupts = <GIC_SPI 422 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&legacy_cmu GATE_UART_BT>, <&legacy_cmu UART_BT>;
+			clock-names = "uart", "clk_uart_baud0";
+			samsung,uart-fifosize = <256>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart_bt_bus>;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * Expander bus: USI10_I2C (4.9 hsi2c@10930000, alias hsi2c25, SPI 437,
+	 * clocks PERIC1_USI_I2C + GATE_USI10_I2C, default-clk 200 MHz, fast
+	 * mode). 4.9 never wrote a SW_CONF for it (usi@10811040 disabled); the
+	 * hsi2c driver only cleared USI_CON reset.
+	 */
+	usi_i2c_exp: usi@109300c0 {
+		compatible = "samsung,exynos9810-usi";
+		reg = <0x109300c0 0x20>;
+		clocks = <&legacy_cmu GATE_USI10_I2C>, <&legacy_cmu PERIC1_USI_I2C>;
+		clock-names = "pclk", "ipclk";
+		samsung,mode = <USI_V2_I2C>;
+		samsung,no-sw-conf;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		status = "disabled";
+
+		hsi2c_exp: i2c@10930000 {
+			compatible = "samsung,exynos9810-hsi2c";
+			reg = <0x10930000 0xc0>;
+			interrupts = <GIC_SPI 437 IRQ_TYPE_LEVEL_HIGH>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			clocks = <&legacy_cmu PERIC1_USI_I2C>, <&legacy_cmu GATE_USI10_I2C>;
+			clock-names = "hsi2c", "hsi2c_pclk";
+			clock-frequency = <400000>;	/* 4.9 fast-mode default */
+			pinctrl-names = "default";
+			pinctrl-0 = <&hsi2c25_bus>;
+			status = "disabled";
+
+			/* no reset-gpios, no interrupts, no GPIO driver: see above */
+			bt_expander: gpio@22 {
+				compatible = "nxp,pcal6524";
+				reg = <0x22>;
+				gpio-controller;
+				#gpio-cells = <2>;
+				status = "disabled";
+			};
+		};
+	};
+};

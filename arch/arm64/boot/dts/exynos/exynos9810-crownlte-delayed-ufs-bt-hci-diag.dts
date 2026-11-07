@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Bluetooth B1, trial B1-hci: as B1-read, but the self-test at 93 s also
+ * powers the BT core (BT_WAKE high, expander P0_7 high, 100 ms), opens
+ * ttySAC1 in the kernel at 115200 8N1 RTS/CTS, sends HCI Reset, Read Local
+ * Version and Read BD_ADDR, then powers the core off again. The expander is
+ * dumped before and after each change. Expected end "bt selftest: RESULT
+ * PASS". Only after B1-read passed. See Documentation/crownlte/bluetooth-port.md.
+ */
+#include "exynos9810-crownlte-delayed-ufs-bt-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + Bluetooth B1 (HCI self-test)";
+};
+
+&bluetooth {
+	/delete-property/ samsung,bt-selftest-no-power;
+};
