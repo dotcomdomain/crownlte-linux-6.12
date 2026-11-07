@@ -622,8 +622,14 @@ static int st_uart(struct bcm43xx_bt *bt)
 	st_info(bt, "uart clk=%lu Hz err115200=%c%d.%02d%% err3000000=%c%d.%02d%%\n",
 		rate, e1 < 0 ? '-' : '+', abs(e1) / 100, abs(e1) % 100,
 		e2 < 0 ? '-' : '+', abs(e2) / 100, abs(e2) % 100);
-	if (!usi || !uart || rate < 48000000 || abs(e1) > 200 || abs(e2) > 200)
+	if (!usi || !uart || abs(e1) > 200) {
 		ret = -ERANGE;
+	} else if (rate < 48000000 || abs(e2) > 200) {
+		/* 115200 (HCI step) still usable, libbt's 3 Mbaud is not */
+		st_err(bt, "uart: 3000000 baud not reachable within 2%%\n");
+		if (!ret)
+			ret = 1;
+	}
 out:
 	if (!IS_ERR_OR_NULL(bclk))
 		clk_put(bclk);
@@ -894,6 +900,7 @@ static void bt_selftest_work(struct work_struct *work)
 					     struct bcm43xx_bt, st_work);
 	struct tty_struct *tty;
 	const char *stage = NULL;
+	bool baud3m_bad = false;
 	int diffs = 0, ret, ret2;
 
 	st_info(bt, "start at %lld ms, mode %s\n",
@@ -907,11 +914,15 @@ static void bt_selftest_work(struct work_struct *work)
 	}
 	if (st_bus(bt, &diffs))
 		stage = "bus";
-	if (st_uart(bt) && !stage)
+	ret = st_uart(bt);
+	if (ret < 0 && !stage)
 		stage = "uart";
+	baud3m_bad = ret > 0;
 	if (st_rfkill(bt) && !stage)
 		stage = "rfkill";
 	if (stage || bt->st_no_power) {
+		if (!stage && baud3m_bad)
+			stage = "uart-3m";
 		if (stage)
 			st_err(bt, "RESULT FAIL stage=%s\n", stage);
 		else
@@ -956,6 +967,8 @@ static void bt_selftest_work(struct work_struct *work)
 		rfkill_soft_blocked(bt->rfkill));
 	if (!stage && (ret2 || diffs))
 		stage = "power";
+	if (!stage && baud3m_bad)
+		stage = "uart-3m";	/* HCI fine at 115200, 3 Mbaud is not */
 	if (stage)
 		st_err(bt, "RESULT FAIL stage=%s\n", stage);
 	else
