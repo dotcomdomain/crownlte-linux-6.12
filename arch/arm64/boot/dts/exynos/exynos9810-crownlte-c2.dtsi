@@ -2,10 +2,11 @@
 /*
  * Runtime C2 self-recovery (S0): the C2 quarantine marker page.
  *
- * One 4 KB no-map page holds the record of a core lost in C2 (written by
- * drivers/cpuidle/cpuidle-exynos9810.c before it stops petting the
- * watchdog), so the next boot of this kernel keeps the lost cluster out of
- * C2 instead of looping. It sits in the last page of the 4.9 exynos-snapshot
+ * One 4 KB no-map page holds the C2 quarantine record (v2: two alternating
+ * sequenced slots, armed-session state, lost cores, consumed drills;
+ * drivers/cpuidle/cpuidle-exynos9810.c), so the next boot of this kernel
+ * keeps C2 off after a loss or an unclean end of an armed session instead
+ * of looping. It sits in the last page of the 4.9 exynos-snapshot
  * carve-out (0xfda00000..0xff608000, already no-map here as
  * snapshot-after-pstore). 4.9 places no snapshot item there: its last item,
  * log_kevents, ends at 0xff518000. RAM only, nothing is written to storage.

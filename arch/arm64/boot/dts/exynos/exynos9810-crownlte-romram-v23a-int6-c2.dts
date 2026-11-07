@@ -19,4 +19,11 @@
 	samsung,c2-boot-cpus = <0xf0>;
 	/* After the 40 s boot QoS release. */
 	samsung,c2-arm-delay-ms = <45000>;
+	/*
+	 * One-shot explicit clear of a VALID quarantine record whose token
+	 * differs (no root shell on ROM-RAM). Never applies to a missing or
+	 * invalid record: that boot stays fail-closed and writes an UNINIT
+	 * record; the next boot of this pack clears it once. Bump to rerun.
+	 */
+	samsung,c2-quarantine-trial-token = <0xc251a001>;
 };

@@ -2,10 +2,14 @@
 /*
  * C2 S0 drill (a), delayed-UFS vehicle: big C2 armed (cpu4-7) at 30 s, then
  * at 60 s the lost-core detector treats cpu2 as lost (simulated). Expected:
- * C2-LOST dump, quarantine marker (LITTLE), everything disarmed, watchdog no
- * longer petted, CLUSTER0 watchdog reset at about 90 s (before the 120 s PID1
- * restart). The driver reboots by itself at 105 s if the watchdog did not
- * fire, and restarts at 135 s as a last resort. No cpuidle self-test.
+ * C2-LOST dump, quarantine record (LITTLE), everything disarmed, the
+ * watchdog final stop, CLUSTER0 watchdog reset within its timeout (15 s, so
+ * about 75 s, before the 120 s PID1 restart). The driver reboots by itself
+ * at 105 s if the watchdog did not fire, and restarts at 135 s as a last
+ * resort. No cpuidle self-test. The drill runs once: it is consumed in the
+ * record before it fires (root c2_drill_rearm re-arms it). No trial token:
+ * the big arming at 30 s only happens if the record is already valid and
+ * clear; the drill does not need it.
  */
 #include "exynos9810-crownlte-delayed-ufs-diag.dts"
 #include "exynos9810-crownlte-c2.dtsi"

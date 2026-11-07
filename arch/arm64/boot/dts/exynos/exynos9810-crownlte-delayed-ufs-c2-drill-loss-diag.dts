@@ -20,4 +20,6 @@
 	samsung,c2-boot-cpus = <0xf0>;
 	samsung,c2-arm-delay-ms = <30000>;
 	samsung,c2-loss-drill-ms = <60000>;
+	/* One-shot clear of a valid record whose token differs (see S1a DTS). */
+	samsung,c2-quarantine-trial-token = <0xc2b10001>;
 };
