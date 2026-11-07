@@ -46,10 +46,12 @@
  *
  * Recovery: the CL0 watchdog stays armed through suspend
  * (samsung,keep-armed-in-suspend, 60 s). A CPU lost while the kernel still
- * counts it online stops the kernel's petting (other CPUs would otherwise
- * keep the watchdog quiet forever, as in trial c2diag-b); a DT deadline
- * does the same if the system is still up long after the vehicle's
- * restart time.
+ * counts it online, or a cross-CPU request that times out, stops the
+ * kernel's petting (other CPUs would otherwise keep the watchdog quiet
+ * forever, as in trial c2diag-b). The DT deadline is installed at probe,
+ * before any cross-CPU request, inside the watchdog's ping path: after it
+ * no CPU can reload the counter. S0b and S0c/S0d start only with a live,
+ * reset-enabled, still-petted watchdog carrying that deadline.
  */
 
 #define pr_fmt(fmt) "suspend s0: " fmt
@@ -88,9 +90,17 @@
 #define E9810_NR_PHYCPUS		8
 #define E9810_NR_CLUSTERS		2
 
+/*
+ * Register access rule (S0 R1, after the S0ab panic on PMU 0x30): only
+ * registers that the 4.9 kernel reaches by plain non-secure MMIO on 9810;
+ * table with the 4.9 file:line for each in Documentation/crownlte/
+ * suspend-s0.md section 9. PMU 0x30 CP_CTRL_NS and 0x34 CP_CTRL_S are
+ * secure-only: 4.9 goes through SMC 0x82000700 for them (pmucal_cp.c
+ * pmucal_is_cp_smc_regs()), and a non-secure read is a synchronous
+ * external abort. This driver never touches them and has no SMC.
+ */
+
 /* PMU (0x14060000) */
-#define PMU_CP_CTRL_NS			0x0030
-#define PMU_CP_CTRL_S			0x0034
 #define PMU_CP_STAT			0x0038
 #define PMU_CENTRAL_SEQ_CP_CFG		0x0280
 #define PMU_CENTRAL_SEQ_CP_STATUS	0x0284
@@ -126,16 +136,22 @@ static const u16 pmu_pad_ret[E9810_NR_PAD_RET] = {
 #define INTR_GEN_CLEAR(g)		(0x100 * (g) + 0xc)
 /* LITTLE cores use bits 4-7, BIG cores bits 0-3 */
 #define INTR_GEN_BIT(phy)		BIT((phy) ^ 4)
+/* Groups whose EN and PEND the 4.9 CAL tables access (not 0, 3) */
+static const u8 intr_gen_grp[] = { 1, 2, 4 };
+#define E9810_NR_GRP			ARRAY_SIZE(intr_gen_grp)
 
 /* GPIO_ALIVE (0x14050000): gpa0..gpa4 */
 #define ALIVE_NR_BANKS			5
 #define ALIVE_EINT_MASK(b)		(0x900 + 4 * (b))
 #define ALIVE_EINT_PEND(b)		(0xa00 + 4 * (b))
 
-/* GIC-400 distributor; SGI/PPI bits are banked for the reading CPU */
+/*
+ * GIC-400 distributor; SGI/PPI bits are banked for the reading CPU.
+ * ISPENDR0 bits 0-15 show a pending SGI from any source, so the S0d
+ * self-IPI check needs no GICD_SPENDSGIRn (4.9 never reads those on 9810).
+ */
 #define GICD_ISPENDR(n)			(0x200 + 4 * (n))
 #define GICD_NR_ISPENDR			16
-#define GICD_SPENDSGIR(n)		(0xf20 + 4 * (n))
 
 /* MCT global free-running counter */
 #define MCT_G_CNT_L			0x100
@@ -162,7 +178,8 @@ static const char * const fdbg_name[] = { "sw_flag", "ap_sleep", "mif_sleep" };
 #define S0_PM_TEST_DELAY_DEFAULT	5
 #define S0_GROUP_CYCLES_DEFAULT		5
 #define S0_HP_TIMEOUT_MS		9000	/* > arm64 5 s waits + CPU_DEAD 2 s */
-#define S0_PING_TIMEOUT_MS		200
+#define S0_XCALL_TIMEOUT_MS		200	/* any cross-CPU request */
+#define S0_WDT_LIVE_TRIES		20	/* WTCNT must move: 20 x 2-3 ms */
 #define S0_DEAD_POLL_MS			2000	/* 4.9 exynos_cpu_callback() */
 #define S0_DEAD_POLL_SHORT_MS		20	/* after a core stayed powered */
 #define S0_REMINDERS			4
@@ -175,7 +192,7 @@ static const char * const s0_result_name[] = {
 };
 
 struct e9810_snap {
-	u32 cp_ctrl_ns, cp_ctrl_s, cp_stat, cp_seq_cfg, cp_seq_stat;
+	u32 cp_stat, cp_seq_cfg, cp_seq_stat;
 	u32 dfd, g3d;
 	u32 wakeup_stat, wakeup_stat2, eint_wmask;
 	u32 wmask[E9810_MAX_WMASK];
@@ -185,10 +202,10 @@ struct e9810_snap {
 	u32 cpu_status[E9810_NR_PHYCPUS];
 	u32 noncpu[2];
 	u32 event_grp2;
-	u32 grp_en[5], grp_pend[5];	/* INTR_GEN groups 0..4 */
+	u32 grp_en[E9810_NR_GRP], grp_pend[E9810_NR_GRP]; /* intr_gen_grp[] */
 	u32 apm2ap;
 	u32 alive_mask[ALIVE_NR_BANKS], alive_pend[ALIVE_NR_BANKS];
-	u32 gicd_pend[GICD_NR_ISPENDR], sgi_pend[4];
+	u32 gicd_pend[GICD_NR_ISPENDR];
 	u64 frc, cntpct;
 	u32 g_tcon;
 	u32 fdbg[E9810_NR_FDBG][2];
@@ -266,7 +283,7 @@ static struct e9810_pm {
 	u32 c_ok;
 	struct cpumask lost;
 	bool lost_online;
-	struct hrtimer deadline[2];
+	struct hrtimer deadline;	/* supplement to the WDT ping-path check */
 	struct task_struct *task;
 } e9pm;
 
@@ -312,8 +329,6 @@ static void e9810_snap(struct e9810_snap *s)
 	unsigned int i;
 
 	memset(s, 0, sizeof(*s));
-	s->cp_ctrl_ns = pmu_rd(PMU_CP_CTRL_NS);
-	s->cp_ctrl_s = pmu_rd(PMU_CP_CTRL_S);
 	s->cp_stat = pmu_rd(PMU_CP_STAT);
 	s->cp_seq_cfg = pmu_rd(PMU_CENTRAL_SEQ_CP_CFG);
 	s->cp_seq_stat = pmu_rd(PMU_CENTRAL_SEQ_CP_STATUS);
@@ -338,9 +353,10 @@ static void e9810_snap(struct e9810_snap *s)
 	for (i = 0; i < 2; i++)
 		s->noncpu[i] = pmu_rd(pmu_noncpu_status[i]);
 	s->event_grp2 = pmu_rd(PMU_EVENT_INT_EN_GRP2);
-	for (i = 0; i < 5; i++) {
-		s->grp_en[i] = readl(e9pm.intr_gen + INTR_GEN_EN(i));
-		s->grp_pend[i] = readl(e9pm.intr_gen + INTR_GEN_PEND(i));
+	for (i = 0; i < E9810_NR_GRP; i++) {
+		s->grp_en[i] = readl(e9pm.intr_gen + INTR_GEN_EN(intr_gen_grp[i]));
+		s->grp_pend[i] = readl(e9pm.intr_gen +
+				       INTR_GEN_PEND(intr_gen_grp[i]));
 	}
 	s->apm2ap = readl(e9pm.mbox + APM_MAILBOX_APM2AP);
 	for (i = 0; i < ALIVE_NR_BANKS; i++) {
@@ -349,8 +365,6 @@ static void e9810_snap(struct e9810_snap *s)
 	}
 	for (i = 0; i < GICD_NR_ISPENDR; i++)
 		s->gicd_pend[i] = readl(e9pm.gicd + GICD_ISPENDR(i));
-	for (i = 0; i < 4; i++)
-		s->sgi_pend[i] = readl(e9pm.gicd + GICD_SPENDSGIR(i));
 	s->frc = mct_frc();
 	s->g_tcon = readl(e9pm.mct + MCT_G_TCON);
 	s->cntpct = __arch_counter_get_cntpct();
@@ -365,9 +379,8 @@ static void e9810_snap_print(const char *tag, const struct e9810_snap *s)
 {
 	unsigned int i;
 
-	pr_info("%s CP_STAT=%#x CP_CTRL_NS=%#x CP_CTRL_S=%#x SEQ_CP cfg=%#x status=%#x DFD=%#x G3D=%#x\n",
-		tag, s->cp_stat, s->cp_ctrl_ns, s->cp_ctrl_s, s->cp_seq_cfg,
-		s->cp_seq_stat, s->dfd, s->g3d);
+	pr_info("%s CP_STAT=%#x SEQ_CP cfg=%#x status=%#x DFD=%#x G3D=%#x\n",
+		tag, s->cp_stat, s->cp_seq_cfg, s->cp_seq_stat, s->dfd, s->g3d);
 	pr_info("%s INFORM0..7=%#x %#x %#x %#x %#x %#x %#x %#x FLEXPMU_INFORM=%#x\n",
 		tag, s->inform[0], s->inform[1], s->inform[2], s->inform[3],
 		s->inform[4], s->inform[5], s->inform[6], s->inform[7],
@@ -387,10 +400,9 @@ static void e9810_snap_print(const char *tag, const struct e9810_snap *s)
 		s->pad_ret[4], s->pad_ret[5], s->idle_ip[0], s->idle_ip[1],
 		s->idle_ip[2], s->idle_ip[3], s->idle_ip_mask[0],
 		s->idle_ip_mask[1], s->idle_ip_mask[2], s->idle_ip_mask[3]);
-	pr_info("%s INTR_GEN en/pend grp0=%#x/%#x grp1=%#x/%#x grp2=%#x/%#x grp3=%#x/%#x grp4=%#x/%#x EVENT_INT_EN_GRP2=%#x\n",
+	pr_info("%s INTR_GEN en/pend grp1=%#x/%#x grp2=%#x/%#x grp4=%#x/%#x EVENT_INT_EN_GRP2=%#x\n",
 		tag, s->grp_en[0], s->grp_pend[0], s->grp_en[1], s->grp_pend[1],
-		s->grp_en[2], s->grp_pend[2], s->grp_en[3], s->grp_pend[3],
-		s->grp_en[4], s->grp_pend[4], s->event_grp2);
+		s->grp_en[2], s->grp_pend[2], s->event_grp2);
 	pr_info("%s EINT gpa0..4 mask=%#x %#x %#x %#x %#x pend=%#x %#x %#x %#x %#x\n",
 		tag, s->alive_mask[0], s->alive_mask[1], s->alive_mask[2],
 		s->alive_mask[3], s->alive_mask[4], s->alive_pend[0],
@@ -399,10 +411,9 @@ static void e9810_snap_print(const char *tag, const struct e9810_snap *s)
 	for (i = 0; i < GICD_NR_ISPENDR; i++)
 		if (s->gicd_pend[i])
 			pr_info("%s GICD_ISPENDR%u=%#x\n", tag, i, s->gicd_pend[i]);
-	pr_info("%s GICD_SPENDSGIR(cpu%u)=%#x %#x %#x %#x FRC=%llu G_TCON=%#x(start=%d) CNTPCT=%llu\n",
-		tag, raw_smp_processor_id(), s->sgi_pend[0], s->sgi_pend[1],
-		s->sgi_pend[2], s->sgi_pend[3], s->frc, s->g_tcon,
-		!!(s->g_tcon & MCT_G_TCON_START), s->cntpct);
+	pr_info("%s FRC=%llu G_TCON=%#x(start=%d) CNTPCT=%llu (read on cpu%u)\n",
+		tag, s->frc, s->g_tcon, !!(s->g_tcon & MCT_G_TCON_START),
+		s->cntpct, raw_smp_processor_id());
 	pr_info("%s flexpmu %s=%#x/%#x %s=%u/%u %s=%u/%u\n", tag,
 		fdbg_name[0], s->fdbg[0][0], s->fdbg[0][1],
 		fdbg_name[1], s->fdbg[1][0], s->fdbg[1][1],
@@ -439,7 +450,7 @@ static unsigned int e9810_snap_diff(const char *tag, const struct e9810_snap *a,
 	for (i = 0; i < E9810_NR_PHYCPUS; i++)
 		DIFF("INFORM", i, a->inform[i], b->inform[i]);
 	DIFF("EVENT_INT_EN_GRP2", 0, a->event_grp2, b->event_grp2);
-	DIFF("INTR_GEN GRP2 enable", 0, a->grp_en[2], b->grp_en[2]);
+	DIFF("INTR_GEN GRP2 enable", 0, a->grp_en[1], b->grp_en[1]); /* grp 2 */
 	DIFF("APM2AP bit24", 0, a->apm2ap & BIT(24), b->apm2ap & BIT(24));
 	for (i = 0; i < ALIVE_NR_BANKS; i++)
 		DIFF("EINT mask gpa", i, a->alive_mask[i], b->alive_mask[i]);
@@ -478,6 +489,83 @@ static void e9810_apm_print(const char *tag, unsigned int last)
 			shown, e->slot, e->time_ns, tagbuf, e->val, e->header);
 		shown++;
 	}
+}
+
+/* ------------------------------------------------------------------------ */
+/* Bounded cross-CPU calls                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Every request to another CPU, probe included, goes through
+ * e9810_xcall(): asynchronous, waited for at most S0_XCALL_TIMEOUT_MS. The
+ * request lives on the heap and is deliberately leaked on a timeout, so a
+ * CPU that runs it late still writes valid memory. A timeout also stops
+ * the watchdog petting for good: a CPU that the kernel counts online but
+ * that takes no IPIs is the c2diag-b hang, and other CPUs would otherwise
+ * keep the watchdog quiet. Process context only (sleeps).
+ */
+struct e9810_xcall {
+	call_single_data_t csd;
+	void (*fn)(struct e9810_xcall *x);
+	u64 val;			/* set by fn */
+	int ret;			/* set by fn */
+	u64 t_run;			/* ktime_get_ns() | 1, published last */
+};
+
+static void e9810_xcall_run(void *info)
+{
+	struct e9810_xcall *x = info;
+
+	x->fn(x);
+	/* Pairs with the acquire in e9810_xcall(). */
+	smp_store_release(&x->t_run, ktime_get_ns() | 1);
+}
+
+static int e9810_xcall(unsigned int cpu, void (*fn)(struct e9810_xcall *x),
+		       const char *what, u64 *val, int *ret, u64 *lat_ns)
+{
+	struct e9810_xcall *x = kzalloc(sizeof(*x), GFP_KERNEL);
+	u64 t0;
+	int err;
+
+	if (!x)
+		return -ENOMEM;
+	x->fn = fn;
+	INIT_CSD(&x->csd, e9810_xcall_run, x);
+	t0 = ktime_get_ns();
+	err = smp_call_function_single_async(cpu, &x->csd);
+	if (err) {
+		kfree(x);
+		return err;
+	}
+	/* Pairs with the release in e9810_xcall_run(). */
+	while (!smp_load_acquire(&x->t_run)) {
+		if (ktime_get_ns() - t0 > S0_XCALL_TIMEOUT_MS * NSEC_PER_MSEC) {
+			pr_emerg("cpu%u did not run the %s request within %u ms (request left to it)\n",
+				 cpu, what, S0_XCALL_TIMEOUT_MS);
+			s3c2410wdt_crownlte_stop_petting("suspend s0: a CPU does not answer cross-CPU calls");
+			return -ETIMEDOUT;
+		}
+		usleep_range(100, 200);
+	}
+	if (val)
+		*val = x->val;
+	if (ret)
+		*ret = x->ret;
+	if (lat_ns)
+		*lat_ns = x->t_run - t0;
+	kfree(x);
+	return 0;
+}
+
+static void e9810_xcall_nop(struct e9810_xcall *x)
+{
+}
+
+/* IPI round trip; -ETIMEDOUT: no answer (petting already stopped). */
+static int e9810_ping(unsigned int cpu, u64 *lat_ns)
+{
+	return e9810_xcall(cpu, e9810_xcall_nop, "IPI ping", NULL, NULL, lat_ns);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -580,14 +668,14 @@ static int e9810_cpu_dead(unsigned int cpu)
 	return 0;
 }
 
-static void e9810_reset_hooks_local(void *ret)
+static void e9810_reset_hooks_local(struct e9810_xcall *x)
 {
-	*(int *)ret = cal_cpu_enable(e9pm.phycpu[smp_processor_id()]);
+	x->ret = cal_cpu_enable(e9pm.phycpu[smp_processor_id()]);
 }
 
-static void e9810_read_mpidr(void *info)
+static void e9810_read_mpidr(struct e9810_xcall *x)
 {
-	*(u64 *)info = read_cpuid_mpidr();
+	x->val = read_cpuid_mpidr();
 }
 
 /* 4.9 linear_phycpu(): A55 MPIDRs carry the MT bit, Mongoose ones do not. */
@@ -623,8 +711,9 @@ static const char *e9810_init_topology(void)
 		 */
 		if (!cpu_online(cpu))
 			return "a CPU is offline at probe";
-		if (smp_call_function_single(cpu, e9810_read_mpidr, &live, 1))
-			return "MPIDR read IPI failed";
+		if (e9810_xcall(cpu, e9810_read_mpidr, "MPIDR read", &live,
+				NULL, NULL))
+			return "MPIDR read IPI failed or timed out";
 		if (e9810_linear_phycpu(live) != phy)
 			return "live MPIDR does not match DT reg";
 	}
@@ -656,9 +745,9 @@ static const char *e9810_setup_hooks(void)
 	for_each_online_cpu(cpu) {
 		int r = -EIO;
 
-		if (smp_call_function_single(cpu, e9810_reset_hooks_local, &r, 1) ||
-		    r)
-			return "hook reset (cal_cpu_enable) failed";
+		if (e9810_xcall(cpu, e9810_reset_hooks_local, "hook reset", NULL,
+				&r, NULL) || r)
+			return "hook reset (cal_cpu_enable) failed or timed out";
 	}
 
 	ret = cpuhp_setup_state_nocalls(CPUHP_AP_EXYNOS9810_CPU_POWER_STARTING,
@@ -721,7 +810,7 @@ static int e9810_pm_enter(suspend_state_t state)
 	unsigned long entry = __pa_symbol(cpu_resume);
 	unsigned int cpu = smp_processor_id();
 	struct crownlte_wdt_state w = { };
-	u32 pend0, sgi0;
+	u32 pend0;
 	int ret;
 
 	e9pm.cnt_enter++;
@@ -743,17 +832,16 @@ static int e9810_pm_enter(suspend_state_t state)
 
 	/*
 	 * 4.9 test_early_wakeup: a self-IPI (SGI1, call-function) pending at
-	 * CPU0 makes the firmware's WFI fall through. Its banked pending bits
-	 * are read back here.
+	 * CPU0 makes the firmware's WFI fall through. Its banked pending bit
+	 * (GICD_ISPENDR0 bit 1, any source) is read back here.
 	 */
 	arch_send_call_function_single_ipi(cpu);
 	pend0 = readl(e9pm.gicd + GICD_ISPENDR(0));
-	sgi0 = readl(e9pm.gicd + GICD_SPENDSGIR(0));
-	e9pm.ipi_pending = (pend0 & BIT(1)) || (sgi0 & 0xff00);
+	e9pm.ipi_pending = !!(pend0 & BIT(1));
 
-	pr_info("step 30 enter (S0 dry run, no SMC): fn=%#x state=%#x entry=%#lx cpu%u self-IPI pending=%d (ISPENDR0=%#x SPENDSGIR0=%#x) wdt=%us en=%d rst=%d cntpct=%llu frc=%llu\n",
+	pr_info("step 30 enter (S0 dry run, no SMC): fn=%#x state=%#x entry=%#lx cpu%u self-IPI pending=%d (ISPENDR0=%#x) wdt=%us en=%d rst=%d cntpct=%llu frc=%llu\n",
 		e9pm.psci_fn, e9pm.psci_state, entry, cpu, e9pm.ipi_pending, pend0,
-		sgi0, w.timeout, w.enabled, w.reset, e9pm.enter_cnt0,
+		w.timeout, w.enabled, w.reset, e9pm.enter_cnt0,
 		e9pm.enter_frc0);
 
 	ret = cpu_suspend(0, e9810_dry_finisher);
@@ -966,76 +1054,61 @@ static enum hrtimer_restart e9810_deadline_fn(struct hrtimer *t)
 	return HRTIMER_NORESTART;
 }
 
-static void e9810_deadline_start(void *info)
-{
-	struct hrtimer *t = info;
-
-	hrtimer_start(t, ms_to_ktime(e9pm.deadline_ms), HRTIMER_MODE_ABS_PINNED);
-}
-
 /*
- * Two copies, on CPU0 and on the last BIG CPU: a CPU wedged with
- * interrupts off cannot fire its own. A timer on a CPU that goes offline
- * migrates to an online one.
+ * The deadline lives in the watchdog's own ping path: after it, no CPU can
+ * reload the counter (s3c2410wdt_crownlte_set_deadline()), so a CPU wedged
+ * with interrupts off cannot be covered up by others that keep petting,
+ * wherever any timer sits. Installed at probe, before the first cross-CPU
+ * request; without an armed guarded watchdog the driver does not start.
+ * The hrtimer only adds the log line and an earlier stop when nobody pets.
  */
-static void e9810_deadline_arm(void)
+static int e9810_deadline_install(void)
 {
-	unsigned int i, cpus[2] = { 0, nr_cpu_ids - 1 };
+	int ret;
 
-	if (!e9pm.deadline_ms)
-		return;
-	for (i = 0; i < 2; i++) {
-		hrtimer_init(&e9pm.deadline[i], CLOCK_BOOTTIME,
-			     HRTIMER_MODE_ABS_PINNED);
-		e9pm.deadline[i].function = e9810_deadline_fn;
-		if (cpu_online(cpus[i]))
-			smp_call_function_single(cpus[i], e9810_deadline_start,
-						 &e9pm.deadline[i], 1);
-	}
-	pr_info("deadline armed: watchdog petting stops at %u ms boot time if still up\n",
-		e9pm.deadline_ms);
-}
-
-struct e9810_ping {
-	call_single_data_t csd;
-	u64 t_run;
-};
-
-static void e9810_ping_fn(void *info)
-{
-	struct e9810_ping *p = info;
-
-	/* Pairs with the acquire in e9810_ping(): t_run published last. */
-	smp_store_release(&p->t_run, ktime_get_ns() | 1);
-}
-
-/*
- * IPI round trip with a bounded wait. -ETIMEDOUT: no answer (the request
- * is leaked on purpose, the CPU may still run it later).
- */
-static int e9810_ping(unsigned int cpu, u64 *lat_ns)
-{
-	struct e9810_ping *p = kzalloc(sizeof(*p), GFP_KERNEL);
-	u64 t0;
-
-	if (!p)
-		return -ENOMEM;
-	INIT_CSD(&p->csd, e9810_ping_fn, p);
-	t0 = ktime_get_ns();
-	if (smp_call_function_single_async(cpu, &p->csd)) {
-		kfree(p);
-		return -EBUSY;
-	}
-	/* Pairs with the release in e9810_ping_fn(). */
-	while (!smp_load_acquire(&p->t_run)) {
-		if (ktime_get_ns() - t0 > S0_PING_TIMEOUT_MS * NSEC_PER_MSEC)
-			return -ETIMEDOUT;
-		usleep_range(100, 200);
-	}
-	if (lat_ns)
-		*lat_ns = p->t_run - t0;
-	kfree(p);
+	ret = s3c2410wdt_crownlte_set_deadline((u64)e9pm.deadline_ms *
+						NSEC_PER_MSEC);
+	if (ret)
+		return ret;
+	hrtimer_init(&e9pm.deadline, CLOCK_BOOTTIME, HRTIMER_MODE_ABS);
+	e9pm.deadline.function = e9810_deadline_fn;
+	hrtimer_start(&e9pm.deadline, ms_to_ktime(e9pm.deadline_ms),
+		      HRTIMER_MODE_ABS);
 	return 0;
+}
+
+/*
+ * Recovery armed: the guarded CL0 watchdog runs with the reset enabled, is
+ * still petted, carries this driver's deadline (or an earlier one) and
+ * (@live) its counter is seen moving. NULL if so, else why not.
+ */
+static const char *s0_recovery_refused(bool live, bool keep_armed)
+{
+	struct crownlte_wdt_state a, b;
+	unsigned int i;
+
+	if (!s3c2410wdt_crownlte_state(&a))
+		return "no guarded CL0 watchdog";
+	if (!a.enabled || !a.reset)
+		return "CL0 watchdog not running with the reset enabled";
+	if (a.pet_stopped)
+		return "CL0 watchdog petting already stopped";
+	if (!a.deadline_ns ||
+	    a.deadline_ns > (u64)e9pm.deadline_ms * NSEC_PER_MSEC)
+		return "watchdog deadline not installed";
+	if (keep_armed && !a.keep_armed_suspend)
+		return "CL0 watchdog without samsung,keep-armed-in-suspend";
+	if (!live)
+		return NULL;
+	for (i = 0; i < S0_WDT_LIVE_TRIES; i++) {
+		usleep_range(2000, 3000);
+		if (!s3c2410wdt_crownlte_state(&b) || !b.enabled || !b.reset ||
+		    b.pet_stopped)
+			return "CL0 watchdog stopped while being checked";
+		if (b.wtcnt != a.wtcnt)
+			return NULL;
+	}
+	return "CL0 watchdog counter not moving";
 }
 
 /* Number of online CPUs that did not answer; logs each one. */
@@ -1070,9 +1143,9 @@ static void e9810_log_core(const char *tag, unsigned int cpu)
 	u32 g2e = readl(e9pm.intr_gen + INTR_GEN_EN(2));
 	u32 g2p = readl(e9pm.intr_gen + INTR_GEN_PEND(2));
 
-	pr_emerg("%s cpu%u phy%u status=%#x config=%#x inform=%#x EVENT_INT_EN_GRP2=%#x grp1 en/pend=%d/%d grp2 en/pend=%d/%d APM2AP=%#x online=%d\n",
+	pr_emerg("%s cpu%u phy%u status=%#x inform=%#x EVENT_INT_EN_GRP2=%#x grp1 en/pend=%d/%d grp2 en/pend=%d/%d APM2AP=%#x online=%d\n",
 		 tag, cpu, phy, pmu_rd(pmu_cpu_status[phy]),
-		 pmu_rd(pmu_cpu_status[phy] - 4), pmu_rd(PMU_CPU_INFORM(phy)),
+		 pmu_rd(PMU_CPU_INFORM(phy)),
 		 pmu_rd(PMU_EVENT_INT_EN_GRP2), !!(g1e & bit), !!(g1p & bit),
 		 !!(g2e & bit), !!(g2p & bit),
 		 readl(e9pm.mbox + APM_MAILBOX_APM2AP), cpu_online(cpu));
@@ -1167,8 +1240,16 @@ static int s0b_down(const char *ph, unsigned int cpu, unsigned int n)
 {
 	struct e9810_hp *hp = per_cpu_ptr(&e9810_hp, cpu);
 	u32 down0 = hp->down, dead0 = hp->dead;
+	const char *why;
 	int ret = 0, err;
 
+	/* No core goes down unless the watchdog can still reset the SoC. */
+	why = s0_recovery_refused(false, false);
+	if (why) {
+		pr_err("S0b %s cpu%u off#%u not started: %s FAIL\n", ph, cpu, n,
+		       why);
+		return -ENOLINK;
+	}
 	err = e9810_hotplug_bounded(cpu, false, &ret);
 	if (err == -ETIMEDOUT) {
 		pr_emerg("S0b %s cpu%u off#%u remove_cpu() still blocked after %u ms (online=%d)\n",
@@ -1439,15 +1520,15 @@ static void s0b_run(void)
 /* S0c/S0d preconditions: nothing in device suspend may reach UFS/charger. */
 static const char *s0_suspend_refused(void)
 {
-	struct crownlte_wdt_state w;
 	struct device_node *np;
-	const char *why = NULL;
+	const char *why;
 
 	if (!e9pm.ops)
 		return "suspend ops not registered";
-	if (!s3c2410wdt_crownlte_state(&w) || !w.enabled || !w.reset ||
-	    !w.keep_armed_suspend || w.pet_stopped)
-		return "CL0 watchdog not armed with samsung,keep-armed-in-suspend";
+	/* Live, reset-enabled, petted, deadline, kept armed in suspend. */
+	why = s0_recovery_refused(true, true);
+	if (why)
+		return why;
 	for_each_compatible_node(np, NULL, "samsung,exynos9810-ufs") {
 		struct platform_device *pdev = of_find_device_by_node(np);
 
@@ -1669,13 +1750,20 @@ static int s0_thread(void *unused)
 
 	while ((now = boot_ms()) < e9pm.start_ms)
 		msleep(min_t(u64, e9pm.start_ms - now, 1000));
-	e9810_deadline_arm();
+	pr_info("deadline %u ms installed at probe in the watchdog ping path\n",
+		e9pm.deadline_ms);
 
 	s0a_run();
 
 	if (e9pm.want[1]) {
-		if (s0_time_ok(1, 40000))
+		const char *why = s0_recovery_refused(true, false);
+
+		if (why) {
+			s0_set(1, S0_SKIPPED, "refused: %s", why);
+			pr_err("S0b refused (no hotplug done): %s\n", why);
+		} else if (s0_time_ok(1, 40000)) {
 			s0b_run();
+		}
 		ok = e9pm.res[1] == S0_PASS;
 	}
 	if (e9pm.want[2]) {
@@ -1741,11 +1829,10 @@ static int e9810_pm_parse(struct device_node *np)
 	of_property_read_u32_array(np, "samsung,wakeup-mask-offsets",
 				   e9pm.wmask_off, n);
 	of_property_read_u32_array(np, "samsung,wakeup-masks", e9pm.wmask_val, n);
+	/* Only the four 4.9 wakeup-mask registers (4.9 DT reg-offset values). */
 	for (i = 0; i < n; i++)
-		if (e9pm.wmask_off[i] < 0x600 || e9pm.wmask_off[i] > 0x6fc ||
-		    e9pm.wmask_off[i] == PMU_EINT_WAKEUP_MASK ||
-		    e9pm.wmask_off[i] == PMU_WAKEUP_STAT ||
-		    e9pm.wmask_off[i] == PMU_WAKEUP_STAT2)
+		if (e9pm.wmask_off[i] != 0x610 && e9pm.wmask_off[i] != 0x614 &&
+		    e9pm.wmask_off[i] != 0x618 && e9pm.wmask_off[i] != 0x644)
 			return -EINVAL;
 	e9pm.sleep_with_cp_off = of_property_read_bool(np, "samsung,sleep-with-cp-off");
 
@@ -1779,7 +1866,10 @@ static int e9810_pm_parse(struct device_node *np)
 	e9pm.cluster_cycles = clamp_t(u32, e9pm.cluster_cycles, 0, 20);
 	e9pm.group_cycles = clamp_t(u32, e9pm.group_cycles, 0, 20);
 	e9pm.pm_test_delay = clamp_t(u32, e9pm.pm_test_delay, 1, 5);
-	if (e9pm.deadline_ms && e9pm.deadline_ms < e9pm.end_by_ms + 10000)
+	/* Mandatory: no S0 run without a watchdog deadline. */
+	if (!e9pm.deadline_ms)
+		return -EINVAL;
+	if (e9pm.deadline_ms < e9pm.end_by_ms + 10000)
 		e9pm.deadline_ms = e9pm.end_by_ms + 10000;
 	return 0;
 }
@@ -1849,6 +1939,15 @@ static int e9810_pm_probe(struct platform_device *pdev)
 	/* Before any write of this driver. */
 	e9810_snap(&e9pm.boot);
 	e9pm.boot_valid = true;
+
+	/* Before the first cross-CPU request: recovery bounds everything after. */
+	ret = e9810_deadline_install();
+	if (ret)
+		return e9810_probe_fail(pdev, ret,
+					"no armed, petted CL0 watchdog to carry the %u ms deadline",
+					e9pm.deadline_ms);
+	pr_info("probe: watchdog deadline %u ms installed before any cross-CPU request\n",
+		e9pm.deadline_ms);
 
 	cpus_read_lock();
 	why = e9810_init_topology();
