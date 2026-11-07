@@ -107,6 +107,8 @@
 #define PMU_IDLE_IP(n)			(0x03e0 + 4 * (n))
 #define PMU_IDLE_IP_MASK(n)		(0x03f0 + 4 * (n))
 #define PMU_NR_IDLE_IP			4
+/* 4.9 SYS_SLEEP idle_ip_mask: init_idle_ip(), no fix-idle-ip on crownlte */
+#define E9810_IDLE_IP_MASK_SLEEP	0xffffffff
 #define PMU_RESET_SEQUENCER_CFG		0x0500	/* bit 0: DFD EDPCSR dump */
 #define PMU_WAKEUP_STAT			0x0600
 #define PMU_EINT_WAKEUP_MASK		0x060c
@@ -259,7 +261,7 @@ static struct e9810_pm {
 	/* suspend path state */
 	bool sys_entered;		/* syscore suspend ran cal_pm_enter_unarmed */
 	bool early;			/* .enter came back without a power cycle */
-	u32 saved_wmask[E9810_MAX_WMASK], saved_idle_ip_mask[PMU_NR_IDLE_IP];
+	bool masks_owned;		/* sleep masks written: baseline is ours */
 	u32 cnt_begin, cnt_prepare_late, cnt_enter, cnt_wake, cnt_end;
 	u32 cnt_sys_suspend, cnt_sys_resume, cnt_sys_refused;
 	int last_resume_ret;
@@ -422,12 +424,14 @@ static void e9810_snap_print(const char *tag, const struct e9810_snap *s)
 
 /*
  * Kernel-owned configuration that every stage must leave as it found it:
- * the PMU masks this driver writes, the CPU_INFORM slots and GRP2 enables
- * the CAL core/cluster/system sequences write, the cluster flag in the APM
- * mailbox and the EINT masks. Each difference is printed; returns their
- * number. Not compared: INTR_GEN GRP1 enables and the other mailbox bits
- * (the APM firmware writes those) and PAD_RETENTION (cal_pm_exit() writes
- * the 4.9 release value; printed by step 50 instead).
+ * the CPU_INFORM slots and GRP2 enables the CAL core/cluster/system
+ * sequences write, the cluster flag in the APM mailbox and the EINT masks.
+ * The PMU masks this driver writes are compared with its software-owned
+ * baseline (e9810_write_sleep_masks()) once it has written them, before
+ * that with @a. Each difference is printed (expected -> found); returns
+ * their number. Not compared: INTR_GEN GRP1 enables and the other mailbox
+ * bits (the APM firmware writes those) and PAD_RETENTION (cal_pm_exit()
+ * writes the 4.9 release value; printed by step 50 instead).
  */
 static unsigned int e9810_snap_diff(const char *tag, const struct e9810_snap *a,
 				    const struct e9810_snap *b)
@@ -444,9 +448,14 @@ static unsigned int e9810_snap_diff(const char *tag, const struct e9810_snap *a,
 
 	DIFF("0x60c", 0, a->eint_wmask, b->eint_wmask);
 	for (i = 0; i < e9pm.nr_wmask; i++)
-		DIFF("wakeup mask", i, a->wmask[i], b->wmask[i]);
+		DIFF("wakeup mask", i,
+		     e9pm.masks_owned ? e9pm.wmask_val[i] : a->wmask[i],
+		     b->wmask[i]);
 	for (i = 0; i < PMU_NR_IDLE_IP; i++)
-		DIFF("IDLE_IP_MASK", i, a->idle_ip_mask[i], b->idle_ip_mask[i]);
+		DIFF("IDLE_IP_MASK", i,
+		     e9pm.masks_owned ? E9810_IDLE_IP_MASK_SLEEP :
+					a->idle_ip_mask[i],
+		     b->idle_ip_mask[i]);
 	for (i = 0; i < E9810_NR_PHYCPUS; i++)
 		DIFF("INFORM", i, a->inform[i], b->inform[i]);
 	DIFF("EVENT_INT_EN_GRP2", 0, a->event_grp2, b->event_grp2);
@@ -883,13 +892,35 @@ static const struct platform_suspend_ops e9810_pm_ops = {
 };
 
 /*
+ * The wakeup masks and IDLE_IP_MASK are written only with values this
+ * driver owns, never with a value read back from the hardware: the 4.9
+ * SYS_SLEEP values, DT samsung,wakeup-masks and all-ones IDLE_IP_MASK
+ * (exynos-powermode.c exynos_prepare_sys_powerdown(), init_idle_ip()).
+ * 4.9 leaves them in place after resume and after a failed entry; so does
+ * this driver, which writes the same values again on resume and on the
+ * undo path in case a CAL sequence moved them. From the first write on,
+ * these values are the baseline the after-suspend register check expects.
+ */
+static void e9810_write_sleep_masks(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < e9pm.nr_wmask; i++)
+		regmap_write(e9pm.pmu, e9pm.wmask_off[i], e9pm.wmask_val[i]);
+	for (i = 0; i < PMU_NR_IDLE_IP; i++)
+		regmap_write(e9pm.pmu, PMU_IDLE_IP_MASK(i),
+			     E9810_IDLE_IP_MASK_SLEEP);
+	e9pm.masks_owned = true;
+}
+
+/*
  * First syscore suspend callback to run (registered last), as 4.9's: all
  * other CPUs are offline and interrupts are off on CPU0.
  */
 static int e9810_pm_syscore_suspend(void)
 {
 	u32 cp = pmu_rd(PMU_CP_STAT), g3d, en, ev, inform0;
-	unsigned int i, phy0 = e9pm.phycpu[smp_processor_id()];
+	unsigned int phy0 = e9pm.phycpu[smp_processor_id()];
 	int ret;
 
 	e9pm.cnt_sys_suspend++;
@@ -912,15 +943,8 @@ static int e9810_pm_syscore_suspend(void)
 		return -EBUSY;
 	}
 
-	for (i = 0; i < e9pm.nr_wmask; i++) {
-		e9pm.saved_wmask[i] = pmu_rd(e9pm.wmask_off[i]);
-		regmap_write(e9pm.pmu, e9pm.wmask_off[i], e9pm.wmask_val[i]);
-	}
-	/* 4.9 exynos_set_idle_ip_mask(SYS_SLEEP): no idle-IP node, all masked */
-	for (i = 0; i < PMU_NR_IDLE_IP; i++) {
-		e9pm.saved_idle_ip_mask[i] = pmu_rd(PMU_IDLE_IP_MASK(i));
-		regmap_write(e9pm.pmu, PMU_IDLE_IP_MASK(i), 0xffffffff);
-	}
+	/* 4.9 exynos_set_idle_ip_mask() + exynos_set_wakeupmask(SYS_SLEEP) */
+	e9810_write_sleep_masks();
 
 	e9pm.enter_skipped = 0;
 	ret = cal_pm_enter_unarmed(e9pm.sleep_mode, &e9pm.enter_skipped);
@@ -935,11 +959,8 @@ static int e9810_pm_syscore_suspend(void)
 		/* -EINVAL/-ENOENT: refused before the hint/save, nothing to undo */
 		if (ret != -EINVAL && ret != -ENOENT)
 			cal_pm_earlywakeup(e9pm.sleep_mode);
-		for (i = 0; i < e9pm.nr_wmask; i++)
-			regmap_write(e9pm.pmu, e9pm.wmask_off[i], e9pm.saved_wmask[i]);
-		for (i = 0; i < PMU_NR_IDLE_IP; i++)
-			regmap_write(e9pm.pmu, PMU_IDLE_IP_MASK(i),
-				     e9pm.saved_idle_ip_mask[i]);
+		/* The software-owned baseline, as 4.9 (no read-back restore). */
+		e9810_write_sleep_masks();
 		cal_cpu_enable(phy0);
 		e9pm.cnt_sys_refused++;
 		return ret ? ret : -EIO;
@@ -983,10 +1004,8 @@ static void e9810_pm_syscore_resume(void)
 	else
 		ret = cal_pm_exit(e9pm.sleep_mode);
 
-	for (i = 0; i < e9pm.nr_wmask; i++)
-		regmap_write(e9pm.pmu, e9pm.wmask_off[i], e9pm.saved_wmask[i]);
-	for (i = 0; i < PMU_NR_IDLE_IP; i++)
-		regmap_write(e9pm.pmu, PMU_IDLE_IP_MASK(i), e9pm.saved_idle_ip_mask[i]);
+	/* The software-owned baseline, as 4.9 (no read-back restore). */
+	e9810_write_sleep_masks();
 	/* 4.9 CPU-online reset of CPU0's slot: INFORM 0, GRP2 off and clear */
 	ret2 = cal_cpu_enable(phy0);
 	s3c2410wdt_crownlte_ping();
@@ -1936,18 +1955,32 @@ static int e9810_pm_probe(struct platform_device *pdev)
 	/* Optional: without it the APM ring is just not printed. */
 	e9pm.apm = devm_kzalloc(&pdev->dev, sizeof(*e9pm.apm), GFP_KERNEL);
 
-	/* Before any write of this driver. */
-	e9810_snap(&e9pm.boot);
-	e9pm.boot_valid = true;
-
-	/* Before the first cross-CPU request: recovery bounds everything after. */
+	/*
+	 * Before this driver's first access to a PMU, INTR_GEN, GPIO_ALIVE,
+	 * GIC, MCT, FlexPMU or mailbox register, and before the first
+	 * cross-CPU request: if a diagnostic read stalls CPU0 instead of
+	 * aborting, the other CPUs stop reloading the counter at the deadline
+	 * whatever they do. Up to here only the DT, the CAL init flag and the
+	 * syscon/ioremap lookups were used; the watchdog accesses below are
+	 * its own CL0 registers.
+	 */
 	ret = e9810_deadline_install();
 	if (ret)
 		return e9810_probe_fail(pdev, ret,
 					"no armed, petted CL0 watchdog to carry the %u ms deadline",
 					e9pm.deadline_ms);
-	pr_info("probe: watchdog deadline %u ms installed before any cross-CPU request\n",
+	/* Verified: running, reset enabled, petted, our deadline, WTCNT moving. */
+	why = s0_recovery_refused(true, false);
+	if (why)
+		return e9810_probe_fail(pdev, -EIO,
+					"watchdog deadline %u ms not verified: %s",
+					e9pm.deadline_ms, why);
+	pr_info("probe: watchdog deadline %u ms installed and verified before any diagnostic register read or cross-CPU request\n",
 		e9pm.deadline_ms);
+
+	/* Before any write of this driver. */
+	e9810_snap(&e9pm.boot);
+	e9pm.boot_valid = true;
 
 	cpus_read_lock();
 	why = e9810_init_topology();
