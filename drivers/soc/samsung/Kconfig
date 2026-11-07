@@ -167,8 +167,9 @@ config EXYNOS9810_AUDIO_A1
 	  ("audio selftest A1:") that only reads the pd-aud and ABOX CPU
 	  status in the PMU, the codec/amp GPIOs, S2MPS18 LDO33/LDO34 over
 	  the read-only ACPM path and the MAX98512 revision and enable
-	  registers over HSI2C18; ABOX, SYSREG_AUD, SysMMU and pinctrl_aud
-	  only while pd-aud reads on, behind a CL0 watchdog deadline. No
+	  registers over HSI2C18, on a CPU other than CPU0. Nothing inside
+	  pd-aud is read. The CL0 watchdog deadline is armed at probe; the
+	  amp bus (DT samsung,audio-a1-guard) only comes up after that. No
 	  SPI traffic, no amp or codec driver. Idle unless the node has
 	  samsung,audio-a1-selftest-ms. See Documentation/crownlte/audio-a1.md.
 
