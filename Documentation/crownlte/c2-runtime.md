@@ -18,6 +18,7 @@ section 7; the record format is in section 6.
 | ea54a6b81 | watchdog: one crownlte final-stop state for suspend and C2 |
 | b57b23022 | cpuidle: fail-closed v2 record, armed session, hotplug-safe detector, consumed drills, per-CPU boot arming |
 | f3ee75781 | DT: trial tokens (S1a, drill b), comments |
+| fbcc1d167 | watchdog: the restart notifier reloads exactly once (the timeout without a reload, then the final stop) |
 
 ## 1. What it does
 
@@ -144,16 +145,16 @@ section 7; the record format is in section 6.
 
 ## 2. Artifacts (gekko `/mnt/ssd/host-builds/kernel-upgrade`)
 
-Fix round 1, `crownlte-c2-runtime` f3ee75781. Config `panel-bright-work/ko-c2-f3ee/config`
+Fix round 1, `crownlte-c2-runtime` fbcc1d167. Config `panel-bright-work/ko-c2-fbcc/config`
 = int6 config (c7b917d1) + `crownlte_c2.fragment`, `olddefconfig`, unchanged from round 0
 (668b03c4; the fragment change is a comment). It adds only `HARDLOCKUP_DETECTOR`,
 `_BUDDY`, `_COUNTS_HRTIMER`, `BOOTPARAM_HARDLOCKUP_PANIC`, `LOCKUP_DETECTOR` and
 `SOFTLOCKUP_DETECTOR`. Banner: `Linux version 6.12.93-crownlte-diag+`. W=1 clean for
 `s3c2410_wdt.o` and `cpuidle-exynos9810.o`.
 
-| File (`panel-bright-work/ko-c2-f3ee/`) | sha256 |
+| File (`panel-bright-work/ko-c2-fbcc/`) | sha256 |
 |---|---|
-| `arch/arm64/boot/Image` | 7e3c03cddcbf63c26aed0c89187243440cd61b6dc88a412985be3cc89033a5aa |
+| `arch/arm64/boot/Image` | 17544cf3e22adbe8a46202278438ce054f15d7cf848dcd82fcfb41ddfe0a5d92 |
 | `.../exynos9810-crownlte-romram-v23a-int6-c2.dtb` (S1a ROM-RAM) | 2bc3c73c15d535202a8c794f18373b5419ffc0ce31947d248834f578ebb29d17 |
 | `.../exynos9810-crownlte-romram-v23a-int6.dtb` (int6 minus Wi-Fi self-test, unchanged) | c30c8d048dc10eb2ad841e6748b7063be9dc3a8ccbdb8c29428f0fbe8f4c24ee |
 | `.../exynos9810-crownlte-delayed-ufs-c2-drill-lost-diag.dtb` (drill a, unchanged: comments only) | 6488152a30e86eccaf392ae7749bd691ce87e05ef96da2413202860c41ec53c2 |
@@ -165,8 +166,8 @@ PROVENANCE.txt:
 
 | Pack | recovery.img sha256 | Inputs |
 |---|---|---|
-| `c2-drill-lost-r1-20261107` (delayed-UFS, drill a) | 8ce86bf4cbc25d15273af67a606f26bdf8baf2126a54551c5ac8ea409880f163 | `pack-acpm-q-paths.py`, Image 7e3c03cd, DTB 6488152a, ramdisk 506232b1, loader b670c92c. The manifest `purpose`/`kernel_source` are packer defaults; see PROVENANCE.txt |
-| `rom-ram/pack-romram-int6-c2-r1` (ROM-RAM S1a) | c89ced6bec67a25d125e7581ee7443f9b9254a9b52b403de97325387051b131f | `rom-ram/pack-rom-ram.py`, KO `panel-bright-work/ko-c2-f3ee`, DTB 2bc3c73c, ramdisk build-30 e615cc8d, loader d06fca05 |
+| `c2-drill-lost-r1-20261107` (delayed-UFS, drill a) | aea3534a475e8b034f04dae35d64f3122bfb391a0b506879593a93cd32423583 | `pack-acpm-q-paths.py`, Image 17544cf3, DTB 6488152a, ramdisk 506232b1, loader 32df794d. The manifest `purpose`/`kernel_source` are packer defaults; see PROVENANCE.txt |
+| `rom-ram/pack-romram-int6-c2-r1` (ROM-RAM S1a) | f655965cd76d6f91496b96d3daef76565faf9caac7a44c6740a75d62035f606a | `rom-ram/pack-rom-ram.py`, KO `panel-bright-work/ko-c2-fbcc`, DTB 2bc3c73c, ramdisk build-30 e615cc8d, loader 1b9c5014 |
 
 The round-0 packs (`c2-drill-lost-20261107` 57715ff5, `rom-ram/pack-romram-int6-c2`
 611cbbb0) were deleted on gekko; copies are on the PC. Do not run them: they fail open
