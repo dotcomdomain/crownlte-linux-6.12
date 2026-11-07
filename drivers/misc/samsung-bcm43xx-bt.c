@@ -10,18 +10,25 @@
  *  - BT_REG_ON is pin 7 (port 0 bit 7) of the PCAL6524 at 0x22 on
  *    hsi2c@10930000. That expander also drives NFC VEN, the wireless charging
  *    enable and the DP switch, so no GPIO driver is bound to it: this driver
- *    reads/writes exactly two of its registers (output port 0, configuration
- *    port 0) and only ever changes bit 7, read-modify-write, with readback;
- *  - BT_WAKE (gpg2-0) is held high whenever the chip is powered (no LPM yet:
- *    the vendor libbt never drives BT_WAKE itself);
+ *    writes exactly two of its registers (output port 0, configuration
+ *    port 0) and only ever changes bit 7, read-modify-write, with readback.
+ *    Before and after every write it re-reads every non-volatile register
+ *    and compares it with the probe baseline; any failed read or difference
+ *    latches the expander "unsafe" and nothing is ever written again;
+ *  - BT_REG_ON power state OFF / ON / ON (bootloader) / UNKNOWN. The
+ *    bootloader leaves P0_7 an output driven high; probe records that as
+ *    "ON (bootloader)" and writes nothing. The first rfkill block or
+ *    unblock (or the self-test) drives it low, as 4.9 did at probe;
+ *  - BT_WAKE (gpg2-0) is held high whenever this driver has powered the
+ *    chip or may have (no LPM yet: the vendor libbt never drives BT_WAKE);
  *  - BT_HOST_WAKE (gpa2-3) is requested as a both-edge interrupt that only
  *    counts edges while powered. It is not a wakeup source in B1.
  *
  * An optional one-shot self-test ("bt selftest:"), armed only by the DT
  * property samsung,bt-selftest, checks the expander bus, the UART and the
- * rfkill index and, unless samsung,bt-selftest-no-power is set, powers the
- * chip, sends HCI Reset / Read Local Version / Read BD_ADDR over ttySAC1 at
- * 115200 8N1 with RTS/CTS and powers it off again.
+ * rfkill index and, unless samsung,bt-selftest-no-power is set, power-cycles
+ * the chip, sends HCI Reset / Read Local Version / Read BD_ADDR over ttySAC1
+ * at 115200 8N1 with RTS/CTS and powers it off again.
  */
 
 #include <linux/bitops.h>
@@ -41,9 +48,11 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/rfkill.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/sysfs.h>
 #include <linux/timekeeping.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
@@ -54,7 +63,9 @@
 /* PCAL6524 registers (4.9 include/linux/i2c/pcal6524.h + NXP datasheet) */
 #define PCAL_IN0		0x00
 #define PCAL_OUT0		0x04
+#define PCAL_POL0		0x08
 #define PCAL_CFG0		0x0c	/* 1 = input */
+#define PCAL_OUT_CFG		0x5c	/* bit n: port n open-drain */
 #define BT_EXP_BIT		BIT(7)	/* P0_7 = BT_REG_ON, the only pin we touch */
 
 struct pcal_dump_group {
@@ -69,6 +80,7 @@ struct pcal_dump_group {
  * Every readable PCAL6524 register (interrupt clear 0x68-0x6a is write-only
  * and skipped). Reads have no side effects except that reading the input
  * ports clears a pending expander interrupt, which nothing uses on 6.12.
+ * All of them answered on hardware (B1-read, 2026-11-07).
  */
 static const struct pcal_dump_group pcal_groups[] = {
 	{ "in",		0x00, 3, true,  false },
@@ -98,10 +110,7 @@ struct pcal_dump {
 	u8 v[PCAL_DUMP_BYTES];
 };
 
-/* read-only diagnostic addresses (Exynos9810, 4.9 DT) */
-#define SYSREG_PERIC1_BASE	0x10811000
-#define SYSREG_USI10_SW_CONF	0x3c	/* USI10 slot ("i2c" in 4.9) */
-#define SYSREG_USI10I2C_SW_CONF	0x40	/* USI10_I2C slot (disabled in 4.9) */
+/* read-only diagnostic addresses (Exynos9810, 4.9 DT; 4.9 reads them too) */
 #define GPG3_BASE		0x108300c0	/* PERIC1 gpg3: CON, DAT, PUD */
 #define EXP_RESET_PIN		6		/* gpg3-6, expander RESET#, active low */
 
@@ -116,9 +125,29 @@ struct pcal_dump {
 #define UART_UBRDIV		0x28
 #define UART_UFRACVAL		0x2c
 
-#define BT_POWER_ON_DELAY_MS	100	/* 4.9 bcm43xx.c */
+#define BT_POWER_ON_DELAY_MS	100	/* 4.9 bcm43xx.c, after BT_REG_ON high */
+/*
+ * BT_REG_ON low time of a power cycle from "ON (bootloader)". 4.9 never
+ * cycled quickly: it drove the pin low at probe and the HAL raised it
+ * seconds later. 500 ms is five times the 4.9 power-on delay.
+ */
+#define BT_POWER_CYCLE_OFF_MS	500
 #define HOST_WAKE_STORM		10000	/* edges per power session */
 #define ST_RX_SIZE		64
+
+enum bt_pwr {
+	BT_PWR_OFF,		/* P0_7 driven low, or an input (not driven) */
+	BT_PWR_ON,		/* powered by this driver */
+	BT_PWR_ON_BOOT,		/* P0_7 driven high by the bootloader (probe) */
+	BT_PWR_UNKNOWN,		/* a P0_7 write may have taken effect */
+};
+
+static const char * const bt_pwr_names[] = {
+	[BT_PWR_OFF]		= "OFF",
+	[BT_PWR_ON]		= "ON",
+	[BT_PWR_ON_BOOT]	= "ON (bootloader)",
+	[BT_PWR_UNKNOWN]	= "UNKNOWN",
+};
 
 struct bcm43xx_bt {
 	struct device *dev;
@@ -130,9 +159,12 @@ struct bcm43xx_bt {
 	struct i2c_client *exp;		/* PCAL6524, no driver bound */
 	struct device_node *uart_np;
 
-	bool powered;
-	bool exp_tainted;		/* unexpected expander state: no more power-on */
+	enum bt_pwr pwr;
+	bool exp_unsafe;		/* latched: never write the expander again */
+	unsigned int write_errors;	/* I2C write transfer errors this boot */
 	struct pcal_dump baseline;	/* at probe */
+	u8 exp_out0, exp_cfg0;		/* expected output/config port 0 */
+	bool quiescing;			/* suspend/shutdown: no new transitions */
 
 	spinlock_t irq_lock;
 	bool irq_on;
@@ -143,6 +175,7 @@ struct bcm43xx_bt {
 	struct delayed_work st_work;
 	u32 st_ms;
 	bool st_no_power;
+	bool st_verbose;		/* self-test running: print every dump */
 	spinlock_t rx_lock;
 	wait_queue_head_t rx_wait;
 	bool rx_active;
@@ -153,7 +186,7 @@ struct bcm43xx_bt {
 };
 
 /* ---------------------------------------------------------------------- */
-/* PCAL6524: dump all registers, pin-7-only read-modify-write               */
+/* PCAL6524: dump all registers, validate, pin-7-only read-modify-write     */
 
 static int pcal_read(struct bcm43xx_bt *bt, u8 reg, u8 *val)
 {
@@ -178,7 +211,7 @@ static int pcal_dump_read(struct bcm43xx_bt *bt, struct pcal_dump *d)
 				continue;
 			ret = pcal_read(bt, pcal_groups[g].reg + i, &d->v[k]);
 			if (ret && pcal_groups[g].ext) {
-				/* never needed for P0_7: report, do not fail */
+				/* checked by the caller against the baseline */
 				d->ext_missing = true;
 				continue;
 			}
@@ -230,7 +263,7 @@ static void pcal_dump_print(struct bcm43xx_bt *bt, const char *tag,
 	}
 }
 
-/* offset of register @reg inside a dump */
+/* offset of register @reg inside a dump (all callers pass dumped registers) */
 static int pcal_dump_index(u8 reg)
 {
 	unsigned int g, k = 0;
@@ -241,38 +274,54 @@ static int pcal_dump_index(u8 reg)
 			return k + reg - pcal_groups[g].reg;
 		k += pcal_groups[g].n;
 	}
-	return -1;
+	return 0;
+}
+
+static u8 pcal_dump_reg(const struct pcal_dump *d, u8 reg)
+{
+	return d->v[pcal_dump_index(reg)];
+}
+
+/* latch: from now on nothing writes the expander (until reboot) */
+static void pcal_set_unsafe(struct bcm43xx_bt *bt, const char *why, int err)
+{
+	if (!bt->exp_unsafe)
+		dev_err(bt->dev, "expander UNSAFE (%s, %d): no further expander writes, BT_REG_ON state %s\n",
+			why, err, bt_pwr_names[bt->pwr]);
+	bt->exp_unsafe = true;
 }
 
 /*
- * Compare a dump with the probe baseline. Volatile registers are skipped and
- * bit 7 of output/config port 0 may differ (our pin). Returns the number of
- * differing bytes and prints each one.
+ * Compare a dump with what the expander must hold: the probe baseline for
+ * every non-volatile register, the tracked expected value for output and
+ * configuration port 0 (bit 7 ignored when @mask_bit7, i.e. after a write
+ * that may or may not have taken effect). Prints each difference.
  */
 static int pcal_dump_compare(struct bcm43xx_bt *bt, const char *tag,
-			     const struct pcal_dump *d)
+			     const struct pcal_dump *d, bool mask_bit7)
 {
 	int out0 = pcal_dump_index(PCAL_OUT0), cfg0 = pcal_dump_index(PCAL_CFG0);
 	unsigned int g, i, k = 0;
 	int diffs = 0;
 
-	if (!bt->baseline.valid || !d->valid)
-		return -ENODATA;
 	for (g = 0; g < ARRAY_SIZE(pcal_groups); g++) {
 		for (i = 0; i < pcal_groups[g].n; i++, k++) {
-			u8 mask = 0xff;
+			u8 ref = bt->baseline.v[k], mask = 0xff;
 
 			if (pcal_groups[g].volatile_reg)
 				continue;
-			if (pcal_groups[g].ext &&
-			    (d->ext_missing || bt->baseline.ext_missing))
+			if (pcal_groups[g].ext && bt->baseline.ext_missing)
 				continue;
-			if (k == out0 || k == cfg0)
+			if (k == out0)
+				ref = bt->exp_out0;
+			if (k == cfg0)
+				ref = bt->exp_cfg0;
+			if ((k == out0 || k == cfg0) && mask_bit7)
 				mask = (u8)~BT_EXP_BIT;
-			if ((d->v[k] ^ bt->baseline.v[k]) & mask) {
-				dev_err(bt->dev, "%s exp CHANGED %s[%u] probe=%02x now=%02x\n",
-					tag, pcal_groups[g].name, i,
-					bt->baseline.v[k], d->v[k]);
+			if ((d->v[k] ^ ref) & mask) {
+				dev_err(bt->dev, "%s exp CHANGED %s[%u] expected=%02x now=%02x%s\n",
+					tag, pcal_groups[g].name, i, ref, d->v[k],
+					mask != 0xff ? " (bit 7 ignored)" : "");
 				diffs++;
 			}
 		}
@@ -280,91 +329,166 @@ static int pcal_dump_compare(struct bcm43xx_bt *bt, const char *tag,
 	return diffs;
 }
 
-/* BT_REG_ON state from output/config/input port 0 */
-static void pcal_pin_state(u8 out0, u8 cfg0, u8 in0, int *driven_high,
-			   int *level)
-{
-	*driven_high = !(cfg0 & BT_EXP_BIT) && (out0 & BT_EXP_BIT);
-	*level = !!(in0 & BT_EXP_BIT);
-}
-
 /*
- * Read output and configuration port 0 and check that every bit except
- * bit 7 still equals the probe baseline. Anything else (bus error, expander
- * reset, another writer) taints the expander: nothing more is written.
+ * Mandatory check before and after every expander write: no driver bound,
+ * every register readable (extension registers too if they answered at
+ * probe), every non-volatile register as expected, and P0_7, if it is an
+ * output, at the level it is driven to. Any failure latches the expander
+ * unsafe. @tag: print the dump (self-test); failures always print it.
  */
-static int pcal_check_port0(struct bcm43xx_bt *bt, u8 *out0, u8 *cfg0)
+static int pcal_validate(struct bcm43xx_bt *bt, const char *tag,
+			 struct pcal_dump *d, bool mask_bit7)
 {
-	const struct pcal_dump *b = &bt->baseline;
-	u8 bo = b->v[pcal_dump_index(PCAL_OUT0)], bc = b->v[pcal_dump_index(PCAL_CFG0)];
-	int ret;
+	const char *t = tag ?: "expander check:";
+	u8 out0, cfg0, in0;
+	int ret, diffs;
 
-	if (!b->valid) {
-		dev_err(bt->dev, "expander: no valid probe baseline, not touching it\n");
+	memset(d, 0, sizeof(*d));
+	if (bt->exp_unsafe) {
+		dev_err(bt->dev, "%s expander is latched unsafe, not touching it\n", t);
+		return -EIO;
+	}
+	if (!bt->baseline.valid) {
+		pcal_set_unsafe(bt, "no valid probe baseline", -ENODATA);
 		return -EIO;
 	}
 	if (bt->exp->dev.driver) {
-		dev_err(bt->dev, "expander: bound to driver %s, not touching it\n",
+		dev_err(bt->dev, "%s expander bound to driver %s\n", t,
 			bt->exp->dev.driver->name);
+		pcal_set_unsafe(bt, "driver bound", -EBUSY);
 		return -EBUSY;
 	}
-	ret = pcal_read(bt, PCAL_OUT0, out0);
-	if (!ret)
-		ret = pcal_read(bt, PCAL_CFG0, cfg0);
+	ret = pcal_dump_read(bt, d);
+	if (tag || ret)
+		pcal_dump_print(bt, t, d);
 	if (ret) {
-		dev_err(bt->dev, "expander: port 0 read failed: %d\n", ret);
+		pcal_set_unsafe(bt, "register read failed", ret);
 		return ret;
 	}
-	if ((*out0 ^ bo) & ~BT_EXP_BIT || (*cfg0 ^ bc) & ~BT_EXP_BIT) {
-		dev_err(bt->dev, "expander: port 0 changed outside P0_7 (out %02x->%02x cfg %02x->%02x), not touching it\n",
-			bo, *out0, bc, *cfg0);
-		bt->exp_tainted = true;
+	if (d->ext_missing && !bt->baseline.ext_missing) {
+		pcal_set_unsafe(bt, "extension registers stopped answering", -EIO);
+		return -EIO;
+	}
+	diffs = pcal_dump_compare(bt, t, d, mask_bit7);
+	out0 = pcal_dump_reg(d, PCAL_OUT0);
+	cfg0 = pcal_dump_reg(d, PCAL_CFG0);
+	in0 = pcal_dump_reg(d, PCAL_IN0);
+	if (!(cfg0 & BT_EXP_BIT) && ((in0 ^ out0) & BT_EXP_BIT)) {
+		dev_err(bt->dev, "%s P0_7 driven %d but reads %d\n", t,
+			!!(out0 & BT_EXP_BIT), !!(in0 & BT_EXP_BIT));
+		diffs++;
+	}
+	if (diffs) {
+		if (!tag)
+			pcal_dump_print(bt, t, d);
+		pcal_set_unsafe(bt, "registers differ from the baseline", -EIO);
 		return -EIO;
 	}
 	return 0;
 }
 
-/* write @reg = @val, which differs from the current value only in bit 7 */
-static int pcal_write_bit7(struct bcm43xx_bt *bt, u8 reg, u8 old, u8 val)
+/*
+ * Write @reg = @val, which differs from @old only in bit 7, and read it
+ * back. A readback that fails or differs latches unsafe. A failed write
+ * transfer returns the I2C error with *@xfer set; the caller decides (it
+ * re-validates read-only).
+ */
+static int pcal_write_bit7(struct bcm43xx_bt *bt, u8 reg, u8 old, u8 val,
+			   bool *xfer)
 {
 	u8 rb;
 	int ret;
 
-	if ((old ^ val) & ~BT_EXP_BIT)
-		return -EINVAL;	/* never: callers only flip bit 7 */
+	*xfer = false;
+	if ((old ^ val) & ~BT_EXP_BIT) {
+		pcal_set_unsafe(bt, "internal: write would change more than bit 7", -EINVAL);
+		return -EINVAL;
+	}
 	if (old == val)
 		return 0;
 	ret = i2c_smbus_write_byte_data(bt->exp, reg, val);
-	if (!ret)
-		ret = pcal_read(bt, reg, &rb);
-	if (!ret && rb != val)
-		ret = -EIO;
 	if (ret) {
-		dev_err(bt->dev, "expander: reg 0x%02x %02x->%02x failed: %d\n",
+		dev_err(bt->dev, "expander: write reg 0x%02x %02x->%02x failed: %d\n",
 			reg, old, val, ret);
-		bt->exp_tainted = true;
+		*xfer = true;
+		return ret;
 	}
-	return ret;
+	ret = pcal_read(bt, reg, &rb);
+	if (ret) {
+		pcal_set_unsafe(bt, "readback failed", ret);
+		return ret;
+	}
+	if (rb != val) {
+		dev_err(bt->dev, "expander: reg 0x%02x wrote %02x, reads %02x\n",
+			reg, val, rb);
+		pcal_set_unsafe(bt, "readback differs", -EIO);
+		return -EIO;
+	}
+	return 0;
 }
 
-/* BT_REG_ON high: output bit first, then direction (4.9 pcal6524 order) */
+/*
+ * Drive BT_REG_ON. Validate first (no write at all if that fails), record
+ * UNKNOWN (and raise BT_WAKE: power may be asserted) before the first
+ * write, write output port 0 then (power on) configuration port 0, as the
+ * 4.9 pcal6524 driver did, then validate again. Only a validated result
+ * sets OFF/ON. No rollback writes: a failure leaves UNKNOWN.
+ * bt->lock held.
+ */
 static int bt_reg_on_set(struct bcm43xx_bt *bt, bool on)
 {
-	u8 out0, cfg0;
+	const char *pre = NULL, *post = NULL;
+	struct pcal_dump d;
+	u8 out0, cfg0, want_out, want_cfg;
+	bool xfer = false;
 	int ret;
 
-	ret = pcal_check_port0(bt, &out0, &cfg0);
+	if (bt->st_verbose) {
+		pre = on ? "bt selftest: before power on" : "bt selftest: before power off";
+		post = on ? "bt selftest: after power on" : "bt selftest: after power off";
+	}
+	ret = pcal_validate(bt, pre, &d, bt->pwr == BT_PWR_UNKNOWN);
 	if (ret)
 		return ret;
-	if (on) {
-		ret = pcal_write_bit7(bt, PCAL_OUT0, out0, out0 | BT_EXP_BIT);
+	out0 = pcal_dump_reg(&d, PCAL_OUT0);
+	cfg0 = pcal_dump_reg(&d, PCAL_CFG0);
+	want_out = on ? out0 | BT_EXP_BIT : out0 & ~BT_EXP_BIT;
+	want_cfg = on ? cfg0 & ~BT_EXP_BIT : cfg0;	/* off: stays an output (4.9) */
+
+	if (want_out != out0 || want_cfg != cfg0) {
+		bt->pwr = BT_PWR_UNKNOWN;
+		gpiod_set_value_cansleep(bt->bt_wake, 1);
+		ret = pcal_write_bit7(bt, PCAL_OUT0, out0, want_out, &xfer);
 		if (!ret)
-			ret = pcal_write_bit7(bt, PCAL_CFG0, cfg0, cfg0 & ~BT_EXP_BIT);
-	} else {
-		/* stays an output, driven low (4.9: gpio_set_value(bt_en, 0)) */
-		ret = pcal_write_bit7(bt, PCAL_OUT0, out0, out0 & ~BT_EXP_BIT);
+			ret = pcal_write_bit7(bt, PCAL_CFG0, cfg0, want_cfg, &xfer);
+		if (ret) {
+			/*
+			 * A failed transfer may or may not have reached the
+			 * chip: check everything else read-only (bit 7
+			 * ignored). One transfer error per boot is tolerated
+			 * so that a validated power-off can recover; a second
+			 * one, or a failed check, latches unsafe.
+			 */
+			if (xfer && ++bt->write_errors > 1)
+				pcal_set_unsafe(bt, "second write transfer error", ret);
+			if (xfer && !bt->exp_unsafe)
+				pcal_validate(bt, "after failed write", &d, true);
+			return ret;
+		}
+		/* both readbacks matched: now check everything, bit 7 included */
+		bt->exp_out0 = want_out;
+		bt->exp_cfg0 = want_cfg;
+		ret = pcal_validate(bt, post, &d, false);
+		if (ret)
+			return ret;
+	} else if (!(cfg0 & BT_EXP_BIT) && pre) {
+		/* nothing to write: the check above is the readback */
+		dev_info(bt->dev, "bt selftest: P0_7 already %s\n", on ? "high" : "low");
 	}
-	return ret;
+	bt->exp_out0 = want_out;
+	bt->exp_cfg0 = want_cfg;
+	bt->pwr = on ? BT_PWR_ON : BT_PWR_OFF;
+	return 0;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -413,54 +537,80 @@ static void bt_host_wake_irq_disable(struct bcm43xx_bt *bt)
 			bt->host_wake_edges);
 }
 
-/* bt->lock held */
+/*
+ * Power off from ON, ON (bootloader) or UNKNOWN (the recovery path): a
+ * validated pin-7-only write. Refused once the expander is latched unsafe;
+ * then BT_WAKE stays as it is. bt->lock held.
+ */
+static int bt_power_off(struct bcm43xx_bt *bt)
+{
+	enum bt_pwr from = bt->pwr;
+	int ret;
+
+	if (from == BT_PWR_OFF)
+		return 0;
+	/* edge counting runs only in ON; it stays off if this fails */
+	if (from == BT_PWR_ON)
+		bt_host_wake_irq_disable(bt);
+	ret = bt_reg_on_set(bt, false);
+	if (ret) {
+		dev_err(bt->dev, "power off from %s failed: %d, BT_REG_ON state %s%s, BT_WAKE=%d\n",
+			bt_pwr_names[from], ret, bt_pwr_names[bt->pwr],
+			bt->exp_unsafe ? ", expander unsafe" : "",
+			gpiod_get_value_cansleep(bt->bt_wake));
+		/* still ON if nothing was written: count edges again */
+		if (bt->pwr == BT_PWR_ON)
+			bt_host_wake_irq_enable(bt);
+		return ret;
+	}
+	gpiod_set_value_cansleep(bt->bt_wake, 0);
+	if (from == BT_PWR_ON)
+		dev_info(bt->dev, "power off (BT_REG_ON=0, BT_WAKE=0), host_wake_edges=%u\n",
+			 bt->host_wake_edges);
+	else
+		dev_info(bt->dev, "power off from %s (BT_REG_ON=0, BT_WAKE=0)\n",
+			 bt_pwr_names[from]);
+	return 0;
+}
+
+/*
+ * Power on. From ON (bootloader) this is a power cycle (validated off,
+ * BT_POWER_CYCLE_OFF_MS, validated on). From UNKNOWN it is refused: block
+ * (power off) first. bt->lock held.
+ */
 static int bt_power_on(struct bcm43xx_bt *bt)
 {
 	int ret;
 
-	if (bt->powered)
+	switch (bt->pwr) {
+	case BT_PWR_ON:
 		return 0;
-	if (bt->exp_tainted) {
-		dev_err(bt->dev, "power on refused: expander state unexpected (see above)\n");
+	case BT_PWR_UNKNOWN:
+		dev_err(bt->dev, "power on refused: BT_REG_ON state UNKNOWN, block (power off) first\n");
 		return -EIO;
+	case BT_PWR_ON_BOOT:
+		ret = bt_power_off(bt);
+		if (ret)
+			return ret;
+		msleep(BT_POWER_CYCLE_OFF_MS);
+		break;
+	case BT_PWR_OFF:
+		break;
 	}
-	gpiod_set_value_cansleep(bt->bt_wake, 1);
+	gpiod_set_value_cansleep(bt->bt_wake, 1);	/* 4.9: BT_WAKE before BT_REG_ON */
 	ret = bt_reg_on_set(bt, true);
 	if (ret) {
-		/* undo only what is ours: P0_7 low (if still allowed), BT_WAKE low */
-		if (!bt->exp_tainted)
-			bt_reg_on_set(bt, false);
-		gpiod_set_value_cansleep(bt->bt_wake, 0);
-		dev_err(bt->dev, "power on failed: %d\n", ret);
+		if (bt->pwr == BT_PWR_OFF)	/* nothing was written */
+			gpiod_set_value_cansleep(bt->bt_wake, 0);
+		dev_err(bt->dev, "power on failed: %d, BT_REG_ON state %s%s, BT_WAKE=%d\n",
+			ret, bt_pwr_names[bt->pwr],
+			bt->exp_unsafe ? ", expander unsafe" : "",
+			gpiod_get_value_cansleep(bt->bt_wake));
 		return ret;
 	}
 	msleep(BT_POWER_ON_DELAY_MS);
 	bt_host_wake_irq_enable(bt);
-	bt->powered = true;
 	dev_info(bt->dev, "power on (BT_WAKE=1, BT_REG_ON=1)\n");
-	return 0;
-}
-
-/* bt->lock held */
-static int bt_power_off(struct bcm43xx_bt *bt)
-{
-	int ret;
-
-	if (!bt->powered)
-		return 0;
-	bt_host_wake_irq_disable(bt);
-	/* power-off is a pin-7-only write and is allowed even when tainted
-	 * by a later check, as long as port 0 still matches the baseline */
-	ret = bt_reg_on_set(bt, false);
-	if (ret) {
-		dev_err(bt->dev, "power off failed: %d (BT_REG_ON state unknown)\n", ret);
-		bt_host_wake_irq_enable(bt);
-		return ret;
-	}
-	gpiod_set_value_cansleep(bt->bt_wake, 0);
-	bt->powered = false;
-	dev_info(bt->dev, "power off (BT_REG_ON=0, BT_WAKE=0), host_wake_edges=%u\n",
-		 bt->host_wake_edges);
 	return 0;
 }
 
@@ -470,7 +620,13 @@ static int bt_rfkill_set_block(void *data, bool blocked)
 	int ret;
 
 	mutex_lock(&bt->lock);
-	ret = blocked ? bt_power_off(bt) : bt_power_on(bt);
+	if (READ_ONCE(bt->quiescing)) {
+		dev_warn(bt->dev, "rfkill %s rejected: suspend/shutdown in progress\n",
+			 blocked ? "block" : "unblock");
+		ret = -EBUSY;
+	} else {
+		ret = blocked ? bt_power_off(bt) : bt_power_on(bt);
+	}
 	mutex_unlock(&bt->lock);
 	return ret;
 }
@@ -485,22 +641,6 @@ static const struct rfkill_ops bt_rfkill_ops = {
 #define st_info(bt, fmt, ...) dev_info((bt)->dev, "bt selftest: " fmt, ##__VA_ARGS__)
 #define st_err(bt, fmt, ...) dev_err((bt)->dev, "bt selftest: " fmt, ##__VA_ARGS__)
 
-static void st_dump(struct bcm43xx_bt *bt, const char *when, int *diffs)
-{
-	struct pcal_dump d;
-	char tag[48];
-	int n;
-
-	snprintf(tag, sizeof(tag), "bt selftest: %s", when);
-	pcal_dump_read(bt, &d);
-	pcal_dump_print(bt, tag, &d);
-	n = pcal_dump_compare(bt, tag, &d);
-	if (n > 0)
-		*diffs += n;
-	else if (n < 0)
-		*diffs += 1000;
-}
-
 static u32 st_readl(phys_addr_t pa)
 {
 	void __iomem *va = ioremap(pa & ~(phys_addr_t)0xfff, 0x1000);
@@ -513,38 +653,39 @@ static u32 st_readl(phys_addr_t pa)
 	return v;
 }
 
-static int st_bus(struct bcm43xx_bt *bt, int *diffs)
+static int st_bus(struct bcm43xx_bt *bt)
 {
-	u32 con, dat, pud, sw10, sw10i2c;
-	int reset_fn, reset_level, drv, lvl;
+	u32 con, dat, pud;
+	int reset_fn, reset_level, ret;
+	struct pcal_dump d;
 	u8 o, c, in;
 
-	sw10 = st_readl(SYSREG_PERIC1_BASE + SYSREG_USI10_SW_CONF);
-	sw10i2c = st_readl(SYSREG_PERIC1_BASE + SYSREG_USI10I2C_SW_CONF);
+	/* GPIO bank reads only (4.9 reads gpg3 through its pinctrl driver) */
 	con = st_readl(GPG3_BASE);
 	dat = st_readl(GPG3_BASE + 4);
 	pud = st_readl(GPG3_BASE + 8);
 	reset_fn = (con >> (EXP_RESET_PIN * 4)) & 0xf;
 	reset_level = (dat >> EXP_RESET_PIN) & 1;
-	st_info(bt, "bus sysreg_peric1 usi10=0x%08x usi10_i2c=0x%08x exp_reset gpg3-6 fn=%d level=%d pud=%d (gpg3 con=%08x dat=%02x)\n",
-		sw10, sw10i2c, reset_fn, reset_level,
-		(pud >> (EXP_RESET_PIN * 4)) & 0xf, con, dat & 0xff);
-	st_info(bt, "bus expander %s addr 0x%02x driver=%s probe_baseline=%s tainted=%d\n",
+	st_info(bt, "bus exp_reset gpg3-6 fn=%d level=%d pud=%d (gpg3 con=%08x dat=%02x)\n",
+		reset_fn, reset_level, (pud >> (EXP_RESET_PIN * 4)) & 0xf, con,
+		dat & 0xff);
+	st_info(bt, "bus expander %s addr 0x%02x driver=%s probe_baseline=%s unsafe=%d\n",
 		dev_name(&bt->exp->dev), bt->exp->addr,
 		bt->exp->dev.driver ? bt->exp->dev.driver->name : "none",
-		bt->baseline.valid ? "ok" : "MISSING", bt->exp_tainted);
+		bt->baseline.valid ? "ok" : "MISSING", bt->exp_unsafe);
 	pcal_dump_print(bt, "bt selftest: probe", &bt->baseline);
-	st_dump(bt, "now", diffs);
+	ret = pcal_validate(bt, "bt selftest: now", &d,
+			    bt->pwr == BT_PWR_UNKNOWN);
 	if (!reset_level)
 		st_err(bt, "bus expander reset line gpg3-6 reads LOW (expander held in reset?)\n");
-	if (!bt->baseline.valid || bt->exp_tainted || bt->exp->dev.driver || *diffs)
-		return -EIO;
-	o = bt->baseline.v[pcal_dump_index(PCAL_OUT0)];
-	c = bt->baseline.v[pcal_dump_index(PCAL_CFG0)];
-	in = bt->baseline.v[pcal_dump_index(PCAL_IN0)];
-	pcal_pin_state(o, c, in, &drv, &lvl);
-	st_info(bt, "bus P0_7 (BT_REG_ON) at probe: %s, out=%d, level=%d\n",
-		(c & BT_EXP_BIT) ? "input" : "output", !!(o & BT_EXP_BIT), lvl);
+	if (ret)
+		return ret;
+	o = pcal_dump_reg(&d, PCAL_OUT0);
+	c = pcal_dump_reg(&d, PCAL_CFG0);
+	in = pcal_dump_reg(&d, PCAL_IN0);
+	st_info(bt, "bus P0_7 (BT_REG_ON) now: %s, out=%d, level=%d, state %s\n",
+		(c & BT_EXP_BIT) ? "input" : "output", !!(o & BT_EXP_BIT),
+		!!(in & BT_EXP_BIT), bt_pwr_names[bt->pwr]);
 	return 0;
 }
 
@@ -559,6 +700,30 @@ static int st_baud_err(unsigned long rate, unsigned int baud)
 	return (int)(((long)actual - (long)baud) * 10000 / (long)baud);
 }
 
+/*
+ * The ttySAC1 class device. On 6.12 its parent is the serial_base port
+ * device (10840000.serial:0.0, child of 10840000.serial:0), not the
+ * platform device, so look it up by dev_t and check that the platform
+ * device is one of its ancestors.
+ */
+static struct device *st_find_tty(struct device *uart_dev, bool *foreign)
+{
+	struct device *tty_dev, *p;
+	dev_t devt;
+
+	*foreign = false;
+	if (tty_dev_name_to_number("ttySAC1", &devt))
+		return NULL;
+	tty_dev = class_find_device_by_devt(&tty_class, devt);
+	if (!tty_dev)
+		return NULL;
+	for (p = tty_dev->parent; p; p = p->parent)
+		if (p == uart_dev)
+			return tty_dev;
+	*foreign = true;
+	return tty_dev;
+}
+
 static int st_uart(struct bcm43xx_bt *bt)
 {
 	struct platform_device *pdev;
@@ -567,6 +732,7 @@ static int st_uart(struct bcm43xx_bt *bt)
 	struct clk *pclk = NULL, *bclk = NULL;
 	void __iomem *usi = NULL, *uart = NULL;
 	unsigned long rate = 0;
+	bool foreign = false;
 	int e1, e2, ret = 0;
 
 	pdev = of_find_device_by_node(bt->uart_np);
@@ -575,11 +741,13 @@ static int st_uart(struct bcm43xx_bt *bt)
 		return -ENODEV;
 	}
 	if (pdev->dev.driver)
-		tty_dev = device_find_child_by_name(&pdev->dev, "ttySAC1");
-	st_info(bt, "uart %s driver=%s tty=%s\n", dev_name(&pdev->dev),
+		tty_dev = st_find_tty(&pdev->dev, &foreign);
+	st_info(bt, "uart %s driver=%s tty=%s%s (parent %s)\n", dev_name(&pdev->dev),
 		pdev->dev.driver ? pdev->dev.driver->name : "none",
-		tty_dev ? dev_name(tty_dev) : "MISSING");
-	if (!tty_dev)
+		tty_dev ? dev_name(tty_dev) : "MISSING",
+		foreign ? " NOT-THIS-UART" : "",
+		tty_dev && tty_dev->parent ? dev_name(tty_dev->parent) : "-");
+	if (!tty_dev || foreign)
 		ret = -ENODEV;
 	put_device(tty_dev);
 
@@ -601,6 +769,12 @@ static int st_uart(struct bcm43xx_bt *bt)
 	usi = of_iomap(usi_np, 0);
 	of_node_put(usi_np);
 	uart = of_iomap(bt->uart_np, 0);
+	/*
+	 * USI_CON/USI_OPTION of the UART_BT wrapper (0x108400c4/c8): 4.9 only
+	 * writes them, but B1-read on hardware (2026-11-07, pack 218efc06)
+	 * read con=00000000 option=00000003 here and in exynos-usi without an
+	 * abort, with the UART clocks enabled as here.
+	 */
 	if (usi)
 		st_info(bt, "uart usi con=%08x option=%08x\n",
 			readl(usi + USI_CON), readl(usi + USI_OPTION));
@@ -700,6 +874,7 @@ static size_t st_receive_buf(struct tty_port *port, const u8 *cp,
 	return count;
 }
 
+/* does not use client_data: harmless if it races with the restore */
 static void st_write_wakeup(struct tty_port *port)
 {
 	struct tty_struct *tty = tty_port_tty_get(port);
@@ -737,10 +912,18 @@ static unsigned int st_rx_len(struct bcm43xx_bt *bt)
 	return n;
 }
 
+static void st_rx_set_active(struct bcm43xx_bt *bt, bool on)
+{
+	spin_lock_irq(&bt->rx_lock);
+	bt->rx_active = on;
+	spin_unlock_irq(&bt->rx_lock);
+}
+
 /*
  * Send an HCI command and wait for its Command Complete event
  * (04 0e <len> <ncmd> <opcode lo> <opcode hi> <status> ...). On success
  * copies the return parameters after the status byte into @ret_par.
+ * Returns -ESHUTDOWN as soon as suspend/shutdown starts quiescing.
  */
 static int st_hci_cmd(struct bcm43xx_bt *bt, struct tty_struct *tty,
 		      u16 opcode, u8 *ret_par, unsigned int npar,
@@ -753,14 +936,19 @@ static int st_hci_cmd(struct bcm43xx_bt *bt, struct tty_struct *tty,
 	char hex[3 * 24 + 1];
 	int ret, i, n = 0;
 
+	if (READ_ONCE(bt->quiescing))
+		return -ESHUTDOWN;
 	st_rx_reset(bt);
 	ret = tty->ops->write(tty, cmd, sizeof(cmd));
 	if (ret != sizeof(cmd)) {
 		st_err(bt, "hci 0x%04x: write returned %d\n", opcode, ret);
 		return ret < 0 ? ret : -EIO;
 	}
-	wait_event_timeout(bt->rx_wait, st_rx_len(bt) >= want, HZ);
+	wait_event_timeout(bt->rx_wait, st_rx_len(bt) >= want ||
+			   READ_ONCE(bt->quiescing), HZ);
 	*elapsed_ms = jiffies_to_msecs(jiffies - t0);
+	if (READ_ONCE(bt->quiescing))
+		return -ESHUTDOWN;
 
 	spin_lock_irqsave(&bt->rx_lock, flags);
 	have = bt->rx_len;
@@ -792,6 +980,31 @@ static int st_hci_cmd(struct bcm43xx_bt *bt, struct tty_struct *tty,
 	return 0;
 }
 
+/*
+ * Give the port back. Order: stop accepting data, flush TX, close the port
+ * (the UART stops receiving), drop queued flip buffers, wait for a running
+ * flip-buffer worker (the only caller of client_ops->receive_buf; this is
+ * tty_buffer_flush_work(), private to drivers/tty), restore the default
+ * client ops while the kopen still keeps userspace out, then tty_kclose()
+ * last. tty unlocked on entry.
+ */
+static void st_tty_release(struct bcm43xx_bt *bt, struct tty_struct *tty)
+{
+	struct tty_port *port = tty->port;
+
+	st_rx_set_active(bt, false);
+	tty_driver_flush_buffer(tty);	/* nothing stuck behind CTS on close */
+	tty_lock(tty);
+	if (tty->ops->close)
+		tty->ops->close(tty, NULL);
+	tty_ldisc_flush(tty);
+	tty_unlock(tty);
+	flush_work(&port->buf.work);
+	port->client_ops = &tty_port_default_client_ops;
+	port->client_data = NULL;
+	tty_kclose(tty);	/* frees tty */
+}
+
 static struct tty_struct *st_tty_open(struct bcm43xx_bt *bt)
 {
 	struct ktermios kt;
@@ -808,21 +1021,16 @@ static struct tty_struct *st_tty_open(struct bcm43xx_bt *bt)
 		return tty;
 	/* tty_kopen_exclusive() returns with the tty locked */
 	port = tty->port;
-	bt->rx_active = false;
+	st_rx_set_active(bt, false);
 	port->client_data = bt;
 	port->client_ops = &st_client_ops;
 	ret = tty->ops->open ? tty->ops->open(tty, NULL) : -ENODEV;
+	tty_unlock(tty);
 	if (ret) {
-		if (tty->ops->close)
-			tty->ops->close(tty, NULL);
-		tty_unlock(tty);
-		tty_kclose(tty);	/* frees tty */
-		port->client_ops = &tty_port_default_client_ops;
-		port->client_data = NULL;
+		st_tty_release(bt, tty);
 		return ERR_PTR(ret);
 	}
 	clear_bit(TTY_HUPPED, &tty->flags);
-	tty_unlock(tty);
 
 	/* serdev-ttyport: raw 8N1, RTS/CTS, ignore carrier; 115200 as libbt */
 	kt = tty->termios;
@@ -837,29 +1045,8 @@ static struct tty_struct *st_tty_open(struct bcm43xx_bt *bt)
 	st_info(bt, "tty ttySAC1 open: %u baud, crtscts=%d\n",
 		tty_termios_baud_rate(&tty->termios),
 		!!(tty->termios.c_cflag & CRTSCTS));
-	spin_lock_irq(&bt->rx_lock);
-	bt->rx_active = true;
-	spin_unlock_irq(&bt->rx_lock);
+	st_rx_set_active(bt, true);
 	return tty;
-}
-
-static void st_tty_close(struct bcm43xx_bt *bt, struct tty_struct *tty)
-{
-	struct tty_port *port = tty->port;
-
-	spin_lock_irq(&bt->rx_lock);
-	bt->rx_active = false;
-	spin_unlock_irq(&bt->rx_lock);
-	/* drop anything stuck behind CTS so close does not wait closing_wait */
-	tty_driver_flush_buffer(tty);
-	tty_lock(tty);
-	if (tty->ops->close)
-		tty->ops->close(tty, NULL);
-	tty_ldisc_flush(tty);
-	tty_unlock(tty);
-	tty_kclose(tty);
-	port->client_ops = &tty_port_default_client_ops;
-	port->client_data = NULL;
 }
 
 static int st_hci(struct bcm43xx_bt *bt, struct tty_struct *tty)
@@ -870,7 +1057,7 @@ static int st_hci(struct bcm43xx_bt *bt, struct tty_struct *tty)
 
 	for (try = 1; try <= 3; try++) {
 		ret = st_hci_cmd(bt, tty, 0x0c03, NULL, 0, &ms);
-		if (!ret)
+		if (!ret || ret == -ESHUTDOWN)
 			break;
 		msleep(100);
 	}
@@ -883,6 +1070,8 @@ static int st_hci(struct bcm43xx_bt *bt, struct tty_struct *tty)
 	if (ret)
 		return ret;
 	ret = st_hci_cmd(bt, tty, 0x1009, addr, sizeof(addr), &ms);
+	if (ret == -ESHUTDOWN)
+		return ret;
 	st_info(bt, "local version hci=0x%02x rev=0x%04x lmp=0x%02x lmp_subver=0x%04x manuf=0x%04x bdaddr_oui=%s%02x:%02x:%02x\n",
 		ver[0], ver[1] | ver[2] << 8, ver[3], ver[6] | ver[7] << 8,
 		ver[4] | ver[5] << 8, ret ? "(read failed) " : "",
@@ -894,6 +1083,19 @@ static int st_hci(struct bcm43xx_bt *bt, struct tty_struct *tty)
 	return 0;
 }
 
+static void st_result(struct bcm43xx_bt *bt, const char *stage,
+		      const char *pass)
+{
+	if (stage && !strcmp(stage, "quiesce"))
+		st_info(bt, "RESULT ABORT suspend/shutdown, state %s%s\n",
+			bt_pwr_names[bt->pwr], bt->exp_unsafe ? ", expander unsafe" : "");
+	else if (stage)
+		st_err(bt, "RESULT FAIL stage=%s, state %s%s\n", stage,
+		       bt_pwr_names[bt->pwr], bt->exp_unsafe ? ", expander unsafe" : "");
+	else
+		st_info(bt, "RESULT %s, state %s\n", pass, bt_pwr_names[bt->pwr]);
+}
+
 static void bt_selftest_work(struct work_struct *work)
 {
 	struct bcm43xx_bt *bt = container_of(to_delayed_work(work),
@@ -901,18 +1103,22 @@ static void bt_selftest_work(struct work_struct *work)
 	struct tty_struct *tty;
 	const char *stage = NULL;
 	bool baud3m_bad = false;
-	int diffs = 0, ret, ret2;
+	int ret, ret2;
 
 	st_info(bt, "start at %lld ms, mode %s\n",
 		ktime_to_ms(ktime_get_boottime()),
 		bt->st_no_power ? "no-power" : "full");
 
 	mutex_lock(&bt->lock);
-	if (bt->powered || !rfkill_soft_blocked(bt->rfkill)) {
+	if (READ_ONCE(bt->quiescing)) {
+		st_result(bt, "quiesce", NULL);
+		goto out_unlock;
+	}
+	if (bt->pwr == BT_PWR_ON || !rfkill_soft_blocked(bt->rfkill)) {
 		st_info(bt, "RESULT SKIP userspace owns BT (rfkill unblocked)\n");
 		goto out_unlock;
 	}
-	if (st_bus(bt, &diffs))
+	if (st_bus(bt))
 		stage = "bus";
 	ret = st_uart(bt);
 	if (ret < 0 && !stage)
@@ -920,13 +1126,12 @@ static void bt_selftest_work(struct work_struct *work)
 	baud3m_bad = ret > 0;
 	if (st_rfkill(bt) && !stage)
 		stage = "rfkill";
+	if (!stage && bt->pwr == BT_PWR_UNKNOWN)
+		stage = "power";
 	if (stage || bt->st_no_power) {
 		if (!stage && baud3m_bad)
 			stage = "uart-3m";
-		if (stage)
-			st_err(bt, "RESULT FAIL stage=%s\n", stage);
-		else
-			st_info(bt, "RESULT PASS-NOPOWER\n");
+		st_result(bt, stage, "PASS-NOPOWER");
 		goto out_unlock;
 	}
 
@@ -940,45 +1145,113 @@ static void bt_selftest_work(struct work_struct *work)
 		goto out_unlock;
 	}
 
-	st_dump(bt, "before power on", &diffs);
-	ret = bt_power_on(bt);
-	st_dump(bt, "after power on", &diffs);
-	if (ret) {
+	bt->st_verbose = true;
+	if (READ_ONCE(bt->quiescing)) {
+		stage = "quiesce";
+	} else if (bt_power_on(bt)) {
 		stage = "power";
 	} else {
 		u8 in0 = 0;
 
-		pcal_read(bt, PCAL_IN0, &in0);
-		st_info(bt, "power on (bt_wake=%d reg_on_level=%d)\n",
+		ret = pcal_read(bt, PCAL_IN0, &in0);
+		st_info(bt, "power on (bt_wake=%d reg_on_level=%d%s)\n",
 			gpiod_get_value_cansleep(bt->bt_wake),
-			!!(in0 & BT_EXP_BIT));
-		if (diffs)
-			stage = "power";
-		else if (st_hci(bt, tty))
+			!!(in0 & BT_EXP_BIT), ret ? " read failed" : "");
+		ret = st_hci(bt, tty);
+		if (ret == -ESHUTDOWN)
+			stage = "quiesce";
+		else if (ret)
 			stage = "hci";
 	}
 
+	/* cleanup: always back to OFF (validated; refused if unsafe) */
 	ret2 = bt_power_off(bt);
-	st_dump(bt, "after power off", &diffs);
-	st_tty_close(bt, tty);
+	bt->st_verbose = false;
+	st_tty_release(bt, tty);
 	st_info(bt, "power off%s, host_wake_edges=%u, bt_wake=%d, tty closed, rfkill soft_blocked=%d\n",
 		ret2 ? " FAILED" : "", bt->host_wake_edges,
 		gpiod_get_value_cansleep(bt->bt_wake),
 		rfkill_soft_blocked(bt->rfkill));
-	if (!stage && (ret2 || diffs))
+	if (!stage && ret2)
 		stage = "power";
 	if (!stage && baud3m_bad)
 		stage = "uart-3m";	/* HCI fine at 115200, 3 Mbaud is not */
-	if (stage)
-		st_err(bt, "RESULT FAIL stage=%s\n", stage);
-	else
-		st_info(bt, "RESULT PASS\n");
+	st_result(bt, stage, "PASS");
 out_unlock:
 	mutex_unlock(&bt->lock);
 }
 
 /* ---------------------------------------------------------------------- */
-/* probe                                                                    */
+/* suspend / shutdown                                                       */
+
+/*
+ * Stop the self-test (cancel it if pending, else make it abort at its next
+ * check and join it) and wait out an rfkill transition in flight; later
+ * transitions see quiescing and are rejected. The self-test's own cleanup
+ * power-off still runs (validated) before it returns.
+ */
+static void bt_quiesce(struct bcm43xx_bt *bt, const char *why)
+{
+	WRITE_ONCE(bt->quiescing, true);
+	wake_up(&bt->rx_wait);
+	if (cancel_delayed_work_sync(&bt->st_work))
+		dev_info(bt->dev, "bt selftest: cancelled before it ran (%s)\n", why);
+	mutex_lock(&bt->lock);
+	dev_dbg(bt->dev, "quiesced for %s, BT_REG_ON state %s\n", why,
+		bt_pwr_names[bt->pwr]);
+	mutex_unlock(&bt->lock);
+}
+
+static int bcm43xx_bt_prepare(struct device *dev)
+{
+	bt_quiesce(dev_get_drvdata(dev), "suspend");
+	return 0;
+}
+
+static void bcm43xx_bt_complete(struct device *dev)
+{
+	struct bcm43xx_bt *bt = dev_get_drvdata(dev);
+
+	mutex_lock(&bt->lock);
+	WRITE_ONCE(bt->quiescing, false);
+	mutex_unlock(&bt->lock);
+}
+
+static const struct dev_pm_ops bcm43xx_bt_pm_ops = {
+	.prepare = bcm43xx_bt_prepare,
+	.complete = bcm43xx_bt_complete,
+};
+
+static void bcm43xx_bt_shutdown(struct platform_device *pdev)
+{
+	struct bcm43xx_bt *bt = platform_get_drvdata(pdev);
+
+	if (bt)
+		bt_quiesce(bt, "shutdown");
+}
+
+/* ---------------------------------------------------------------------- */
+/* sysfs, probe                                                             */
+
+static ssize_t bt_reg_on_state_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct bcm43xx_bt *bt = dev_get_drvdata(dev);
+	ssize_t n;
+
+	mutex_lock(&bt->lock);
+	n = sysfs_emit(buf, "%s%s\n", bt_pwr_names[bt->pwr],
+		       bt->exp_unsafe ? " unsafe" : "");
+	mutex_unlock(&bt->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(bt_reg_on_state);
+
+static struct attribute *bcm43xx_bt_attrs[] = {
+	&dev_attr_bt_reg_on_state.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(bcm43xx_bt);
 
 static void bt_put_i2c_client(void *data)
 {
@@ -990,13 +1263,69 @@ static void bt_put_node(void *data)
 	of_node_put(data);
 }
 
+/*
+ * Read-only expander baseline and the BT_REG_ON state found at probe.
+ * Nothing is written (unlike 4.9, which had just reset and reprogrammed
+ * the whole expander and then drove BT_REG_ON low). If the expander is not
+ * in a sane state the BT_REG_ON state stays UNKNOWN and, latched unsafe,
+ * is never written (BT_WAKE stays low: this driver never asserted power).
+ * bt->lock held.
+ */
+static void bt_probe_expander(struct bcm43xx_bt *bt)
+{
+	struct device *dev = bt->dev;
+	u8 o, c, in, pol, ocfg;
+
+	bt->pwr = BT_PWR_UNKNOWN;
+	if (bt->exp->dev.driver) {
+		dev_err(dev, "expander %s is bound to driver %s: BT power disabled\n",
+			dev_name(&bt->exp->dev), bt->exp->dev.driver->name);
+		pcal_set_unsafe(bt, "driver bound at probe", -EBUSY);
+		return;
+	}
+	if (pcal_dump_read(bt, &bt->baseline)) {
+		dev_err(dev, "expander %s unreadable (%d): BT power disabled\n",
+			dev_name(&bt->exp->dev), bt->baseline.err);
+		bt->baseline.valid = false;
+		pcal_set_unsafe(bt, "unreadable at probe", bt->baseline.err);
+		return;
+	}
+	pcal_dump_print(bt, "probe", &bt->baseline);
+	o = pcal_dump_reg(&bt->baseline, PCAL_OUT0);
+	c = pcal_dump_reg(&bt->baseline, PCAL_CFG0);
+	in = pcal_dump_reg(&bt->baseline, PCAL_IN0);
+	pol = pcal_dump_reg(&bt->baseline, PCAL_POL0);
+	ocfg = pcal_dump_reg(&bt->baseline, PCAL_OUT_CFG);
+	bt->exp_out0 = o;
+	bt->exp_cfg0 = c;
+
+	if (pol & BT_EXP_BIT) {
+		pcal_set_unsafe(bt, "P0_7 input polarity inverted at probe", -EIO);
+	} else if (ocfg & BIT(0)) {
+		pcal_set_unsafe(bt, "port 0 open-drain at probe", -EIO);
+	} else if (!(c & BT_EXP_BIT) && ((o ^ in) & BT_EXP_BIT)) {
+		dev_err(dev, "BT_REG_ON (P0_7) driven %d but reads %d at probe\n",
+			!!(o & BT_EXP_BIT), !!(in & BT_EXP_BIT));
+		pcal_set_unsafe(bt, "P0_7 level differs from its output at probe", -EIO);
+	} else if (!(c & BT_EXP_BIT) && (o & BT_EXP_BIT)) {
+		/* B1-read 2026-11-07: out=90,.. cfg=6f,.. in=90,..: P0_7 high */
+		bt->pwr = BT_PWR_ON_BOOT;
+		dev_info(dev, "BT_REG_ON (P0_7) driven high by the bootloader: state %s, not written at probe\n",
+			 bt_pwr_names[bt->pwr]);
+	} else {
+		bt->pwr = BT_PWR_OFF;
+		dev_info(dev, "BT_REG_ON (P0_7) %s at probe: state %s\n",
+			 (c & BT_EXP_BIT) ? "an input" : "driven low",
+			 bt_pwr_names[bt->pwr]);
+	}
+}
+
 static int bcm43xx_bt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *np;
 	struct bcm43xx_bt *bt;
-	u8 o, c, in;
-	int ret, drv, lvl;
+	int ret;
 
 	bt = devm_kzalloc(dev, sizeof(*bt), GFP_KERNEL);
 	if (!bt)
@@ -1026,7 +1355,7 @@ static int bcm43xx_bt_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	/* 4.9 parity: BT_WAKE output low at probe (SoC pin, chip is off) */
+	/* 4.9 parity: BT_WAKE output low at probe (SoC pin) */
 	bt->bt_wake = devm_gpiod_get(dev, "bt-wake", GPIOD_OUT_LOW);
 	if (IS_ERR(bt->bt_wake))
 		return dev_err_probe(dev, PTR_ERR(bt->bt_wake), "BT_WAKE\n");
@@ -1046,35 +1375,12 @@ static int bcm43xx_bt_probe(struct platform_device *pdev)
 		bt->host_wake_irq = -1;
 	}
 
-	/*
-	 * Expander baseline: read-only. Unlike 4.9 (which had just reset and
-	 * reprogrammed the whole expander) nothing is written at probe; the
-	 * first write happens at the first power-on. If the expander does not
-	 * answer, reads constant garbage, has a driver bound, or BT_REG_ON is
-	 * already driven high, the expander is never written.
-	 */
 	mutex_lock(&bt->lock);
-	if (bt->exp->dev.driver) {
-		dev_err(dev, "expander %s is bound to driver %s: BT power disabled\n",
-			dev_name(&bt->exp->dev), bt->exp->dev.driver->name);
-		bt->exp_tainted = true;
-	} else if (pcal_dump_read(bt, &bt->baseline)) {
-		dev_err(dev, "expander %s unreadable (%d): BT power disabled\n",
-			dev_name(&bt->exp->dev), bt->baseline.err);
-		bt->exp_tainted = true;
-	} else {
-		pcal_dump_print(bt, "probe", &bt->baseline);
-		o = bt->baseline.v[pcal_dump_index(PCAL_OUT0)];
-		c = bt->baseline.v[pcal_dump_index(PCAL_CFG0)];
-		in = bt->baseline.v[pcal_dump_index(PCAL_IN0)];
-		pcal_pin_state(o, c, in, &drv, &lvl);
-		if (drv) {
-			dev_err(dev, "BT_REG_ON (P0_7) is already driven high at probe: BT power disabled\n");
-			bt->exp_tainted = true;
-		}
-	}
+	bt_probe_expander(bt);
 	mutex_unlock(&bt->lock);
 
+	/* drvdata before rfkill_register: sysfs, PM and set_block use it */
+	platform_set_drvdata(pdev, bt);
 	bt->rfkill = rfkill_alloc("bcm43xx Bluetooth", dev, RFKILL_TYPE_BLUETOOTH,
 				  &bt_rfkill_ops, bt);
 	if (!bt->rfkill)
@@ -1086,11 +1392,10 @@ static int bcm43xx_bt_probe(struct platform_device *pdev)
 		rfkill_destroy(bt->rfkill);
 		return dev_err_probe(dev, ret, "rfkill_register\n");
 	}
-	platform_set_drvdata(pdev, bt);
 
-	dev_info(dev, "rfkill \"bcm43xx Bluetooth\" = rfkill%d (blocked), host-wake irq %d, expander %s P0_7%s\n",
+	dev_info(dev, "rfkill \"bcm43xx Bluetooth\" = rfkill%d (blocked), host-wake irq %d, expander %s P0_7 state %s%s\n",
 		 bt_rfkill_index(bt), bt->host_wake_irq, dev_name(&bt->exp->dev),
-		 bt->exp_tainted ? " UNUSABLE" : "");
+		 bt_pwr_names[bt->pwr], bt->exp_unsafe ? " UNUSABLE (unsafe)" : "");
 
 	if (of_property_read_bool(dev->of_node, "samsung,bt-selftest")) {
 		s64 now = ktime_to_ms(ktime_get_boottime());
@@ -1114,9 +1419,12 @@ MODULE_DEVICE_TABLE(of, bcm43xx_bt_of_match);
 
 static struct platform_driver bcm43xx_bt_driver = {
 	.probe = bcm43xx_bt_probe,
+	.shutdown = bcm43xx_bt_shutdown,
 	.driver = {
 		.name = "samsung-bcm43xx-bt",
 		.of_match_table = bcm43xx_bt_of_match,
+		.dev_groups = bcm43xx_bt_groups,
+		.pm = pm_sleep_ptr(&bcm43xx_bt_pm_ops),
 		/* never unbound: the self-test and rfkill outlive any unbind */
 		.suppress_bind_attrs = true,
 	},
