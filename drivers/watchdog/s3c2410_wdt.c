@@ -249,10 +249,9 @@ struct s3c2410_wdt {
 	struct regmap *pmureg;
 	/* Opt-in expiry selftest (QUIRK_SBOOT_RESET_GUARD variants only) */
 	struct delayed_work	selftest_work;
-	bool			selftest_stopped;
-	/* Restart in progress: armed with a short timeout, no longer petted */
+	bool			selftest_fired;	/* the work already ran once */
+	/* Restart: short timeout, last reload, then the final stop */
 	struct notifier_block	reboot_nb;
-	bool			reboot_pending;
 	/*
 	 * DT samsung,keep-armed-in-suspend (guarded variants only): system
 	 * suspend leaves the watchdog running with a longer timeout instead
@@ -264,10 +263,20 @@ struct s3c2410_wdt {
 	bool			suspended_armed;
 	unsigned int		resume_timeout;
 	/*
-	 * Petting stopped for good: s3c2410wdt_crownlte_stop_petting(), or the
-	 * absolute deadline below has passed. Never cleared.
+	 * Counter switched off by a plain (not kept-armed) system suspend,
+	 * under wdt->lock; cleared by resume under the same lock.
+	 */
+	bool			pm_stopped;
+	/*
+	 * THE final-stop state, the only one: set under wdt->lock by
+	 * __s3c2410wdt_final_stop() (s3c2410wdt_crownlte_stop_petting(), the
+	 * restart notifier, the expiry selftest) or by s3c2410wdt_may_pet()
+	 * once the deadline below has passed. Never cleared. Every path that
+	 * writes WTCNT, slows the prescaler, stops the counter or masks the
+	 * reset checks it under wdt->lock. stop_why: the first reason.
 	 */
 	bool			pet_stopped;
+	const char		*stop_why;
 	/*
 	 * s3c2410wdt_crownlte_set_deadline(): CLOCK_BOOTTIME ns after which
 	 * no path reloads the counter any more, whatever CPU asks (0: none).
@@ -563,15 +572,40 @@ static void s3c2410wdt_mask_dbgack(struct s3c2410_wdt *wdt)
  */
 static bool s3c2410wdt_may_pet(struct s3c2410_wdt *wdt)
 {
-	if (wdt->reboot_pending || wdt->selftest_stopped || wdt->pet_stopped)
+	lockdep_assert_held(&wdt->lock);
+	if (wdt->pet_stopped)
 		return false;
 	if (wdt->pet_deadline_ns &&
 	    ktime_get_boot_fast_ns() >= wdt->pet_deadline_ns) {
 		wdt->pet_stopped = true;
+		wdt->stop_why = "deadline";
 		wdt->deadline_hit = true;
 		return false;
 	}
 	return true;
+}
+
+/*
+ * The final stop, with wdt->lock held: one last reload of the running
+ * counter, but only while s3c2410wdt_may_pet() still allows one (never
+ * after the deadline passed or after an earlier final stop), then the
+ * shared stopped state is latched for good. Idempotent. True if this call
+ * made the last reload.
+ */
+static bool __s3c2410wdt_final_stop(struct s3c2410_wdt *wdt, const char *why)
+{
+	bool reload;
+
+	lockdep_assert_held(&wdt->lock);
+	reload = s3c2410wdt_may_pet(wdt) &&
+		 (readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE);
+	if (reload)
+		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
+	if (!wdt->pet_stopped) {
+		wdt->pet_stopped = true;
+		wdt->stop_why = why;
+	}
+	return reload;
 }
 
 /* Logs the deadline stop once, outside wdt->lock. */
@@ -824,9 +858,21 @@ static int s3c2410wdt_start(struct watchdog_device *wdd)
 
 	spin_lock_irqsave(&wdt->lock, flags);
 
-	/* A running counter that may no longer be reloaded is left alone. */
-	if ((readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE) &&
-	    !s3c2410wdt_may_pet(wdt)) {
+	/*
+	 * After the final stop the counter is never reloaded: one running
+	 * with the reset enabled is left alone; otherwise (block reset in
+	 * sleep) counter and reset are switched on from whatever WTCNT holds,
+	 * so the reset the final stop asked for still comes, within at most
+	 * the full count.
+	 */
+	if (!s3c2410wdt_may_pet(wdt)) {
+		wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+		if ((wtcon & (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) !=
+		    (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) {
+			wtcon &= ~S3C2410_WTCON_INTEN;
+			wtcon |= S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN;
+			writel(wtcon, wdt->reg_base + S3C2410_WTCON);
+		}
 		spin_unlock_irqrestore(&wdt->lock, flags);
 		s3c2410wdt_deadline_report(wdt);
 		return 0;
@@ -983,14 +1029,17 @@ s3c2410_get_wdt_drv_data(struct platform_device *pdev, struct s3c2410_wdt *wdt)
 	return 0;
 }
 
+/* Unbind: after the final stop the reset is neither masked nor stopped. */
 static void s3c2410wdt_wdt_disable_action(void *data)
 {
-	s3c2410wdt_enable(data, false);
+	if (!s3c2410wdt_pet_refused(data))
+		s3c2410wdt_enable(data, false);
 }
 
 static void s3c2410wdt_hw_stop_action(void *data)
 {
-	s3c2410wdt_stop(&((struct s3c2410_wdt *)data)->wdt_device);
+	if (!s3c2410wdt_pet_refused(data))
+		s3c2410wdt_stop(&((struct s3c2410_wdt *)data)->wdt_device);
 }
 
 static int s3c2410wdt_pmu_read(struct s3c2410_wdt *wdt, unsigned int reg,
@@ -1185,7 +1234,7 @@ static void s3c2410wdt_selftest_work(struct work_struct *work)
 	unsigned long flags;
 	int ret;
 
-	if (wdt->selftest_stopped) {
+	if (wdt->selftest_fired) {
 		dev_emerg(wdt->dev,
 			  "watchdog selftest: FAIL, still running %d s after petting stopped (WTCON=%#x WTCNT=%#x)\n",
 			  S3C2410_SELFTEST_EXPIRE_S + 5,
@@ -1202,7 +1251,8 @@ static void s3c2410wdt_selftest_work(struct work_struct *work)
 	spin_lock_irqsave(&wdt->lock, flags);
 	if (!ret)
 		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, true);
-	wdt->selftest_stopped = true;
+	__s3c2410wdt_final_stop(wdt, "watchdog selftest");
+	wdt->selftest_fired = true;
 	spin_unlock_irqrestore(&wdt->lock, flags);
 
 	dev_emerg(wdt->dev,
@@ -1316,37 +1366,56 @@ int s3c2410wdt_crownlte_set_deadline(u64 boot_ns)
 EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_set_deadline);
 
 /*
- * Stop petting for good, so the running watchdog resets the SoC within its
- * current timeout. For a hang the kernel can see but not undo (a CPU lost
- * while online): other CPUs would otherwise keep petting forever. The
- * counter is reloaded once, by the first call only, so the logs have a
- * full timeout to reach pstore; later calls change nothing. Returns the
- * timeout in seconds, or a negative error if nothing is armed.
+ * The one public final stop, shared by every crownlte user (suspend
+ * deadline, C2 lost-core chain): stop petting for good, so the running
+ * watchdog resets the SoC within its current timeout. For a hang the kernel
+ * can see but not undo (a CPU lost while online): other CPUs would
+ * otherwise keep petting forever.
+ *
+ * Irreversible and idempotent, decided entirely under wdt->lock by
+ * __s3c2410wdt_final_stop(): one last reload of a running counter, only
+ * while s3c2410wdt_may_pet() still allows it (so the logs get a full
+ * timeout to reach pstore), never after the deadline passed or after an
+ * earlier final stop (restart notifier, selftest, an earlier call); then
+ * the shared stopped state is latched. From then on no path reloads the
+ * counter, slows its prescaler, stops it, masks its reset or lets a resume
+ * reload it.
+ *
+ * Returns the timeout in seconds if the counter runs with the reset
+ * enabled, -ENODEV without a guarded instance, -EIO if the counter is not
+ * running with the reset enabled right now (e.g. switched off by a system
+ * suspend that completed first). With -EIO the state is still latched: the
+ * resume switches the counter back on without a reload.
  */
 int s3c2410wdt_crownlte_stop_petting(const char *why)
 {
 	struct s3c2410_wdt *wdt = smp_load_acquire(&s3c2410wdt_crownlte);
 	unsigned long flags;
-	bool first;
+	bool reload, armed;
+	u32 wtcon;
 
 	if (!wdt)
 		return -ENODEV;
-	if (!(readl(wdt->reg_base + S3C2410_WTCON) & S3C2410_WTCON_ENABLE))
-		return -EIO;
 	spin_lock_irqsave(&wdt->lock, flags);
-	first = s3c2410wdt_may_pet(wdt);
-	if (first)
-		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
-	wdt->pet_stopped = true;
+	reload = __s3c2410wdt_final_stop(wdt, why);
+	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	armed = (wtcon & (S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN)) ==
+		(S3C2410_WTCON_ENABLE | S3C2410_WTCON_RSTEN);
 	spin_unlock_irqrestore(&wdt->lock, flags);
-	if (first)
+	if (reload)
 		pr_emerg("s3c2410-wdt: petting stopped for good (%s): SoC reset in about %u s\n",
 			 why, wdt->wdt_device.timeout);
 	else
-		pr_emerg("s3c2410-wdt: petting already stopped (%s now too): reset due within %u s (WTCNT %#x)\n",
-			 why, wdt->wdt_device.timeout,
+		pr_emerg("s3c2410-wdt: petting already stopped (%s, first: %s): no reload, reset due within %u s (WTCON %#x WTCNT %#x)\n",
+			 why, wdt->stop_why, wdt->wdt_device.timeout, wtcon,
 			 readl(wdt->reg_base + S3C2410_WTCNT));
 	s3c2410wdt_deadline_report(wdt);
+	if (!armed) {
+		pr_emerg("s3c2410-wdt: final stop (%s) latched, but the counter is not running with the reset enabled now (WTCON %#x%s)\n",
+			 why, wtcon,
+			 READ_ONCE(wdt->pm_stopped) ? ", stopped for system suspend: resume re-arms it without a reload" : "");
+		return -EIO;
+	}
 	return wdt->wdt_device.timeout;
 }
 EXPORT_SYMBOL_GPL(s3c2410wdt_crownlte_stop_petting);
@@ -1565,8 +1634,7 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 	struct s3c2410_wdt *wdt = container_of(nb, struct s3c2410_wdt, reboot_nb);
 	struct s3c2410wdt_hb hb;
 	unsigned long flags;
-	bool hb_ok;
-	int ret;
+	bool hb_ok, reloaded;
 
 	if (action != SYS_RESTART)
 		return NOTIFY_DONE;
@@ -1575,22 +1643,16 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 	hb_ok = !s3c2410wdt_calc_heartbeat(wdt, S3C2410_WDT_RESTART_TIMEOUT, &hb);
 
 	/*
-	 * One wdt->lock section: the short timeout and the last reload only
-	 * if petting is still allowed; once it has stopped for good (or the
-	 * deadline passed) the reset is due and nothing is written.
+	 * One wdt->lock section: the short timeout (refused, nothing written,
+	 * once reloading is no longer allowed), then the shared final stop,
+	 * whose last reload also only happens while reloading is allowed.
 	 */
 	spin_lock_irqsave(&wdt->lock, flags);
-	if (hb_ok) {
-		ret = __s3c2410wdt_apply_heartbeat(wdt, &hb, true);
-	} else if (s3c2410wdt_may_pet(wdt)) {
-		writel(wdt->count, wdt->reg_base + S3C2410_WTCNT);
-		ret = 0;
-	} else {
-		ret = -ETIME;
-	}
-	wdt->reboot_pending = true;
+	if (hb_ok)
+		__s3c2410wdt_apply_heartbeat(wdt, &hb, true);
+	reloaded = __s3c2410wdt_final_stop(wdt, "restart");
 	spin_unlock_irqrestore(&wdt->lock, flags);
-	if (ret) {
+	if (!reloaded) {
 		s3c2410wdt_deadline_report(wdt);
 		dev_info(wdt->dev, "restart: petting already stopped, reset due within %u s\n",
 			 wdt->wdt_device.timeout);
@@ -1612,6 +1674,9 @@ static void s3c2410wdt_shutdown(struct platform_device *dev)
 			 wdt->wdt_device.timeout);
 		return;
 	}
+	/* After the final stop the reset is never masked or stopped. */
+	if (s3c2410wdt_pet_refused(wdt))
+		return;
 
 	s3c2410wdt_enable(wdt, false);
 	s3c2410wdt_stop(&wdt->wdt_device);
@@ -1672,34 +1737,49 @@ static int s3c2410wdt_suspend_keep_armed(struct s3c2410_wdt *wdt, u32 wtcon)
 	return 0;
 }
 
+static int s3c2410wdt_resume(struct device *dev);
+
 static int s3c2410wdt_suspend(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
 	u32 wtcon = readl(wdt->reg_base + S3C2410_WTCON);
+	unsigned long flags;
 
 	wdt->suspended_armed = false;
 	if (wdt->keep_armed_suspend && (wtcon & S3C2410_WTCON_ENABLE))
 		return s3c2410wdt_suspend_keep_armed(wdt, wtcon);
-	/* A crownlte deadline or stopped petting: never stop it either. */
+	/*
+	 * A crownlte deadline or the final stop: never stop it either. The
+	 * check, the save and switching the counter off are one wdt->lock
+	 * section, so a final stop is either seen here (suspend refused) or
+	 * comes after the counter is off (pm_stopped: the stop latches, and
+	 * resume re-arms without a reload). The PMU reset mask below is only
+	 * set while the counter is off.
+	 */
+	spin_lock_irqsave(&wdt->lock, flags);
+	wtcon = readl(wdt->reg_base + S3C2410_WTCON);
 	if ((wtcon & S3C2410_WTCON_ENABLE) &&
-	    (READ_ONCE(wdt->pet_deadline_ns) || s3c2410wdt_pet_refused(wdt))) {
+	    (wdt->pet_deadline_ns || !s3c2410wdt_may_pet(wdt))) {
+		spin_unlock_irqrestore(&wdt->lock, flags);
+		s3c2410wdt_deadline_report(wdt);
 		dev_err(dev, "suspend refused: watchdog under a deadline or no longer petted (WTCON %#x)\n",
 			wtcon);
 		return -EBUSY;
 	}
-
-	/* Save watchdog state, and turn it off. */
-	wdt->wtcon_save = readl(wdt->reg_base + S3C2410_WTCON);
+	/* Save watchdog state, and turn it off. WTCNT is not saved. */
+	wdt->wtcon_save = wtcon;
 	wdt->wtdat_save = readl(wdt->reg_base + S3C2410_WTDAT);
+	__s3c2410wdt_stop(wdt);
+	wdt->pm_stopped = true;
+	spin_unlock_irqrestore(&wdt->lock, flags);
 
 	ret = s3c2410wdt_enable(wdt, false);
-	if (ret < 0)
+	if (ret < 0) {
+		/* The PM core will not call resume for this device. */
+		s3c2410wdt_resume(dev);
 		return ret;
-
-	/* Note that WTCNT doesn't need to be saved. */
-	s3c2410wdt_stop(&wdt->wdt_device);
-
+	}
 	return 0;
 }
 
@@ -1707,6 +1787,9 @@ static int s3c2410wdt_resume(struct device *dev)
 {
 	int ret;
 	struct s3c2410_wdt *wdt = dev_get_drvdata(dev);
+	unsigned long flags;
+	bool final = false;
+	u32 wtcon;
 
 	if (wdt->suspended_armed) {
 		u32 wtcon = readl(wdt->reg_base + S3C2410_WTCON);
@@ -1739,12 +1822,41 @@ static int s3c2410wdt_resume(struct device *dev)
 		return 0;
 	}
 
-	/* Restore watchdog state. */
-	writel(wdt->wtdat_save, wdt->reg_base + S3C2410_WTDAT);
-	writel(wdt->wtdat_save, wdt->reg_base + S3C2410_WTCNT);/* Reset count */
-	writel(wdt->wtcon_save, wdt->reg_base + S3C2410_WTCON);
-
+	/*
+	 * PMU reset unmask first, then the counter: a counter that is due
+	 * never expires while its reset is still masked.
+	 */
 	ret = s3c2410wdt_enable(wdt, true);
+
+	/*
+	 * Restore watchdog state, in one wdt->lock section with the final
+	 * stop check. After a final stop (latched while the counter was off
+	 * for suspend) WTCNT is not reloaded: the counter goes on from the
+	 * value it stopped at, with the reset enabled.
+	 */
+	spin_lock_irqsave(&wdt->lock, flags);
+	wdt->pm_stopped = false;
+	if (!s3c2410wdt_may_pet(wdt)) {
+		final = true;
+		wtcon = wdt->wtcon_save;
+		if (wtcon & S3C2410_WTCON_ENABLE) {
+			wtcon &= ~S3C2410_WTCON_INTEN;
+			wtcon |= S3C2410_WTCON_RSTEN;
+		}
+		writel(wtcon, wdt->reg_base + S3C2410_WTCON);
+	} else {
+		writel(wdt->wtdat_save, wdt->reg_base + S3C2410_WTDAT);
+		writel(wdt->wtdat_save, wdt->reg_base + S3C2410_WTCNT);/* Reset count */
+		writel(wdt->wtcon_save, wdt->reg_base + S3C2410_WTCON);
+	}
+	spin_unlock_irqrestore(&wdt->lock, flags);
+
+	if (final) {
+		s3c2410wdt_deadline_report(wdt);
+		dev_emerg(dev, "resume after the final stop (%s): re-armed without a reload (WTCON %#x WTCNT %#x)\n",
+			  wdt->stop_why, readl(wdt->reg_base + S3C2410_WTCON),
+			  readl(wdt->reg_base + S3C2410_WTCNT));
+	}
 	if (ret < 0)
 		return ret;
 

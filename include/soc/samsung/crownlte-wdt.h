@@ -1,8 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * crownlte (Exynos 9810) CL0 watchdog hooks for the suspend driver.
- * Served by drivers/watchdog/s3c2410_wdt.c for its SBOOT-guarded instance
- * only (samsung,exynos9810-wdt); see Documentation/crownlte/suspend-s0.md.
+ * crownlte (Exynos 9810) CL0 watchdog hooks for the suspend driver and the
+ * C2 lost-core chain (drivers/cpuidle/cpuidle-exynos9810.c). Served by
+ * drivers/watchdog/s3c2410_wdt.c for its SBOOT-guarded instance only
+ * (samsung,exynos9810-wdt); see Documentation/crownlte/suspend-s0.md.
+ *
+ * s3c2410wdt_crownlte_stop_petting() is THE final stop, shared by both:
+ * irreversible and idempotent under the driver lock, at most one last
+ * reload (only while reloading is still allowed), then one latched stopped
+ * state that every reload, prescaler, stop, PMU-mask and resume path checks.
  */
 #ifndef __SOC_SAMSUNG_CROWNLTE_WDT_H
 #define __SOC_SAMSUNG_CROWNLTE_WDT_H
