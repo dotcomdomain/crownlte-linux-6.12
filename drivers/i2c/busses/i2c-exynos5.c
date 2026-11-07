@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/of.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/spinlock.h>
 #include <soc/samsung/exynos9810-audio-a1.h>
 
@@ -208,13 +209,16 @@ struct exynos5_i2c {
 
 	/*
 	 * crownlte audio A1 read-only mode (DT samsung,crownlte-a1-read-only,
-	 * 9810 variant only): only [2-byte write][1-byte read] transfers, no
+	 * 9810 variant only): only [2-byte register address write][1-byte
+	 * read] of a register on the A1 list at MAX98512 0x39/0x3a, no
 	 * retries, no stuck-bus recovery clocks; the first failure closes the
-	 * adapter for the boot (IRQ off, controller held in reset).
+	 * adapter for the boot (IRQ off, controller held in reset, base
+	 * latched in the A1 driver so no rebind reopens it).
 	 * Documentation/crownlte/audio-a1.md.
 	 */
 	bool			a1_mode;
 	bool			a1_closed;
+	phys_addr_t		a1_base;	/* A1 bus latch key */
 };
 
 /**
@@ -826,6 +830,8 @@ static void exynos5_i2c_a1_close(struct exynos5_i2c *i2c, int err, bool hw)
 {
 	unsigned long flags;
 
+	/* boot-lifetime: a rebind of this controller is refused from now on */
+	exynos9810_audio_a1_bus(i2c->dev, i2c->a1_base, EXYNOS9810_A1_BUS_CLOSE);
 	/* atomic transfers run with the IRQ already disabled (synchronously) */
 	if (i2c->atomic)
 		disable_irq_nosync(i2c->irq);
@@ -843,17 +849,36 @@ static void exynos5_i2c_a1_close(struct exynos5_i2c *i2c, int err, bool hw)
 		err, hw ? ", controller held in reset" : "");
 }
 
-/* A1 read-only mode: the only transfer allowed is a plain register read. */
+/*
+ * A1 read-only mode: the only transfer allowed is a plain read of one
+ * register on the A1 list (exynos9810_audio_a1_amp_reg_ok(), the list the
+ * A1 self-test reads) at MAX98512 0x39 or 0x3a. Whoever sends it (the A1
+ * driver, another kernel client, a sysfs new_device client), anything
+ * else is refused here, before the clocks, and closes the adapter. The
+ * clear-on-read flags 0x0007-0x0009 are not on the list. i2c-dev cannot
+ * reach the adapter: CONFIG_EXYNOS9810_AUDIO_A1 depends on I2C_CHARDEV=n.
+ */
 static int exynos5_i2c_a1_check(struct exynos5_i2c *i2c, struct i2c_msg *msgs,
 				int num)
 {
+	u16 reg;
+
 	if (i2c->a1_closed)
 		return -EIO;
-	if (num == 2 && msgs[0].addr == msgs[1].addr && msgs[0].addr <= 0x7f &&
+	if (num == 2 && msgs[0].addr == msgs[1].addr &&
+	    exynos9810_audio_a1_amp_addr_ok(msgs[0].addr) &&
 	    (msgs[0].flags & ~I2C_M_DMA_SAFE) == 0 && msgs[0].len == 2 &&
-	    (msgs[1].flags & ~I2C_M_DMA_SAFE) == I2C_M_RD && msgs[1].len == 1)
-		return 0;
-	dev_err(i2c->dev, "A1 read-only mode: transfer refused: only [2-byte register address write][1-byte read] to one 7-bit address\n");
+	    msgs[0].buf &&
+	    (msgs[1].flags & ~I2C_M_DMA_SAFE) == I2C_M_RD && msgs[1].len == 1) {
+		reg = (msgs[0].buf[0] << 8) | msgs[0].buf[1];
+		if (exynos9810_audio_a1_amp_reg_ok(reg))
+			return 0;
+		dev_err(i2c->dev, "A1 read-only mode: transfer refused: register %#06x at %#04x is not on the A1 list\n",
+			reg, msgs[0].addr);
+	} else {
+		dev_err(i2c->dev, "A1 read-only mode: transfer refused (%d messages, first to %#x): only [2-byte register address write][1-byte read] to 0x39/0x3a\n",
+			num, num > 0 ? msgs[0].addr : 0);
+	}
 	exynos5_i2c_a1_close(i2c, -EPERM, false);
 	return -EPERM;
 }
@@ -1012,7 +1037,32 @@ static int exynos5_i2c_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
 	struct exynos5_i2c *i2c;
+	struct resource *res;
+	struct pinctrl *a1_pins = NULL;
+	struct pinctrl_state *a1_pin_state = NULL;
+	bool a1_guarded;
 	int ret;
+
+	/*
+	 * crownlte audio A1, first: a guarded controller that was brought up
+	 * (or closed) once in this boot is refused here, before the guard,
+	 * pin mux, clocks or registers (boot-lifetime latch in the A1 driver,
+	 * keyed by the MMIO base). In A1 mode the node has no "default" or
+	 * "init" pin state, so the driver core selected nothing before this
+	 * probe; the bus pins ("a1-bus") are selected below, after the latch
+	 * and the guard. suppress_bind_attrs (A1 builds): no sysfs unbind/bind.
+	 */
+	a1_guarded = of_property_read_bool(np, "samsung,crownlte-a1-read-only") ||
+		     of_property_present(np, "samsung,audio-a1-guard");
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (a1_guarded) {
+		if (!res)
+			return dev_err_probe(&pdev->dev, -EINVAL, "audio A1: no MMIO window\n");
+		ret = exynos9810_audio_a1_bus(&pdev->dev, res->start,
+					      EXYNOS9810_A1_BUS_CHECK);
+		if (ret)
+			return ret;
+	}
 
 	i2c = devm_kzalloc(&pdev->dev, sizeof(struct exynos5_i2c), GFP_KERNEL);
 	if (!i2c)
@@ -1024,14 +1074,21 @@ static int exynos5_i2c_probe(struct platform_device *pdev)
 	 * (DT samsung,audio-a1-guard); A1 mode always requires it.
 	 */
 	i2c->a1_mode = of_property_read_bool(np, "samsung,crownlte-a1-read-only");
+	if (a1_guarded)
+		i2c->a1_base = res->start;
 	if (i2c->a1_mode) {
 		const struct exynos_hsi2c_variant *v = of_device_get_match_data(&pdev->dev);
 
 		if (!v || !v->exynos9810_timings)
 			return dev_err_probe(&pdev->dev, -EINVAL,
 					     "samsung,crownlte-a1-read-only needs samsung,exynos9810-hsi2c\n");
+		/* a "default"/"init" state would be selected before this probe */
+		if (of_property_match_string(np, "pinctrl-names", PINCTRL_STATE_DEFAULT) >= 0 ||
+		    of_property_match_string(np, "pinctrl-names", PINCTRL_STATE_INIT) >= 0)
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "A1 read-only mode: the bus pins must be pinctrl-names \"a1-bus\" only\n");
 	}
-	if (i2c->a1_mode || of_property_present(np, "samsung,audio-a1-guard")) {
+	if (a1_guarded) {
 		ret = exynos9810_audio_a1_guard(&pdev->dev);
 		if (ret)
 			return dev_err_probe(&pdev->dev, ret,
@@ -1058,6 +1115,36 @@ static int exynos5_i2c_probe(struct platform_device *pdev)
 	if (IS_ERR(i2c->pclk)) {
 		return dev_err_probe(&pdev->dev, PTR_ERR(i2c->pclk),
 				     "cannot get pclk");
+	}
+
+	/* A1 mode: look the bus pin state up now (may defer), select it below */
+	if (i2c->a1_mode) {
+		a1_pins = devm_pinctrl_get(&pdev->dev);
+		if (IS_ERR(a1_pins))
+			return dev_err_probe(&pdev->dev, PTR_ERR(a1_pins),
+					     "A1 read-only mode: no pinctrl\n");
+		a1_pin_state = pinctrl_lookup_state(a1_pins, "a1-bus");
+		if (IS_ERR(a1_pin_state))
+			return dev_err_probe(&pdev->dev, PTR_ERR(a1_pin_state),
+					     "A1 read-only mode: no \"a1-bus\" pin state\n");
+	}
+
+	/*
+	 * crownlte audio A1: the first pin mux, clock or register access
+	 * follows. One hardware bring-up per boot: any later probe, even
+	 * after a failure below, is refused by the CHECK above.
+	 */
+	if (a1_guarded) {
+		ret = exynos9810_audio_a1_bus(&pdev->dev, i2c->a1_base,
+					      EXYNOS9810_A1_BUS_CLAIM);
+		if (ret)
+			return ret;
+	}
+	if (a1_pin_state) {
+		ret = pinctrl_select_state(a1_pins, a1_pin_state);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "A1 read-only mode: selecting the \"a1-bus\" pins\n");
 	}
 
 	ret = clk_prepare_enable(i2c->pclk);
@@ -1109,7 +1196,7 @@ static int exynos5_i2c_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, i2c);
 	if (i2c->a1_mode)
-		dev_info(&pdev->dev, "A1 read-only mode: [2-byte address][1-byte read] only, retries 0, no stuck-bus recovery, closed for the boot after the first failure\n");
+		dev_info(&pdev->dev, "A1 read-only mode: [2-byte address][1-byte read] of the A1 register list at 0x39/0x3a only, retries 0, no stuck-bus recovery, closed for the boot after the first failure, no rebind\n");
 
 	clk_disable(i2c->clk);
 	clk_disable(i2c->pclk);
@@ -1191,6 +1278,8 @@ static struct platform_driver exynos5_i2c_driver = {
 		.name	= "exynos5-hsi2c",
 		.pm	= pm_sleep_ptr(&exynos5_i2c_dev_pm_ops),
 		.of_match_table = exynos5_i2c_match,
+		/* crownlte audio A1 builds: no sysfs unbind/bind of the amp bus */
+		.suppress_bind_attrs = IS_ENABLED(CONFIG_EXYNOS9810_AUDIO_A1),
 	},
 };
 
