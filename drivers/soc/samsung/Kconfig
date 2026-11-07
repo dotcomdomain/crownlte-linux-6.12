@@ -162,6 +162,8 @@ config EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET
 config EXYNOS9810_AUDIO_A1
 	bool "crownlte audio stage A1: read-only hardware probe"
 	depends on ARM64 && OF && I2C && MFD_SYSCON && MFD_S2MPS18_ACPM
+	# i2c-dev would give userspace a /dev/i2c-N for the amp bus (I2C_RDWR)
+	depends on I2C_CHARDEV = n
 	help
 	  Exynos 9810 (crownlte) audio stage A1: a DT-started self-test
 	  ("audio selftest A1:") that only reads the pd-aud and ABOX CPU
@@ -171,7 +173,10 @@ config EXYNOS9810_AUDIO_A1
 	  pd-aud is read. The CL0 watchdog deadline is armed at probe; the
 	  amp bus (DT samsung,audio-a1-guard) only comes up after that. No
 	  SPI traffic, no amp or codec driver. Idle unless the node has
-	  samsung,audio-a1-selftest-ms. See Documentation/crownlte/audio-a1.md.
+	  samsung,audio-a1-selftest-ms. Not available with I2C_CHARDEV:
+	  userspace must not reach the amp bus. Also makes the exynos-usi
+	  and exynos5-hsi2c drivers suppress their sysfs bind/unbind files.
+	  See Documentation/crownlte/audio-a1.md.
 
 config EXYNOS9810_PM
 	bool "crownlte system suspend, stage S0 (no firmware sleep)"

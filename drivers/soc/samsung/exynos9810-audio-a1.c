@@ -75,6 +75,7 @@
 #include <linux/preempt.h>
 #include <linux/regmap.h>
 #include <linux/smp.h>
+#include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <soc/samsung/acpm_mfd.h>
 #include <soc/samsung/crownlte-wdt.h>
@@ -304,6 +305,68 @@ int exynos9810_audio_a1_guard(struct device *consumer)
 }
 EXPORT_SYMBOL_GPL(exynos9810_audio_a1_guard);
 
+/*
+ * Boot-lifetime latch of the guarded bus controllers (USI07 wrapper,
+ * HSI2C18), keyed by MMIO base. One hardware bring-up per controller per
+ * boot: a reprobe (rebind, supplier unbind, module reload) is refused
+ * before it touches a clock, SYSREG or register, and a controller closed
+ * after a failure stays closed. Entries are never removed. A full table
+ * refuses every further claim (fail closed).
+ */
+#define A1_BUS_MAX			4
+
+static DEFINE_SPINLOCK(a1_bus_lock);
+static struct {
+	phys_addr_t base;
+	bool closed;
+} a1_bus_seen[A1_BUS_MAX];
+static unsigned int a1_bus_nr;
+static bool a1_bus_full;
+
+int exynos9810_audio_a1_bus(struct device *dev, phys_addr_t base,
+			    enum exynos9810_a1_bus_op op)
+{
+	const char *why = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&a1_bus_lock, flags);
+	for (i = 0; i < a1_bus_nr; i++)
+		if (a1_bus_seen[i].base == base)
+			break;
+	switch (op) {
+	case EXYNOS9810_A1_BUS_CHECK:
+	case EXYNOS9810_A1_BUS_CLAIM:
+		if (i < a1_bus_nr)
+			why = a1_bus_seen[i].closed ? "closed after a failure" :
+						      "already brought up once";
+		else if (a1_bus_full || a1_bus_nr == A1_BUS_MAX)
+			why = "latch table full";
+		else if (op == EXYNOS9810_A1_BUS_CLAIM)
+			a1_bus_seen[a1_bus_nr++].base = base;
+		break;
+	case EXYNOS9810_A1_BUS_CLOSE:
+		if (i < a1_bus_nr) {
+			a1_bus_seen[i].closed = true;
+		} else if (a1_bus_nr < A1_BUS_MAX) {
+			a1_bus_seen[a1_bus_nr].base = base;
+			a1_bus_seen[a1_bus_nr++].closed = true;
+		} else {
+			/* cannot record it: no guarded controller comes up again */
+			a1_bus_full = true;
+		}
+		break;
+	}
+	spin_unlock_irqrestore(&a1_bus_lock, flags);
+
+	if (!why)
+		return 0;
+	dev_err(dev, "audio A1 bus latch: controller %pa %s in this boot: bring-up refused\n",
+		&base, why);
+	return -EPERM;
+}
+EXPORT_SYMBOL_GPL(exynos9810_audio_a1_bus);
+
 /* ---- always-on reads ------------------------------------------------------ */
 
 struct a1_pmu {
@@ -427,14 +490,9 @@ static int a1_amp_read(struct i2c_adapter *adap, u16 addr, u16 reg, u8 *val)
 	};
 	int ret;
 
-	switch (reg) {
-	case MAX98512_INT_RAW1 ... MAX98512_INT_RAW3:
-	case MAX98512_GLOBAL_SHDN:
-	case MAX98512_REV_ID:
-	case MAX98512B_GLOBAL_SHDN:
-	case MAX98512B_REV_ID:
-		break;
-	default:
+	/* the same list the adapter's A1 mode enforces before its clocks */
+	if (!exynos9810_audio_a1_amp_addr_ok(addr) ||
+	    !exynos9810_audio_a1_amp_reg_ok(reg)) {
 		pr_err("amp %#04x: register %#06x is not on the A1 read whitelist, refused\n",
 		       addr, reg);
 		return -EPERM;
