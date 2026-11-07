@@ -54,6 +54,7 @@ struct exynos_usi {
 
 	size_t mode;			/* current USI SW_CONF mode index */
 	bool clkreq_on;			/* always provide clock to IP */
+	bool no_sw_conf;		/* fixed-function block: no SW_CONF */
 
 	/* System Register */
 	struct regmap *sysreg;		/* System Register map */
@@ -127,6 +128,11 @@ static int exynos_usi_set_sw_conf(struct exynos_usi *usi, size_t mode)
 	if (mode < usi->data->min_mode || mode > usi->data->max_mode)
 		return -EINVAL;
 
+	if (usi->no_sw_conf) {
+		usi->mode = mode;
+		return 0;
+	}
+
 	val = exynos_usi_modes[mode].val;
 	ret = regmap_update_bits(usi->sysreg, usi->sw_conf,
 				 usi->data->sw_conf_mask, val);
@@ -177,13 +183,15 @@ static int exynos_usi_enable(const struct exynos_usi *usi)
 	 * clocks are on. Failure here prevents protocol child population.
 	 */
 	if (usi->data == &exynos9810_usi_data) {
-		u32 sw_conf, con, option;
+		u32 sw_conf = 0, con, option;
 
-		ret = regmap_read(usi->sysreg, usi->sw_conf, &sw_conf);
+		if (!usi->no_sw_conf)
+			ret = regmap_read(usi->sysreg, usi->sw_conf, &sw_conf);
 		con = readl(usi->regs + USI_CON);
 		option = readl(usi->regs + USI_OPTION);
-		if (!ret && ((sw_conf & usi->data->sw_conf_mask) !=
-			     exynos_usi_modes[usi->mode].val ||
+		if (!ret && ((!usi->no_sw_conf &&
+			      (sw_conf & usi->data->sw_conf_mask) !=
+			      exynos_usi_modes[usi->mode].val) ||
 			     (con & USI_CON_RESET) ||
 			     (usi->clkreq_on &&
 			      (option & (USI_OPTION_CLKREQ_ON |
@@ -192,6 +200,9 @@ static int exynos_usi_enable(const struct exynos_usi *usi)
 			ret = -EIO;
 		if (ret)
 			dev_err(usi->dev, "USIv2 configuration readback failed: %d\n", ret);
+		else if (usi->no_sw_conf)
+			dev_info(usi->dev, "USIv2 configured: sw_conf=none con=%08x option=%08x\n",
+				 con, option);
 		else
 			dev_info(usi->dev, "USIv2 configured: sw_conf=%08x con=%08x option=%08x\n",
 				 sw_conf, con, option);
@@ -227,6 +238,17 @@ static int exynos_usi_parse_dt(struct device_node *np, struct exynos_usi *usi)
 	if (mode < usi->data->min_mode || mode > usi->data->max_mode)
 		return -EINVAL;
 	usi->mode = mode;
+	usi->clkreq_on = of_property_read_bool(np, "samsung,clkreq-on");
+
+	/*
+	 * Exynos9810 fixed-function blocks (the BT UART, USI10_I2C) sit behind
+	 * a USIv2 wrapper but have no SYSREG protocol selector that the 4.9
+	 * kernel ever wrote. samsung,no-sw-conf skips the selector lookup,
+	 * write and readback; the wrapper reset clear and CLKREQ_ON still apply.
+	 */
+	usi->no_sw_conf = of_property_read_bool(np, "samsung,no-sw-conf");
+	if (usi->no_sw_conf)
+		return usi->data == &exynos9810_usi_data ? 0 : -EINVAL;
 
 	usi->sysreg = syscon_regmap_lookup_by_phandle(np, "samsung,sysreg");
 	if (IS_ERR(usi->sysreg))
@@ -236,8 +258,6 @@ static int exynos_usi_parse_dt(struct device_node *np, struct exynos_usi *usi)
 					 &usi->sw_conf);
 	if (ret)
 		return ret;
-
-	usi->clkreq_on = of_property_read_bool(np, "samsung,clkreq-on");
 
 	return 0;
 }
