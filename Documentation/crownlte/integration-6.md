@@ -117,6 +117,9 @@ The DT arms no write-capable test, and adds no new test.
 | boot | `pmic-diagnostic@60` (s2dos05, `crownlte,read-only-diagnostic`) | S2DOS05 snapshots | none (IRQ register 0x11 is clear-on-read, read once) |
 | 150 s | `wlan samsung,wifi-selftest` (`-ms` 150000) | power, link, chip id, firmware, wlan0 up/down; no kernel scan | Wi-Fi chip power and firmware only (as Android); skipped (`PASS-SHARED`) if userspace already owns wlan0 |
 
+On `crownlte-c2-runtime` (a6bcb13f5) the Wi-Fi self-test row no longer applies: `samsung,wifi-selftest` was
+dropped from `exynos9810-crownlte-romram-wifi.dtsi` (int6 DTB c30c8d04 there). See c2-runtime.md.
+
 Off: `display-handover samsung,display-selftest` (the node is disabled, as in v23a), every
 v23a-dpu-selftest compose step (not included), and every TEE stage (node disabled, no guard
 or pin properties).
