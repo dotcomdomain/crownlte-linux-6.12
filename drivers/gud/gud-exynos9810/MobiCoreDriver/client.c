@@ -633,6 +633,29 @@ void clients_kill_sessions(void)
 }
 
 /*
+ * Secure object for a daemon-registry open (OPEN_SESSION, GP open-session).
+ * crownlte T3: with the session guard on, registry_guard.h decides: daemon
+ * bytes only if pinned for exactly this UUID, otherwise SWd selection only.
+ * Without the guard: unchanged (registry, then SWd selection on ENOENT).
+ */
+static struct tee_object *client_registry_object(const struct mc_uuid_t *uuid,
+						 bool is_gp, const char *what)
+{
+	struct tee_object *obj;
+
+	if (mc_session_guard_active())
+		return mc_guard_registry_object(uuid, is_gp, what);
+
+	/* Get secure object */
+	obj = tee_object_get(uuid, is_gp);
+	/* Try to select secure object inside the SWd if not found */
+	if (IS_ERR(obj) && (PTR_ERR(obj) == -ENOENT) && g_ctx.f_ta_auth)
+		obj = tee_object_select(uuid);
+
+	return obj;
+}
+
+/*
  * Open TA for given client. TA binary is provided by the daemon.
  * @param
  * @return driver error code
@@ -650,17 +673,10 @@ int client_open_session(struct tee_client *client, u32 *session_id,
 	if (err)
 		return err;
 
-	/* Get secure object */
-	obj = tee_object_get(uuid, is_gp_uuid);
+	obj = client_registry_object(uuid, is_gp_uuid, "open-session-registry");
 	if (IS_ERR(obj)) {
-		/* Try to select secure object inside the SWd if not found */
-		if ((PTR_ERR(obj) == -ENOENT) && g_ctx.f_ta_auth)
-			obj = tee_object_select(uuid);
-
-		if (IS_ERR(obj)) {
-			err = PTR_ERR(obj);
-			goto end;
-		}
+		err = PTR_ERR(obj);
+		goto end;
 	}
 
 	/* Open session */
@@ -1077,17 +1093,10 @@ int client_gp_open_session(struct tee_client *client, u32 *session_id,
 	if (ret)
 		return ret;
 
-	/* Get secure object */
-	obj = tee_object_get(uuid, true);
+	obj = client_registry_object(uuid, true, "gp-open-session-registry");
 	if (IS_ERR(obj)) {
-		/* Try to select secure object inside the SWd if not found */
-		if ((PTR_ERR(obj) == -ENOENT) && g_ctx.f_ta_auth)
-			obj = tee_object_select(uuid);
-
-		if (IS_ERR(obj)) {
-			ret = PTR_ERR(obj);
-			goto end;
-		}
+		ret = PTR_ERR(obj);
+		goto end;
 	}
 
 	/* Open session */

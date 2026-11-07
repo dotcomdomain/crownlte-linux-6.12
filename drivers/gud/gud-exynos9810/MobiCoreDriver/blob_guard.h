@@ -34,12 +34,26 @@ enum mc_blob_verdict {
 	MC_BLOB_TYPE,		/* wrong service type for this path */
 	MC_BLOB_UUID,		/* UUID not pinned */
 	MC_BLOB_DIGEST,		/* UUID pinned, SHA-256 differs */
+	MC_BLOB_REQ_UUID,	/* header UUID is not the requested UUID */
 };
 
 static const char * const mc_blob_why[] = {
 	"allowed", "no pins", "SP trustlet", "short", "magic", "service type",
-	"uuid not pinned", "sha256 mismatch",
+	"uuid not pinned", "sha256 mismatch", "uuid not the requested uuid",
 };
+
+/* Is there a pin for this UUID at all? */
+static inline int mc_blob_pinned(const u8 *uuid, const struct mc_blob_pin *pins,
+				 int npins)
+{
+	int i;
+
+	/* MC_PIN_MAX: an explicit bound for FORTIFY_SOURCE (pin arrays hold 4) */
+	for (i = 0; i < npins && i < MC_PIN_MAX; i++)
+		if (!memcmp(pins[i].uuid, uuid, MC_PIN_UUID_LEN))
+			return 1;
+	return 0;
+}
 
 /* Byte length of a DT pin list -> number of pins, or -1 if malformed. */
 static inline int mc_blob_pins_count(int nbytes)
@@ -51,14 +65,17 @@ static inline int mc_blob_pins_count(int nbytes)
 
 /*
  * data/len/header_length: the tee_object. want_type: SERVICE_TYPE_DRIVER
- * (admin LOAD_DRIVER) or SERVICE_TYPE_SYSTEM_TRUSTLET (open-trustlet).
+ * (admin LOAD_DRIVER) or SERVICE_TYPE_SYSTEM_TRUSTLET (open-trustlet and the
+ * guarded registry path). want_uuid: NULL for a client/daemon-chosen blob
+ * (open-trustlet, LOAD_DRIVER); the requested UUID for a registry blob, whose
+ * header must then name exactly that UUID.
  * Out: digest (zero unless hashed), *uuid (NULL if no header), *type.
  * The SHA-256 covers the whole copy (data[0..len)), i.e. the exact vendor
  * file bytes for a system trustlet or driver (header_length == 0).
  */
 static inline enum mc_blob_verdict
 mc_blob_check(const u8 *data, size_t len, u32 header_length, u32 want_type,
-	      const struct mc_blob_pin *pins, int npins,
+	      const u8 *want_uuid, const struct mc_blob_pin *pins, int npins,
 	      u8 digest[MC_PIN_SHA_LEN], const u8 **uuid, u32 *type)
 {
 	const struct mclf_header_v2 *h = (const void *)data;
@@ -80,6 +97,8 @@ mc_blob_check(const u8 *data, size_t len, u32 header_length, u32 want_type,
 		return MC_BLOB_MAGIC;
 	if ((u32)h->service_type != want_type)
 		return MC_BLOB_TYPE;
+	if (want_uuid && memcmp(h->uuid.value, want_uuid, MC_PIN_UUID_LEN))
+		return MC_BLOB_REQ_UUID;
 	sha256(data, len, digest);
 	for (i = 0; i < npins; i++) {
 		if (memcmp(pins[i].uuid, h->uuid.value, MC_PIN_UUID_LEN))

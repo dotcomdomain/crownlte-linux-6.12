@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Host fixture for the crownlte T3 blob guard (blob_guard.h, used verbatim).
+ * Host fixture for the crownlte T3 blob guard (blob_guard.h and
+ * registry_guard.h, both used verbatim).
  * Feeds the real vendor TA/driver blobs, modified copies and synthetic
- * headers through mc_blob_check() with the T3 pin lists.
+ * headers through mc_blob_check() with the T3 pin lists, and drives the
+ * guarded registry path mc_registry_object() (OPEN_SESSION / GP
+ * open-session) against a stub daemon (tee_object_get) and a stub SWd
+ * selection (tee_object_select) that count calls, allocations and frees.
  *
  * Build/run (from MobiCoreDriver/):
  *   cc -O1 -Wall -Wextra -Werror -I. tests/blob-guard-fixture.c -o /tmp/bgf -lcrypto
@@ -13,6 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <errno.h>
 #include <linux/types.h>
 #include <openssl/sha.h>
 
@@ -28,6 +34,74 @@ static void sha256(const u8 *data, unsigned int len, u8 *out)
 }
 
 #include "blob_guard.h"
+
+/* ---- stubs for registry_guard.h: struct tee_object as in mcp.h ---- */
+struct tee_object {
+	u32	length;
+	u32	header_length;
+	u8	data[];
+};
+#define MAX_ERRNO 4095
+static inline void *ERR_PTR(long e) { return (void *)e; }
+static inline long PTR_ERR(const void *p) { return (long)p; }
+static inline int IS_ERR(const void *p)
+{
+	return (unsigned long)p >= (unsigned long)-MAX_ERRNO;
+}
+
+/* What the stub daemon answers to GET_TRUSTLET. */
+static struct {
+	const u8 *data;
+	size_t len;
+	u32 hl;		/* SP object: header_length (lengths info) before data */
+	int err;	/* nonzero: this error instead of data */
+} daemon;
+static int n_get, n_select, n_alloc, n_free;
+
+static struct tee_object *obj_new(u32 hl, const u8 *data, size_t len)
+{
+	struct tee_object *o = calloc(1, sizeof(*o) + hl + len + 1);
+
+	if (!o) {
+		printf("FAIL out of memory\n");
+		exit(1);
+	}
+	o->header_length = hl;
+	o->length = (u32)len;
+	if (len)
+		memcpy(o->data + hl, data, len);
+	n_alloc++;
+	return o;
+}
+
+static struct tee_object *tee_object_get(const struct mc_uuid_t *uuid, bool gp)
+{
+	(void)uuid;
+	(void)gp;
+	n_get++;
+	if (daemon.err)
+		return ERR_PTR(daemon.err);
+	return obj_new(daemon.hl, daemon.data, daemon.len);
+}
+
+/* As admin.c: a bare MCLF header holding only the UUID. */
+static struct tee_object *tee_object_select(const struct mc_uuid_t *uuid)
+{
+	struct mclf_header_v2 h;
+
+	n_select++;
+	memset(&h, 0, sizeof(h));
+	memcpy(&h.uuid, uuid, sizeof(h.uuid));
+	return obj_new(0, (const u8 *)&h, sizeof(h));
+}
+
+static void tee_object_free(struct tee_object *o)
+{
+	n_free++;
+	free(o);
+}
+
+#include "registry_guard.h"
 
 _Static_assert(sizeof(struct mclf_header_v2) == 76, "MCLF v2 header size");
 _Static_assert(offsetof(struct mclf_header_v2, service_type) == 16, "type offset");
@@ -98,7 +172,7 @@ static void expect(const char *name, const u8 *data, size_t len, u32 hl, u32 typ
 	u8 d[32];
 	const u8 *uuid;
 	u32 t;
-	enum mc_blob_verdict v = mc_blob_check(data, len, hl, type, pins, n, d, &uuid, &t);
+	enum mc_blob_verdict v = mc_blob_check(data, len, hl, type, NULL, pins, n, d, &uuid, &t);
 
 	checks++;
 	if (v != want) {
@@ -107,6 +181,72 @@ static void expect(const char *name, const u8 *data, size_t len, u32 hl, u32 typ
 	} else {
 		printf("ok   %-44s %s\n", name, mc_blob_why[v]);
 	}
+}
+
+static const char * const src_name[] = {"refused", "swd-select", "pinned-registry"};
+
+/*
+ * One OPEN_SESSION / GP open-session through mc_registry_object(). want_src,
+ * want_v (MC_REG_PINNED with no fetch error), want_ret: 0 = object returned,
+ * else the -errno. want_get/want_sel: calls into the daemon / SWd selection.
+ * A returned registry object must be the daemon's bytes, a selection object
+ * must name the requested UUID; nothing may leak or be freed twice.
+ */
+static void reg_expect(const char *name, const u8 *req, bool gp, bool ta_auth,
+		       const struct mc_blob_pin *pins, int npins,
+		       enum mc_reg_source want_src, enum mc_blob_verdict want_v,
+		       int want_ret, int want_get, int want_sel)
+{
+	struct mc_uuid_t uuid;
+	struct mc_reg_result r;
+	struct tee_object *o;
+	int ret, bad = 0;
+
+	memcpy(uuid.value, req, 16);
+	n_get = n_select = n_alloc = n_free = 0;
+	o = mc_registry_object(&uuid, gp, ta_auth, pins, npins, &r);
+	ret = IS_ERR(o) ? (int)PTR_ERR(o) : 0;
+	checks++;
+	if (r.source != want_src || ret != want_ret || n_get != want_get ||
+	    n_select != want_sel)
+		bad = 1;
+	if (want_src == MC_REG_PINNED && !want_ret && r.verdict != MC_BLOB_ALLOWED)
+		bad = 1;
+	if (want_src == MC_REG_PINNED && !daemon.err && r.verdict != want_v)
+		bad = 1;
+	if (!IS_ERR(o)) {
+		if (r.source == MC_REG_PINNED &&
+		    (o->length != daemon.len || o->header_length ||
+		     memcmp(o->data, daemon.data, daemon.len) ||
+		     memcmp(o->data + 24, req, 16)))
+			bad = 1;
+		if (r.source == MC_REG_SWD_SELECT &&
+		    (o->length != sizeof(struct mclf_header_v2) ||
+		     memcmp(o->data + 24, req, 16)))
+			bad = 1;
+		tee_object_free(o);
+	}
+	if (n_alloc != n_free)
+		bad = 1;
+	if (bad) {
+		fails++;
+		printf("FAIL %-44s got %s/%s ret=%d get=%d sel=%d alloc=%d free=%d\n",
+		       name, src_name[r.source], mc_blob_why[r.verdict], ret,
+		       n_get, n_select, n_alloc, n_free);
+	} else {
+		printf("ok   %-44s %s/%s ret=%d get=%d sel=%d\n", name,
+		       src_name[r.source],
+		       r.source == MC_REG_PINNED && !daemon.err ? mc_blob_why[r.verdict] : "-",
+		       ret, n_get, n_select);
+	}
+}
+
+static void answer(const u8 *data, size_t len, u32 hl, int err)
+{
+	daemon.data = data;
+	daemon.len = len;
+	daemon.hl = hl;
+	daemon.err = err;
 }
 
 int main(int argc, char **argv)
@@ -194,6 +334,119 @@ int main(int argc, char **argv)
 	expect("75-byte blob", km.data, 75, 0, TL, tl, 2, MC_BLOB_SHORT);
 	expect("0-byte blob", km.data, 0, 0, TL, tl, 2, MC_BLOB_SHORT);
 	free(m);
+
+	/*
+	 * Registry path (OPEN_SESSION / GP open-session, guard on, UUID already
+	 * on the allow list). tl = {KM, GK} with real digests.
+	 */
+	{
+		static const u8 FSD2[16] = {7, 5, 5, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20};
+		static const u8 DBG[16] = {8, 5, 5, 0};
+		const enum mc_reg_source P = MC_REG_PINNED, S = MC_REG_SWD_SELECT,
+			R = MC_REG_REFUSED;
+		const enum mc_blob_verdict OK = MC_BLOB_ALLOWED;
+		const u8 *KMU = km.data + 24, *GKU = gk.data + 24, *SECU = sec.data + 24;
+		struct mc_blob_pin tl_sec[2];
+		size_t big = km.len > sec.len ? km.len : sec.len;
+		u8 *t = malloc(big + 1);
+
+		tl_sec[0] = pin(&km);
+		tl_sec[1] = pin(&sec);
+
+		answer(km.data, km.len, 0, 0);
+		reg_expect("reg: KM uuid, KM blob", KMU, false, true, tl, 2, P, OK, 0, 1, 0);
+		reg_expect("reg: KM uuid, KM blob, gp", KMU, true, true, tl, 2, P, OK, 0, 1, 0);
+		reg_expect("reg: KM uuid, KM blob, no TA auth", KMU, false, false, tl, 2, P, OK, 0, 1, 0);
+		answer(gk.data, gk.len, 0, 0);
+		reg_expect("reg: GK uuid, GK blob, gp", GKU, true, true, tl, 2, P, OK, 0, 1, 0);
+		/* Another pinned, correctly signed blob for the wrong UUID. */
+		reg_expect("reg: KM uuid, GK blob (pinned, other uuid)", KMU, false, true, tl, 2, P,
+			   MC_BLOB_REQ_UUID, -EPERM, 1, 0);
+		answer(km.data, km.len, 0, 0);
+		reg_expect("reg: GK uuid, KM blob, gp", GKU, true, true, tl, 2, P,
+			   MC_BLOB_REQ_UUID, -EPERM, 1, 0);
+		/* Tampered copies. */
+		memcpy(t, km.data, km.len);
+		t[km.len - 1] ^= 1;
+		answer(t, km.len, 0, 0);
+		reg_expect("reg: KM uuid, KM last byte flipped", KMU, false, true, tl, 2, P,
+			   MC_BLOB_DIGEST, -EPERM, 1, 0);
+		memcpy(t, km.data, km.len);
+		t[100] ^= 1;
+		reg_expect("reg: KM uuid, KM byte 100 flipped", KMU, false, true, tl, 2, P,
+			   MC_BLOB_DIGEST, -EPERM, 1, 0);
+		memcpy(t, km.data, km.len);
+		t[km.len] = 0;
+		answer(t, km.len + 1, 0, 0);
+		reg_expect("reg: KM uuid, KM plus 1 byte", KMU, false, true, tl, 2, P,
+			   MC_BLOB_DIGEST, -EPERM, 1, 0);
+		answer(t, km.len - 1, 0, 0);
+		reg_expect("reg: KM uuid, KM truncated by 1", KMU, false, true, tl, 2, P,
+			   MC_BLOB_DIGEST, -EPERM, 1, 0);
+		memcpy(t, km.data, km.len);
+		memcpy(t + 24, GKU, 16);
+		answer(t, km.len, 0, 0);
+		reg_expect("reg: KM uuid, KM body with GK uuid", KMU, false, true, tl, 2, P,
+			   MC_BLOB_REQ_UUID, -EPERM, 1, 0);
+		reg_expect("reg: GK uuid, KM body with GK uuid", GKU, false, true, tl, 2, P,
+			   MC_BLOB_DIGEST, -EPERM, 1, 0);
+		memcpy(t, km.data, km.len);
+		t[0] = 'X';
+		reg_expect("reg: KM uuid, bad magic", KMU, false, true, tl, 2, P,
+			   MC_BLOB_MAGIC, -EPERM, 1, 0);
+		/* Wrong type. */
+		memcpy(t, km.data, km.len);
+		t[16] = SERVICE_TYPE_SP_TRUSTLET;
+		reg_expect("reg: KM uuid, KM retyped SP", KMU, false, true, tl, 2, P,
+			   MC_BLOB_TYPE, -EPERM, 1, 0);
+		t[16] = SERVICE_TYPE_DRIVER;
+		reg_expect("reg: KM uuid, KM retyped driver", KMU, false, true, tl, 2, P,
+			   MC_BLOB_TYPE, -EPERM, 1, 0);
+		answer(sec.data, sec.len, 0, 0);
+		reg_expect("reg: KM uuid, sec driver blob", KMU, false, true, tl, 2, P,
+			   MC_BLOB_TYPE, -EPERM, 1, 0);
+		reg_expect("reg: sec uuid (pinned as tl), sec driver", SECU, false, true, tl_sec, 2, P,
+			   MC_BLOB_TYPE, -EPERM, 1, 0);
+		memcpy(t, sec.data, sec.len);
+		memcpy(t + 24, KMU, 16);
+		answer(t, sec.len, 0, 0);
+		reg_expect("reg: KM uuid, sec driver with KM uuid", KMU, false, true, tl, 2, P,
+			   MC_BLOB_TYPE, -EPERM, 1, 0);
+		/* SP object from the daemon (lengths info before the blob). */
+		answer(km.data, km.len, 8, 0);
+		reg_expect("reg: KM uuid, SP object", KMU, false, true, tl, 2, P,
+			   MC_BLOB_SP, -EPERM, 1, 0);
+		answer(km.data, 75, 0, 0);
+		reg_expect("reg: KM uuid, 75-byte blob", KMU, false, true, tl, 2, P,
+			   MC_BLOB_SHORT, -EPERM, 1, 0);
+		answer(km.data, 0, 0, 0);
+		reg_expect("reg: KM uuid, 0-byte blob", KMU, false, true, tl, 2, P,
+			   MC_BLOB_SHORT, -EPERM, 1, 0);
+		/* Pinned UUID, daemon has nothing: no fallback to SWd selection. */
+		answer(NULL, 0, 0, -ENOENT);
+		reg_expect("reg: KM uuid, daemon ENOENT", KMU, false, true, tl, 2, P,
+			   OK, -ENOENT, 1, 0);
+		answer(NULL, 0, 0, -EPIPE);
+		reg_expect("reg: KM uuid, daemon gone", KMU, true, true, tl, 2, P,
+			   OK, -EPIPE, 1, 0);
+		/* Unpinned UUIDs: SWd selection only, the daemon is never asked,
+		 * whatever it would have answered. */
+		answer(km.data, km.len, 0, 0);
+		reg_expect("reg: FSD2, daemon would send KM", FSD2, false, true, tl, 2, S,
+			   OK, 0, 0, 1);
+		reg_expect("reg: DebugSession, daemon would send KM", DBG, false, true, tl, 2, S,
+			   OK, 0, 0, 1);
+		reg_expect("reg: FSD2 gp", FSD2, true, true, tl, 2, S, OK, 0, 0, 1);
+		reg_expect("reg: KM uuid, GK-only pins", KMU, false, true, gk_only, 1, S,
+			   OK, 0, 0, 1);
+		reg_expect("reg: KM uuid, no trustlet pins", KMU, false, true, tl, 0, S,
+			   OK, 0, 0, 1);
+		reg_expect("reg: FSD2, no TA auth", FSD2, false, false, tl, 2, R,
+			   OK, -EPERM, 0, 0);
+		reg_expect("reg: KM uuid, no pins, no TA auth", KMU, true, false, tl, 0, R,
+			   OK, -EPERM, 0, 0);
+		free(t);
+	}
 
 	/* DT list sizes. */
 	{
