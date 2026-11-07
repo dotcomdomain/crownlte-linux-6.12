@@ -51,6 +51,27 @@
  * reset from a cpuhp online callback and again on each CPU right before it
  * is armed, and clears a latched GRP2 event of its own core (counted as
  * stale_grp2) before every cal_cpu_disable().
+ *
+ * Self-recovery chain (S0, roadmap/c2-runtime-design.md 4.0). Runs whenever
+ * the driver is set up, armed or not:
+ *  - Lost-core detector: every 2 s a work on CPU0 pings (async csd) each CPU
+ *    that has sat in the firmware stage for more than 1 s, and once more
+ *    with a reschedule IPI. No answer within 2 x 200 ms means lost: a
+ *    "C2-LOST" dump, the quarantine marker, everything disarmed, the
+ *    watchdog no longer petted (reset within 30 s), then orderly_reboot().
+ *  - Quarantine marker: one 4 KB no-map reserved-memory page (DT
+ *    memory-region of this node) that survives a watchdog reset. A recorded
+ *    LITTLE loss keeps LITTLE C2 off on later boots, a recorded big loss
+ *    keeps all C2 off, until root writes c2_quarantine_clear. Without the
+ *    page, samsung,c2-boot-cpus is refused.
+ *  - Drills (diag DTBs only): samsung,c2-lost-drill = <cpu ms> simulates a
+ *    loss of <cpu> at <ms> boot time and waits for the watchdog reset;
+ *    samsung,c2-loss-drill-ms arms cpu1-3 (the known EL3 failure) for that
+ *    long.
+ * Boot arming (S1): samsung,c2-boot-cpus is applied from a work at
+ * samsung,c2-arm-delay-ms boot time. While the MCT broadcast device has not
+ * probed yet (the cpuidle probe runs first, link order), the work retries
+ * every second for up to 60 s.
  */
 
 #define pr_fmt(fmt) "exynos9810-cpuidle: " fmt
@@ -61,12 +82,15 @@
 #include <linux/cpuhotplug.h>
 #include <linux/cpuidle.h>
 #include <linux/cpumask.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/io.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/percpu.h>
 #include <linux/platform_device.h>
 #include <linux/psci.h>
@@ -78,6 +102,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/spinlock.h>
+#include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
 #include <uapi/linux/psci.h>
@@ -88,6 +113,7 @@
 #include <asm/suspend.h>
 
 #include <soc/samsung/cal-if.h>
+#include <soc/samsung/crownlte-wdt.h>
 #include <soc/samsung/exynos9810-mct-bc.h>
 
 #include "dt_idle_states.h"
@@ -193,6 +219,8 @@ struct e9810_stats {
 static struct e9810_cluster e9810_clusters[E9810_NR_CLUSTERS];
 static DEFINE_PER_CPU(struct e9810_stats, e9810_stats);
 static DEFINE_PER_CPU(u32, e9810_stage);
+/* jiffies when the CPU last entered the firmware stage (lost-core detector) */
+static DEFINE_PER_CPU(unsigned long, e9810_fw_jiffies);
 /* C2 hook resets (cal_cpu_enable() on the CPU) and the last CAL result. */
 static DEFINE_PER_CPU(u32, e9810_hooks_reset);
 static DEFINE_PER_CPU(int, e9810_hooks_ret);
@@ -247,7 +275,20 @@ static int e9810_little_limit_cfg = E9810_LITTLE_LIMIT_DEFAULT;
  * is not known. BIG C2 never failed. See cpuidle-secondaries-q22b.md.
  */
 static bool e9810_little_c2;
+static bool e9810_little_c2_cfg;	/* DT value, restored after the loss drill */
 static atomic_t e9810_little_in_c2 = ATOMIC_INIT(0);
+
+/*
+ * Quarantine in force this boot, from the marker an earlier boot wrote
+ * (E9810_QF_*). Set at probe before anything can be armed.
+ */
+#define E9810_QF_LITTLE			BIT(0)	/* a LITTLE core was lost */
+#define E9810_QF_BIG			BIT(1)	/* a big core was lost */
+#define E9810_QF_DRILL			BIT(2)	/* recorded by a drill */
+static u32 e9810_quarantine;
+
+/* Compared by address: the only refusal the boot arming retries. */
+static const char e9810_why_no_mct[] = "MCT tick broadcast not active";
 
 /* Called with interrupts off from the idle path: no plain printk here. */
 static void e9810_disable_deep(const char *why)
@@ -350,6 +391,8 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	}
 
 	st->c2_enter++;
+	/* Ordered before the stage by the DSB in e9810_set_stage(). */
+	this_cpu_write(e9810_fw_jiffies, jiffies);
 	e9810_set_stage(E9810_ST_FIRMWARE);
 	ret = psci_cpu_suspend_enter(cl->psci_state[idx]);
 	e9810_set_stage(E9810_ST_CAL_ON);
@@ -598,8 +641,15 @@ static const char *e9810_arm_refused(unsigned int cpu)
 {
 	if (e9810_setup_why)
 		return e9810_setup_why;
+	/* CPU0 owns every SPI, the MCT broadcast and the C2-LOST detector. */
+	if (cpu == 0)
+		return "CPU0 is never armed";
 	if (!e9810_clusters[e9810_cluster_of[cpu]].registered)
 		return "cluster not registered";
+	if (e9810_quarantine & E9810_QF_BIG)
+		return "C2 quarantined (all): a big core was lost on an earlier boot";
+	if (e9810_cluster_of[cpu] == 0 && (e9810_quarantine & E9810_QF_LITTLE))
+		return "C2 quarantined (LITTLE): a LITTLE core was lost on an earlier boot";
 	if (e9810_cluster_of[cpu] == 0 && !e9810_little_c2)
 		return "LITTLE C2 disabled (cores lost in EL3 in q22b/q40/q43; DT samsung,c2-little-enable)";
 	if (!cpu_online(cpu))
@@ -607,7 +657,7 @@ static const char *e9810_arm_refused(unsigned int cpu)
 	if (atomic_read(&e9810_deep_off))
 		return "deep idle disabled";
 	if (!exynos9810_mct_bc_ready())
-		return "MCT tick broadcast not active";
+		return e9810_why_no_mct;
 	return NULL;
 }
 
@@ -684,6 +734,19 @@ static void e9810_disarm_all(void)
 		e9810_state_disable(cpu, true);
 	cpumask_clear(&e9810_armed);
 	/* Both gates closed before the idle CPUs are kicked. */
+	smp_mb();
+	mutex_unlock(&e9810_arm_lock);
+	wake_up_all_idle_cpus();
+}
+
+static void e9810_disarm_mask(const struct cpumask *mask)
+{
+	unsigned int cpu;
+
+	mutex_lock(&e9810_arm_lock);
+	for_each_cpu(cpu, mask)
+		e9810_state_disable(cpu, true);
+	cpumask_andnot(&e9810_armed, &e9810_armed, mask);
 	smp_mb();
 	mutex_unlock(&e9810_arm_lock);
 	wake_up_all_idle_cpus();
@@ -1440,6 +1503,731 @@ static void e9810_log_setup(void)
 	}
 }
 
+/* ------------------------------------------------------------------------ */
+/* S0: self-recovery chain                                                  */
+/* ------------------------------------------------------------------------ */
+
+#define E9810_DET_PERIOD_MS		2000
+#define E9810_DET_FW_MIN_MS		1000
+#define E9810_DET_PING_MS		200
+#define E9810_STATS_PERIOD_MS		(10 * 60 * 1000)
+#define E9810_ARM_RETRY_MS		1000
+#define E9810_ARM_RETRY_MAX_MS		60000
+#define E9810_ARM_DELAY_MAX_MS		600000
+#define E9810_DRILL_MS_MAX		600000
+/* A drill waits this long for the watchdog reset before rebooting itself. */
+#define E9810_DRILL_REBOOT_MS		45000
+/* Still alive this long after a loss: emergency_restart(). */
+#define E9810_LAST_RESORT_MS		75000
+
+/*
+ * Quarantine marker, one page of no-map reserved memory, u32 words. Valid
+ * only with magic, version and a CRC32 over the words before it. Written
+ * through a write-combining mapping and a DSB, so a watchdog reset right
+ * after the write keeps it.
+ */
+enum {
+	QM_MAGIC, QM_VERSION, QM_BOOTS, QM_FLAGS, QM_CPUS, QM_UPTIME_MS,
+	QM_REASON, QM_LOSSES, QM_CRC, QM_WORDS
+};
+#define E9810_QM_MAGIC			0x51324339	/* "9C2Q" */
+#define E9810_QM_VERSION		1
+
+enum {
+	E9810_QR_NONE,
+	E9810_QR_DETECTOR,	/* the runtime lost-core detector */
+	E9810_QR_SELFTEST,	/* a self-test phase, not recovered */
+	E9810_QR_DRILL,		/* samsung,c2-lost-drill (simulated) */
+};
+
+static const char * const e9810_qr_name[] = {
+	[E9810_QR_NONE]		= "none",
+	[E9810_QR_DETECTOR]	= "detector",
+	[E9810_QR_SELFTEST]	= "selftest",
+	[E9810_QR_DRILL]	= "drill",
+};
+
+static u32 *e9810_qm;			/* mapped marker, NULL if none */
+static phys_addr_t e9810_qm_phys;
+static const char *e9810_qm_why = "not probed";
+static u32 e9810_qm_boot[QM_WORDS];	/* as found at probe */
+static DEFINE_SPINLOCK(e9810_qm_lock);
+
+struct e9810_det_ping {
+	call_single_data_t csd;
+	unsigned long sent;
+	unsigned long ack;		/* written by the target */
+};
+static DEFINE_PER_CPU(struct e9810_det_ping, e9810_det_ping);
+
+static struct delayed_work e9810_det_work;
+static u64 e9810_det_scans, e9810_det_pings;
+static unsigned long e9810_stats_next;
+/* CPUs a self-test phase watches itself (20 ms pings, its own recovery). */
+static struct cpumask e9810_selftest_cpus;
+
+static atomic_t e9810_lost_fired = ATOMIC_INIT(0);
+static bool e9810_lost_drill;
+static struct delayed_work e9810_reboot_work;
+static struct delayed_work e9810_last_resort_work;
+
+/* samsung,c2-lost-drill = <cpu ms> */
+static unsigned int e9810_drill_cpu = UINT_MAX;
+static u32 e9810_drill_at_ms;
+static bool e9810_drill_fired;
+
+/* Boot arming (samsung,c2-boot-cpus) and samsung,c2-loss-drill-ms. */
+static struct delayed_work e9810_arm_work;
+static struct cpumask e9810_boot_mask;
+static unsigned long e9810_arm_deadline;
+static bool e9810_arm_retrying;
+static u32 e9810_loss_drill_ms;
+static struct delayed_work e9810_loss_drill_work;
+
+static u64 e9810_boot_ms(void)
+{
+	return ktime_to_ms(ktime_get_boottime());
+}
+
+static u32 e9810_qm_crc(const u32 *w)
+{
+	return crc32_le(~0U, (const u8 *)w, QM_CRC * sizeof(u32)) ^ ~0U;
+}
+
+/* Caller holds e9810_qm_lock (or runs at probe). */
+static void e9810_qm_store(u32 *w)
+{
+	unsigned int i;
+
+	w[QM_CRC] = e9810_qm_crc(w);
+	for (i = 0; i < QM_WORDS; i++)
+		WRITE_ONCE(e9810_qm[i], w[i]);
+	/* Out of the write buffers before anything else happens. */
+	dsb(sy);
+}
+
+static void e9810_qm_load(u32 *w)
+{
+	unsigned int i;
+
+	for (i = 0; i < QM_WORDS; i++)
+		w[i] = READ_ONCE(e9810_qm[i]);
+}
+
+static const char *e9810_qm_flags_str(u32 flags)
+{
+	if (flags & E9810_QF_BIG)
+		return "all";
+	if (flags & E9810_QF_LITTLE)
+		return "LITTLE";
+	return "none";
+}
+
+static const char *e9810_qr_str(u32 reason)
+{
+	return reason < ARRAY_SIZE(e9810_qr_name) ? e9810_qr_name[reason] : "?";
+}
+
+/*
+ * Map the marker page, take over its quarantine and count this boot. A
+ * missing or invalid record (cold boot, other kernels) starts a clean one.
+ */
+static void e9810_qm_init(struct device *dev)
+{
+	struct device_node *mnp;
+	struct reserved_mem *rmem;
+	u32 w[QM_WORDS];
+	bool nomap;
+
+	mnp = of_parse_phandle(dev->of_node, "memory-region", 0);
+	if (!mnp) {
+		e9810_qm_why = "no memory-region in the cpuidle node";
+		goto none;
+	}
+	rmem = of_reserved_mem_lookup(mnp);
+	nomap = of_property_read_bool(mnp, "no-map");
+	of_node_put(mnp);
+	if (!rmem || rmem->size < QM_WORDS * sizeof(u32)) {
+		e9810_qm_why = "memory-region is not a reserved-memory region";
+		goto none;
+	}
+	/* Mapped write-combining; the linear map must not alias it. */
+	if (!nomap) {
+		e9810_qm_why = "memory-region is not no-map";
+		goto none;
+	}
+	e9810_qm = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
+	if (IS_ERR_OR_NULL(e9810_qm)) {
+		e9810_qm = NULL;
+		e9810_qm_why = "memremap failed";
+		goto none;
+	}
+	e9810_qm_phys = rmem->base;
+	e9810_qm_why = NULL;
+
+	e9810_qm_load(w);
+	if (w[QM_MAGIC] != E9810_QM_MAGIC || w[QM_VERSION] != E9810_QM_VERSION ||
+	    w[QM_CRC] != e9810_qm_crc(w)) {
+		pr_info("C2 quarantine marker at %pa: no valid record (magic %#x), starting a clean one\n",
+			&e9810_qm_phys, w[QM_MAGIC]);
+		memset(w, 0, sizeof(w));
+		w[QM_MAGIC] = E9810_QM_MAGIC;
+		w[QM_VERSION] = E9810_QM_VERSION;
+	}
+	w[QM_BOOTS]++;
+	memcpy(e9810_qm_boot, w, sizeof(w));
+	e9810_quarantine = w[QM_FLAGS] & (E9810_QF_LITTLE | E9810_QF_BIG);
+	e9810_qm_store(w);
+
+	if (e9810_quarantine)
+		pr_warn("C2 quarantined (%s): cpus %#x lost at %u ms (%s%s) on an earlier boot, %u losses, %u boots counted; LITTLE C2 off%s; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear\n",
+			e9810_qm_flags_str(e9810_quarantine), w[QM_CPUS],
+			w[QM_UPTIME_MS], e9810_qr_str(w[QM_REASON]),
+			(w[QM_FLAGS] & E9810_QF_DRILL) ? ", drill" : "",
+			w[QM_LOSSES], w[QM_BOOTS],
+			(e9810_quarantine & E9810_QF_BIG) ? ", big C2 off" : ", big C2 allowed",
+			dev_name(dev));
+	else
+		pr_info("C2 quarantine marker at %pa: clear (%u losses, %u boots counted)\n",
+			&e9810_qm_phys, w[QM_LOSSES], w[QM_BOOTS]);
+	return;
+none:
+	pr_warn("C2 quarantine marker not available: %s\n", e9810_qm_why);
+}
+
+/* Record a loss; the next boot keeps the lost cluster(s) out of C2. */
+static void e9810_qm_record(const struct cpumask *lost, u32 reason)
+{
+	unsigned long flags;
+	unsigned int cpu;
+	u32 w[QM_WORDS], f = 0;
+
+	if (!e9810_qm) {
+		pr_emerg("C2-LOST: no quarantine marker (%s): the next boot arms C2 again\n",
+			 e9810_qm_why);
+		return;
+	}
+	for_each_cpu(cpu, lost)
+		f |= e9810_cluster_of[cpu] ? E9810_QF_BIG : E9810_QF_LITTLE;
+	if (reason == E9810_QR_DRILL)
+		f |= E9810_QF_DRILL;
+
+	spin_lock_irqsave(&e9810_qm_lock, flags);
+	e9810_qm_load(w);
+	if (w[QM_MAGIC] != E9810_QM_MAGIC || w[QM_VERSION] != E9810_QM_VERSION ||
+	    w[QM_CRC] != e9810_qm_crc(w))
+		memcpy(w, e9810_qm_boot, sizeof(w));
+	w[QM_FLAGS] |= f;
+	w[QM_CPUS] |= (u32)(cpumask_bits(lost)[0] & 0xff);
+	w[QM_UPTIME_MS] = (u32)e9810_boot_ms();
+	w[QM_REASON] = reason;
+	w[QM_LOSSES]++;
+	e9810_qm_store(w);
+	e9810_qm_load(w);
+	spin_unlock_irqrestore(&e9810_qm_lock, flags);
+
+	pr_emerg("C2-LOST: quarantine marker written at %pa: flags=%#x cpus=%#x reason=%s losses=%u crc=%s; next boot: C2 quarantined (%s)\n",
+		 &e9810_qm_phys, w[QM_FLAGS], w[QM_CPUS], e9810_qr_str(reason),
+		 w[QM_LOSSES], w[QM_CRC] == e9810_qm_crc(w) ? "ok" : "BAD",
+		 e9810_qm_flags_str(w[QM_FLAGS]));
+}
+
+static void e9810_reboot_fn(struct work_struct *work)
+{
+	if (e9810_lost_drill)
+		pr_emerg("C2-LOST drill: FAIL: no watchdog reset %u s after petting stopped; orderly reboot\n",
+			 E9810_DRILL_REBOOT_MS / 1000);
+	orderly_reboot();
+}
+
+static void e9810_last_resort_fn(struct work_struct *work)
+{
+	pr_emerg("C2-LOST: still running %u s after the loss: emergency restart\n",
+		 E9810_LAST_RESORT_MS / 1000);
+	emergency_restart();
+}
+
+/*
+ * The end of the chain: dump, marker, disarm, stop petting the watchdog,
+ * reboot. Process context. A drill does not reboot by itself at first: it
+ * must prove that the watchdog resets the SoC.
+ */
+static void e9810_c2_lost(const struct cpumask *lost, u32 reason)
+{
+	bool drill = reason == E9810_QR_DRILL;
+	unsigned int cpu;
+	int t;
+
+	for_each_cpu(cpu, lost) {
+		struct e9810_regs r;
+		u32 bit = INTR_GEN_BIT(e9810_phycpu[cpu]);
+
+		e9810_read_regs(cpu, &r);
+		pr_emerg("C2-LOST cpu%u%s: no answer from C2 (%s): stage=%s fw_for=%ums status=%#x config=%#x inform=%#x event_grp2=%d grp1_en=%d grp1_pend=%d grp2_en=%d grp2_pend=%d pmucal_cpu_lock=%s armed=%*pbl\n",
+			 cpu, drill ? " (DRILL, simulated)" : "",
+			 e9810_qr_str(reason), e9810_stage_str(r.stage),
+			 r.stage == E9810_ST_FIRMWARE ?
+			 jiffies_to_msecs(jiffies -
+				READ_ONCE(per_cpu(e9810_fw_jiffies, cpu))) : 0,
+			 r.status, r.config, r.inform,
+			 !!(r.event_grp2 & bit), !!(r.grp1_en & bit),
+			 !!(r.grp1_pend & bit), !!(r.grp2_en & bit),
+			 !!(r.grp2_pend & bit),
+			 cal_cpu_lock_is_held() ? "HELD" : "free",
+			 cpumask_pr_args(&e9810_armed));
+	}
+	if (atomic_xchg(&e9810_lost_fired, 1)) {
+		pr_emerg("C2-LOST: %*pbl: reboot already under way\n",
+			 cpumask_pr_args(lost));
+		return;
+	}
+	e9810_lost_drill = drill;
+	/* A drill CPU is fine: the restart path may wait for it as usual. */
+	if (!drill)
+		cpumask_or(&e9810_lost, &e9810_lost, lost);
+
+	e9810_qm_record(lost, reason);
+	e9810_disable_deep(drill ? "C2-LOST drill" : "C2-LOST");
+	e9810_disarm_all();
+
+	t = crownlte_wdt_stop_petting(drill ? "C2-LOST drill" : "C2-LOST");
+	if (t < 0)
+		pr_emerg("C2-LOST: no armed watchdog (%d): relying on the reboot\n",
+			 t);
+	else
+		pr_emerg("C2-LOST: watchdog no longer petted: SoC reset within %d s\n",
+			 t);
+
+	queue_delayed_work_on(0, system_highpri_wq, &e9810_last_resort_work,
+			      msecs_to_jiffies(E9810_LAST_RESORT_MS));
+	if (drill) {
+		pr_emerg("C2-LOST drill: waiting for the watchdog reset; orderly reboot only if none within %u s\n",
+			 E9810_DRILL_REBOOT_MS / 1000);
+		queue_delayed_work_on(0, system_highpri_wq, &e9810_reboot_work,
+				      msecs_to_jiffies(E9810_DRILL_REBOOT_MS));
+	} else {
+		pr_emerg("C2-LOST: orderly reboot\n");
+		orderly_reboot();
+	}
+}
+
+static void e9810_det_ping_fn(void *info)
+{
+	struct e9810_det_ping *p = info;
+
+	smp_store_release(&p->ack, READ_ONCE(p->sent));
+}
+
+/* Wait until every CPU in @wait answered; answered ones are cleared. */
+static void e9810_det_wait(struct cpumask *wait, unsigned int ms)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(ms);
+	unsigned int cpu;
+
+	for (;;) {
+		for_each_cpu(cpu, wait) {
+			struct e9810_det_ping *p = per_cpu_ptr(&e9810_det_ping,
+							       cpu);
+
+			if (smp_load_acquire(&p->ack) == READ_ONCE(p->sent))
+				cpumask_clear_cpu(cpu, wait);
+		}
+		if (cpumask_empty(wait) || time_after(jiffies, end))
+			return;
+		usleep_range(1000, 2000);
+	}
+}
+
+/*
+ * @cand sat in the firmware stage for more than E9810_DET_FW_MIN_MS. A CPU
+ * that is merely in a long C2 period answers the ping within its exit
+ * latency (< 1 ms). Returns the CPUs that answered neither the csd ping nor,
+ * 200 ms later, a reschedule IPI followed by another 200 ms.
+ */
+static void e9810_det_check(const struct cpumask *cand, struct cpumask *lost)
+{
+	unsigned int cpu;
+
+	cpumask_copy(lost, cand);
+	for_each_cpu(cpu, cand) {
+		struct e9810_det_ping *p = per_cpu_ptr(&e9810_det_ping, cpu);
+
+		/* An unanswered earlier ping still owns the csd: wait for it. */
+		if (smp_load_acquire(&p->ack) != READ_ONCE(p->sent))
+			continue;
+		WRITE_ONCE(p->sent, p->sent + 1);
+		if (smp_call_function_single_async(cpu, &p->csd))
+			continue;
+		e9810_det_pings++;
+	}
+	e9810_det_wait(lost, E9810_DET_PING_MS);
+	if (cpumask_empty(lost))
+		return;
+	for_each_cpu(cpu, lost) {
+		pr_warn("C2 detector: cpu%u silent for %u ms in the firmware stage; second ping\n",
+			cpu, E9810_DET_PING_MS);
+		wake_up_if_idle(cpu);
+	}
+	e9810_det_wait(lost, E9810_DET_PING_MS);
+}
+
+static void e9810_log_stats(void)
+{
+	unsigned int cpu;
+
+	pr_info("c2 stats: armed=%*pbl lost=%*pbl deep_off=%d quarantine=%s det_scans=%llu det_pings=%llu uptime_ms=%llu\n",
+		cpumask_pr_args(&e9810_armed), cpumask_pr_args(&e9810_lost),
+		atomic_read(&e9810_deep_off),
+		e9810_qm_flags_str(e9810_quarantine), e9810_det_scans,
+		e9810_det_pings, e9810_boot_ms());
+	for_each_possible_cpu(cpu) {
+		struct e9810_stats st = per_cpu(e9810_stats, cpu);
+		struct cpuidle_device *dev = per_cpu(cpuidle_devices, cpu);
+		struct e9810_cluster *cl = &e9810_clusters[e9810_cluster_of[cpu]];
+		u64 usage = 0, time_ms = 0;
+
+		if (!st.c2_enter && !cpumask_test_cpu(cpu, &e9810_armed))
+			continue;
+		if (dev && cl->registered) {
+			usage = dev->states_usage[cl->c2_idx].usage;
+			time_ms = div_u64(dev->states_usage[cl->c2_idx].time_ns,
+					  NSEC_PER_MSEC);
+		}
+		pr_info("c2 stats: cpu%u enter=%llu resumed=%llu early=%llu psci_fail=%llu last_err=%d unarmed=%llu guarded=%llu wfi_fallback=%llu stale_grp2=%llu stage=%s c2_usage=%llu c2_time_ms=%llu\n",
+			cpu, st.c2_enter, st.c2_resumed, st.early, st.psci_fail,
+			st.last_err, st.unarmed, st.guarded, st.wfi_fallback,
+			st.stale_grp2,
+			e9810_stage_str(READ_ONCE(per_cpu(e9810_stage, cpu))),
+			usage, time_ms);
+	}
+}
+
+static void e9810_detect(struct work_struct *work)
+{
+	struct cpumask cand, lost;
+	unsigned int cpu;
+
+	/* Not during a restart or power-off; SYSTEM_SUSPEND passes by. */
+	if (system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF ||
+	    system_state == SYSTEM_RESTART || atomic_read(&e9810_lost_fired))
+		return;
+	e9810_det_scans++;
+
+	if (e9810_drill_cpu < nr_cpu_ids && !e9810_drill_fired &&
+	    e9810_boot_ms() >= e9810_drill_at_ms) {
+		e9810_drill_fired = true;
+		pr_emerg("C2-LOST drill: treating cpu%u as lost at %llu ms (simulated; the CPU is fine)\n",
+			 e9810_drill_cpu, e9810_boot_ms());
+		e9810_c2_lost(cpumask_of(e9810_drill_cpu), E9810_QR_DRILL);
+		return;
+	}
+
+	cpumask_clear(&cand);
+	for_each_online_cpu(cpu) {
+		unsigned long since;
+
+		if (!cpu || cpumask_test_cpu(cpu, &e9810_lost) ||
+		    cpumask_test_cpu(cpu, &e9810_selftest_cpus))
+			continue;
+		if (READ_ONCE(per_cpu(e9810_stage, cpu)) != E9810_ST_FIRMWARE)
+			continue;
+		/* Pairs with the DSB after the store in e9810_enter_c2(). */
+		smp_rmb();
+		since = READ_ONCE(per_cpu(e9810_fw_jiffies, cpu));
+		if (time_before(jiffies, since +
+				msecs_to_jiffies(E9810_DET_FW_MIN_MS)))
+			continue;
+		cpumask_set_cpu(cpu, &cand);
+	}
+	if (!cpumask_empty(&cand)) {
+		e9810_det_check(&cand, &lost);
+		if (!cpumask_empty(&lost)) {
+			e9810_c2_lost(&lost, E9810_QR_DETECTOR);
+			return;
+		}
+	}
+
+	if (time_after_eq(jiffies, e9810_stats_next)) {
+		e9810_stats_next = jiffies +
+				   msecs_to_jiffies(E9810_STATS_PERIOD_MS);
+		e9810_log_stats();
+	}
+	queue_delayed_work_on(0, system_highpri_wq, &e9810_det_work,
+			      msecs_to_jiffies(E9810_DET_PERIOD_MS));
+}
+
+/* samsung,c2-loss-drill-ms ran out without a loss. */
+static void e9810_loss_drill_end(struct work_struct *work)
+{
+	struct cpumask m;
+
+	if (atomic_read(&e9810_lost_fired))
+		return;
+	cpumask_clear(&m);
+	cpumask_set_cpu(1, &m);
+	cpumask_set_cpu(2, &m);
+	cpumask_set_cpu(3, &m);
+	e9810_disarm_mask(&m);
+	WRITE_ONCE(e9810_little_c2, e9810_little_c2_cfg);
+	WRITE_ONCE(e9810_little_limit, e9810_little_limit_cfg);
+	pr_warn("C2 loss drill: no core lost in %u ms (INCONCLUSIVE); cpu1-3 disarmed\n",
+		e9810_loss_drill_ms);
+}
+
+/* Arms cpu1-3, the configuration that lost a LITTLE core in q22b/q40/q43. */
+static void e9810_loss_drill_start(void)
+{
+	struct cpumask m;
+	const char *why;
+
+	cpumask_clear(&m);
+	cpumask_set_cpu(1, &m);
+	cpumask_set_cpu(2, &m);
+	cpumask_set_cpu(3, &m);
+	WRITE_ONCE(e9810_little_c2, true);
+	WRITE_ONCE(e9810_little_limit, 0);
+	why = e9810_arm(&m);
+	if (why) {
+		WRITE_ONCE(e9810_little_c2, e9810_little_c2_cfg);
+		WRITE_ONCE(e9810_little_limit, e9810_little_limit_cfg);
+		pr_warn("C2 loss drill: cannot arm 1-3: %s\n", why);
+		return;
+	}
+	pr_emerg("C2 loss drill: armed 1-3 (LITTLE, no concurrency limit) for %u ms at %llu ms: a lost core is expected; it must end in C2-LOST, a reboot and 'C2 quarantined (LITTLE)' on the next boot\n",
+		 e9810_loss_drill_ms, e9810_boot_ms());
+	queue_delayed_work_on(0, system_highpri_wq, &e9810_loss_drill_work,
+			      msecs_to_jiffies(e9810_loss_drill_ms));
+}
+
+static void e9810_arm_boot_fn(struct work_struct *work)
+{
+	const char *why;
+
+	if (atomic_read(&e9810_lost_fired))
+		return;
+	if (!e9810_arm_retrying)
+		e9810_arm_deadline = jiffies +
+				     msecs_to_jiffies(E9810_ARM_RETRY_MAX_MS);
+
+	if (!cpumask_empty(&e9810_boot_mask)) {
+		why = e9810_arm(&e9810_boot_mask);
+		if (why == e9810_why_no_mct &&
+		    time_before(jiffies, e9810_arm_deadline)) {
+			if (!e9810_arm_retrying)
+				pr_info("C2 boot arming of %*pbl waits for the MCT tick broadcast (every %u ms, up to %u ms)\n",
+					cpumask_pr_args(&e9810_boot_mask),
+					E9810_ARM_RETRY_MS,
+					E9810_ARM_RETRY_MAX_MS);
+			e9810_arm_retrying = true;
+			queue_delayed_work_on(0, system_highpri_wq,
+					      &e9810_arm_work,
+					      msecs_to_jiffies(E9810_ARM_RETRY_MS));
+			return;
+		}
+		if (why)
+			pr_warn("C2 boot arming of %*pbl refused: %s\n",
+				cpumask_pr_args(&e9810_boot_mask), why);
+		else
+			pr_info("C2 armed for %*pbl after MCT broadcast ready at %llu ms (armed at %llu ms)\n",
+				cpumask_pr_args(&e9810_boot_mask),
+				exynos9810_mct_bc_ready_ms(), e9810_boot_ms());
+	}
+	if (e9810_loss_drill_ms)
+		e9810_loss_drill_start();
+}
+
+static void e9810_boot_arm_setup(struct device_node *np)
+{
+	u32 bits = 0, delay = 0;
+	u64 now;
+
+	of_property_read_u32(np, "samsung,c2-boot-cpus", &bits);
+	if (!of_property_read_u32(np, "samsung,c2-loss-drill-ms",
+				  &e9810_loss_drill_ms))
+		e9810_loss_drill_ms = clamp_t(u32, e9810_loss_drill_ms, 1000,
+					      E9810_DRILL_MS_MAX);
+	cpumask_clear(&e9810_boot_mask);
+	bitmap_from_arr32(cpumask_bits(&e9810_boot_mask), &bits, 32);
+	cpumask_and(&e9810_boot_mask, &e9810_boot_mask, cpu_possible_mask);
+	if (cpumask_empty(&e9810_boot_mask) && !e9810_loss_drill_ms)
+		return;
+
+	if (!e9810_qm) {
+		pr_warn("C2 boot arming of %*pbl%s refused: no C2 quarantine marker (%s); a lost core could loop the reboots\n",
+			cpumask_pr_args(&e9810_boot_mask),
+			e9810_loss_drill_ms ? " and the loss drill" : "",
+			e9810_qm_why);
+		return;
+	}
+	if (e9810_quarantine & E9810_QF_BIG) {
+		pr_warn("C2 quarantined (all): boot arming of %*pbl%s skipped\n",
+			cpumask_pr_args(&e9810_boot_mask),
+			e9810_loss_drill_ms ? " and the loss drill" : "");
+		return;
+	}
+	if (e9810_quarantine & E9810_QF_LITTLE) {
+		if (e9810_loss_drill_ms)
+			pr_warn("C2 quarantined (LITTLE): loss drill skipped\n");
+		e9810_loss_drill_ms = 0;
+		if (cpumask_intersects(&e9810_boot_mask,
+				       &e9810_clusters[0].cpus)) {
+			cpumask_andnot(&e9810_boot_mask, &e9810_boot_mask,
+				       &e9810_clusters[0].cpus);
+			pr_warn("C2 quarantined (LITTLE): boot arming reduced to %*pbl\n",
+				cpumask_pr_args(&e9810_boot_mask));
+		}
+		if (cpumask_empty(&e9810_boot_mask))
+			return;
+	}
+
+	of_property_read_u32(np, "samsung,c2-arm-delay-ms", &delay);
+	delay = min_t(u32, delay, E9810_ARM_DELAY_MAX_MS);
+	now = e9810_boot_ms();
+	pr_info("C2 boot arming of %*pbl%s at %u ms boot time\n",
+		cpumask_pr_args(&e9810_boot_mask),
+		e9810_loss_drill_ms ? " + loss drill cpu1-3" : "", delay);
+	queue_delayed_work_on(0, system_highpri_wq, &e9810_arm_work,
+			      delay > now ? msecs_to_jiffies(delay - now) : 0);
+}
+
+static void e9810_drill_setup(struct device_node *np)
+{
+	u32 v[2];
+
+	if (of_property_read_u32_array(np, "samsung,c2-lost-drill", v, 2))
+		return;
+	if (!v[0] || v[0] >= nr_cpu_ids || v[1] > E9810_DRILL_MS_MAX) {
+		pr_warn("C2-LOST drill: ignored: cpu%u at %u ms (cpu 1..%u, at most %u ms)\n",
+			v[0], v[1], nr_cpu_ids - 1, E9810_DRILL_MS_MAX);
+		return;
+	}
+	e9810_drill_cpu = v[0];
+	e9810_drill_at_ms = v[1];
+	pr_warn("C2-LOST drill ENABLED: cpu%u is treated as lost at %u ms boot time (simulated); expect the marker, the watchdog reset within 30 s and 'C2 quarantined (%s)' on the next boot of this kernel\n",
+		e9810_drill_cpu, e9810_drill_at_ms,
+		e9810_cluster_of[e9810_drill_cpu] ? "all" : "LITTLE");
+}
+
+/* Root-only sysfs under the cpuidle platform device. */
+static ssize_t c2_armed_show(struct device *dev, struct device_attribute *a,
+			     char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(&e9810_armed));
+}
+static DEVICE_ATTR_ADMIN_RO(c2_armed);
+
+static ssize_t c2_lost_show(struct device *dev, struct device_attribute *a,
+			    char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n", cpumask_pr_args(&e9810_lost));
+}
+static DEVICE_ATTR_ADMIN_RO(c2_lost);
+
+static ssize_t c2_stats_show(struct device *dev, struct device_attribute *a,
+			     char *buf)
+{
+	unsigned int cpu;
+	int n = 0;
+
+	for_each_possible_cpu(cpu) {
+		struct e9810_stats st = per_cpu(e9810_stats, cpu);
+
+		n += sysfs_emit_at(buf, n, "cpu%u armed=%d stage=%s enter=%llu resumed=%llu early=%llu psci_fail=%llu unarmed=%llu guarded=%llu wfi_fallback=%llu stale_grp2=%llu last_err=%d\n",
+				   cpu, cpumask_test_cpu(cpu, &e9810_armed),
+				   e9810_stage_str(READ_ONCE(per_cpu(e9810_stage, cpu))),
+				   st.c2_enter, st.c2_resumed, st.early,
+				   st.psci_fail, st.unarmed, st.guarded,
+				   st.wfi_fallback, st.stale_grp2, st.last_err);
+	}
+	n += sysfs_emit_at(buf, n, "deep_off=%d det_scans=%llu det_pings=%llu\n",
+			   atomic_read(&e9810_deep_off), e9810_det_scans,
+			   e9810_det_pings);
+	return n;
+}
+static DEVICE_ATTR_ADMIN_RO(c2_stats);
+
+static ssize_t c2_quarantine_show(struct device *dev,
+				  struct device_attribute *a, char *buf)
+{
+	unsigned long flags;
+	u32 w[QM_WORDS];
+
+	if (!e9810_qm)
+		return sysfs_emit(buf, "marker=none (%s) in_force=%s\n",
+				  e9810_qm_why,
+				  e9810_qm_flags_str(e9810_quarantine));
+	spin_lock_irqsave(&e9810_qm_lock, flags);
+	e9810_qm_load(w);
+	spin_unlock_irqrestore(&e9810_qm_lock, flags);
+	return sysfs_emit(buf, "marker=%s flags=%#x (%s%s) cpus=%#x uptime_ms=%u reason=%s losses=%u boots=%u in_force=%s\n",
+			  w[QM_CRC] == e9810_qm_crc(w) ? "valid" : "INVALID",
+			  w[QM_FLAGS], e9810_qm_flags_str(w[QM_FLAGS]),
+			  (w[QM_FLAGS] & E9810_QF_DRILL) ? ", drill" : "",
+			  w[QM_CPUS], w[QM_UPTIME_MS], e9810_qr_str(w[QM_REASON]),
+			  w[QM_LOSSES], w[QM_BOOTS],
+			  e9810_qm_flags_str(e9810_quarantine));
+}
+static DEVICE_ATTR_ADMIN_RO(c2_quarantine);
+
+static ssize_t c2_quarantine_clear_store(struct device *dev,
+					 struct device_attribute *a,
+					 const char *buf, size_t count)
+{
+	unsigned long flags;
+	u32 w[QM_WORDS];
+	bool v;
+
+	if (kstrtobool(buf, &v) || !v)
+		return -EINVAL;
+	if (!e9810_qm)
+		return -ENODEV;
+	spin_lock_irqsave(&e9810_qm_lock, flags);
+	e9810_qm_load(w);
+	if (w[QM_MAGIC] != E9810_QM_MAGIC || w[QM_VERSION] != E9810_QM_VERSION ||
+	    w[QM_CRC] != e9810_qm_crc(w))
+		memcpy(w, e9810_qm_boot, sizeof(w));
+	w[QM_FLAGS] = 0;
+	w[QM_CPUS] = 0;
+	w[QM_UPTIME_MS] = 0;
+	w[QM_REASON] = E9810_QR_NONE;
+	e9810_qm_store(w);
+	spin_unlock_irqrestore(&e9810_qm_lock, flags);
+	pr_warn("C2 quarantine marker cleared from sysfs; takes effect on the next boot (in force now: %s)\n",
+		e9810_qm_flags_str(e9810_quarantine));
+	return count;
+}
+static DEVICE_ATTR_WO(c2_quarantine_clear);
+
+/* Kill switch: disarm every CPU now (until the next boot). */
+static ssize_t c2_disarm_store(struct device *dev, struct device_attribute *a,
+			       const char *buf, size_t count)
+{
+	bool v;
+
+	if (kstrtobool(buf, &v) || !v)
+		return -EINVAL;
+	/* No boot arming retry may re-arm afterwards. */
+	cancel_delayed_work_sync(&e9810_arm_work);
+	e9810_disarm_all();
+	pr_warn("C2 disarmed on every CPU from sysfs\n");
+	return count;
+}
+static DEVICE_ATTR_WO(c2_disarm);
+
+static struct attribute *e9810_attrs[] = {
+	&dev_attr_c2_armed.attr,
+	&dev_attr_c2_lost.attr,
+	&dev_attr_c2_stats.attr,
+	&dev_attr_c2_quarantine.attr,
+	&dev_attr_c2_quarantine_clear.attr,
+	&dev_attr_c2_disarm.attr,
+	NULL
+};
+
+static const struct attribute_group e9810_attr_group = {
+	.attrs = e9810_attrs,
+};
+
 /* Returns NULL on success or the failure reason; *failed_cpu is set. */
 static const char *e9810_run_phase(const struct e9810_phase *ph,
 				   struct e9810_ping *pings,
@@ -1485,6 +2273,8 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		if (!cpumask_test_cpu(on, &ph->cpus))
 			e9810_tl_start(cl, on);
 	}
+	/* This phase watches its CPUs itself; the runtime detector skips them. */
+	cpumask_or(&e9810_selftest_cpus, &e9810_selftest_cpus, &ph->cpus);
 	e9810_tl_mark("arm", ph->little_limit);
 	why = e9810_arm(&ph->cpus);
 	if (why) {
@@ -1662,6 +2452,9 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		       cpumask_pr_args(&unanswered), cpumask_pr_args(&lost));
 		e9810_tl_stop();
 		e9810_tl_dump(ph->name);
+		/* Not recovered: the S0 chain (marker, watchdog, reboot). */
+		if (!cpumask_empty(&lost))
+			e9810_c2_lost(&lost, E9810_QR_SELFTEST);
 	} else if (!e9810_keep_armed) {
 		e9810_disarm_all();
 	}
@@ -1712,6 +2505,7 @@ static const char *e9810_run_phase(const struct e9810_phase *ph,
 		bc1.write_timeouts - bc0.write_timeouts);
 
 stop_sleepers:
+	cpumask_andnot(&e9810_selftest_cpus, &e9810_selftest_cpus, &ph->cpus);
 	for_each_cpu(cpu, &ph->cpus) {
 		struct e9810_sleeper *s = &sl[cpu];
 		u64 deadline = ktime_get_ns() + 500 * NSEC_PER_MSEC;
@@ -1914,31 +2708,25 @@ static void e9810_selftest(struct work_struct *work)
 	}
 }
 
-static void e9810_arm_boot_cpus(struct device_node *np)
-{
-	struct cpumask mask;
-	const char *why;
-	u32 bits;
-
-	if (of_property_read_u32(np, "samsung,c2-boot-cpus", &bits) || !bits)
-		return;
-	cpumask_clear(&mask);
-	bitmap_from_arr32(cpumask_bits(&mask), &bits, 32);
-	cpumask_and(&mask, &mask, cpu_possible_mask);
-	why = e9810_arm(&mask);
-	if (why)
-		pr_warn("C2 boot arming of %*pbl refused: %s\n",
-			cpumask_pr_args(&mask), why);
-	else
-		pr_info("C2 armed at boot for %*pbl\n", cpumask_pr_args(&mask));
-}
-
 static int e9810_cpuidle_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
+	unsigned int cpu;
 	u32 lim;
+	int ret;
 
 	INIT_DELAYED_WORK(&e9810_lost_work, e9810_lost_remind);
+	INIT_DELAYED_WORK(&e9810_det_work, e9810_detect);
+	INIT_DELAYED_WORK(&e9810_arm_work, e9810_arm_boot_fn);
+	INIT_DELAYED_WORK(&e9810_loss_drill_work, e9810_loss_drill_end);
+	INIT_DELAYED_WORK(&e9810_reboot_work, e9810_reboot_fn);
+	INIT_DELAYED_WORK(&e9810_last_resort_work, e9810_last_resort_fn);
+	for_each_possible_cpu(cpu) {
+		struct e9810_det_ping *p = per_cpu_ptr(&e9810_det_ping, cpu);
+
+		INIT_CSD(&p->csd, e9810_det_ping_fn, p);
+	}
+
 	/* Before anything can be armed. */
 	if (!of_property_read_u32(np, "samsung,c2-little-limit", &lim) &&
 	    lim <= 4) {
@@ -1946,10 +2734,13 @@ static int e9810_cpuidle_probe(struct platform_device *pdev)
 		WRITE_ONCE(e9810_little_limit, lim);
 	}
 	e9810_little_c2 = of_property_read_bool(np, "samsung,c2-little-enable");
+	e9810_little_c2_cfg = e9810_little_c2;
 	pr_info("LITTLE C2 %s, cluster-0 C2 limit %d%s\n",
 		e9810_little_c2 ? "enabled" : "disabled (WFI only)",
 		e9810_little_limit_cfg,
 		e9810_little_limit_cfg ? "" : " (none)");
+	/* The quarantine an earlier boot recorded applies to every arming. */
+	e9810_qm_init(&pdev->dev);
 	e9810_setup_why = e9810_setup(pdev);
 	if (e9810_setup_why)
 		pr_warn("deep idle not available, WFI only: %s\n",
@@ -1959,8 +2750,20 @@ static int e9810_cpuidle_probe(struct platform_device *pdev)
 			e9810_clusters[0].registered,
 			e9810_clusters[1].registered);
 
-	if (!e9810_setup_why)
-		e9810_arm_boot_cpus(np);
+	ret = devm_device_add_group(&pdev->dev, &e9810_attr_group);
+	if (ret)
+		pr_warn("sysfs c2_* files not created (%d)\n", ret);
+
+	if (!e9810_setup_why) {
+		/* The S0 detector runs whether or not anything is armed. */
+		e9810_drill_setup(np);
+		queue_delayed_work_on(0, system_highpri_wq, &e9810_det_work,
+				      msecs_to_jiffies(E9810_DET_PERIOD_MS));
+		pr_info("C2-LOST detector running: every %u ms, ping after %u ms in firmware, %u ms per ping; watchdog stop-petting + reboot on loss\n",
+			E9810_DET_PERIOD_MS, E9810_DET_FW_MIN_MS,
+			E9810_DET_PING_MS);
+		e9810_boot_arm_setup(np);
+	}
 
 	e9810_keep_armed = of_property_read_bool(np,
 					"samsung,cpuidle-selftest-keep-armed");
