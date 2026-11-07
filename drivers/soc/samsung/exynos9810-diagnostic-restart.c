@@ -347,13 +347,38 @@ static long diagnostic_emergency_on_cpu(void *arg)
 	return -EIO;
 }
 
+/* arm64 is always SMP; the field only exists with CONFIG_SMP. */
+static bool diagnostic_caller_pinned(void)
+{
+#ifdef CONFIG_SMP
+	return current->migration_disabled;
+#else
+	return false;
+#endif
+}
+
 /*
  * The CPU is chosen and the work runs on it under the CPU hotplug read lock
  * (the work_on_cpu_safe() pattern, with the selection inside), so the chosen
  * CPU cannot go offline between the online check and the end of the work.
- * Deadlock analysis:
- *  - a hotplug operation already in progress: cpus_read_lock() waits for it;
- *    no hotplug callback waits for the A2 worker or this driver;
+ *
+ * Caller contract: process context; not migration-disabled; holding no CPU
+ * hotplug lock and no lock that a hotplug operation or its callbacks take.
+ * A migration-disabled caller deadlocks against an offline of its own CPU:
+ * the offline holds the hotplug write lock and waits in
+ * sched_cpu_wait_empty() for every task pinned to that CPU, the caller
+ * waits in cpus_read_lock() for the offline, and the work has not started,
+ * so none of the bounds below applies (Sol R4; the round 3 analysis missed
+ * this). Such a caller is therefore refused (-EDEADLK, with a warning)
+ * before any lock is taken. The A2 worker ends its pin before its reset
+ * fallback calls this.
+ *
+ * Deadlock analysis, for a caller that keeps the contract:
+ *  - a hotplug operation already in progress: cpus_read_lock() waits for it,
+ *    and it does not wait for the caller: an unpinned task is pushed off a
+ *    dying CPU (balance_push()), the workqueue offline callback unbinds a
+ *    per-CPU kworker caller without waiting for its work, and no hotplug
+ *    callback waits for the A2 worker or this driver;
  *  - a hotplug operation started later waits until the work returns (bounded
  *    by the 10 s transition wait and the bounded STOP) or the reset;
  *  - nothing in the work takes cpus_read_lock() again (a recursive read with
@@ -376,6 +401,12 @@ int exynos9810_diagnostic_emergency_restart(const char *reason)
 	int cpu;
 
 	might_sleep();
+	/* Contract above: a pinned caller could deadlock in cpus_read_lock(). */
+	if (WARN_ON_ONCE(diagnostic_caller_pinned())) {
+		pr_emerg("Diagnostic emergency restart (%s) refused: caller is migration-disabled (CPU hotplug deadlock risk)\n",
+			 reason);
+		return -EDEADLK;
+	}
 	cpus_read_lock();
 	/* the reboot CPU, as kernel_restart() -> migrate_to_reboot_cpu() */
 	cpu = reboot_cpu;

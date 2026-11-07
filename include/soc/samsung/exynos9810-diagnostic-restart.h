@@ -9,7 +9,10 @@
  * dump off), else the reason it cannot.
  *
  * exynos9810_diagnostic_emergency_restart(): process context only; must
- * not be called with the CPU hotplug lock held. On the reboot CPU (chosen
+ * not be called with the CPU hotplug lock (or a lock a hotplug operation
+ * takes) held, nor migration-disabled: it takes cpus_read_lock(), which a
+ * task pinned to a CPU being taken offline would wait for forever. A
+ * migration-disabled caller is refused (-EDEADLK). On the reboot CPU (chosen
  * and kept online under cpus_read_lock()), runs the restart preparation
  * (normal INFORM2/INFORM3, ACPM STOP per the reset policy), publishes its
  * own emergency preparation (which a concurrent restart(2) cannot clear)

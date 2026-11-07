@@ -800,6 +800,10 @@ static enum a2_stop_result a2_stop(struct abox_a2 *a, int n)
  *     again before each boot (a2_work_fn());
  *  3. only if that refuses as well: an orderly reboot (unbounded: it needs
  *     user space), which ends in the same diagnostic restart.
+ * Called by a2_work_fn() only after its migration pin ended: step 2 takes
+ * the CPU hotplug read lock, and a pinned caller would deadlock against an
+ * offline of its own CPU (that offline holds the hotplug write lock and
+ * waits in sched_cpu_wait_empty() for the pinned caller to unpin).
  */
 static void a2_end_left_running(struct abox_a2 *a)
 {
@@ -910,6 +914,24 @@ static void a2_work_fn(struct work_struct *w)
 	bool left_running = false;
 	int i, ret, boots = 0;
 
+	/*
+	 * Pinned to gate.cpu (the ABOX IRQ affinity) up to the out label, on
+	 * every path, never across the reset fallback. While pinned, an
+	 * offline of gate.cpu waits for this worker (sched_cpu_wait_empty()
+	 * under the hotplug write lock), so nothing below may wait for a CPU
+	 * hotplug operation: no cpus_read_lock(), and no lock or event whose
+	 * owner may wait for one. Taken while pinned (fix round 4 audit):
+	 * watchdog state reads (MMIO, wdt spinlock); the diagnostic restart
+	 * check (context mutex: its other holders, the restart preparation
+	 * and the emergency work, take no hotplug lock under it, and the
+	 * emergency work only runs after the pin ended); PMU regmap
+	 * (spinlock); request_firmware() (loader mutexes, user-helper wait
+	 * bounded by its timeout); runtime PM of the SysMMU (owner rpm_lock,
+	 * clock prepare/enable locks); enable_irq()/disable_irq(); the IPC
+	 * spinlock; sleeps, a bounded completion wait and bounded polls. A
+	 * hotplug operation on gate.cpu meanwhile is delayed by at most the
+	 * test, never blocked by it.
+	 */
 	migrate_disable();
 	pr_info(A2 "start uptime=%llu ms on CPU%d (pinned), boots wanted %u, run %u ms each\n",
 		div_u64(ktime_get_boottime_ns(), NSEC_PER_MSEC), smp_processor_id(),
@@ -964,7 +986,7 @@ static void a2_work_fn(struct work_struct *w)
 	ret = a2_request_firmware(a);
 	if (ret) {
 		a2_finish(a, false, "firmware (nothing written)", 0, 0);
-		goto out_fw;
+		goto out;
 	}
 
 	/* SysMMU on (supplier of this device, enabled with our domain) */
@@ -972,7 +994,7 @@ static void a2_work_fn(struct work_struct *w)
 	if (ret) {
 		dev_err(a->dev, "runtime resume (SysMMU) failed: %d\n", ret);
 		a2_finish(a, false, "sysmmu-resume (nothing written)", 0, 0);
-		goto out_fw;
+		goto out;
 	}
 	a->rpm_held = true;
 
@@ -1043,12 +1065,19 @@ static void a2_work_fn(struct work_struct *w)
 		fails = "incompatible";
 	a2_finish(a, !fails && !left_running && boots == a->boots_wanted, fails, boots,
 		  boot_ms_max);
-out_fw:
-	a2_release_firmware(a);	/* CPU-side copies; the DSP never sees them */
+out:
+	/*
+	 * The one exit, so the pin ends exactly once on every path, after
+	 * the last access that had to run on gate.cpu (the final PMU
+	 * snapshot) and before the reset fallback, which takes the CPU
+	 * hotplug read lock (fix round 4). left_running is false on every
+	 * early exit.
+	 */
+	migrate_enable();
+	/* CPU-side copies, the DSP never sees them; NULL (never requested) is a no-op */
+	a2_release_firmware(a);
 	if (left_running)
 		a2_end_left_running(a);
-out:
-	migrate_enable();
 }
 
 /* -- ABOX probe: map, allocate, IOMMU domain; no register access -- */
