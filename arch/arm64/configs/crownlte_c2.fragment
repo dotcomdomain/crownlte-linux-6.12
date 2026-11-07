@@ -3,9 +3,13 @@
 
 # Buddy hard-lockup detector: a CPU whose watchdog hrtimer stops (a core
 # lost in C2/EL3) is found by its buddy within about 12-24 s, and that
-# panics (panic=30 bootarg, the watchdog is no longer petted). arm64 has no
+# panics (panic=30 bootarg, then emergency_restart(); if the restart hangs,
+# the CL0 watchdog fires once nothing pets it any more). arm64 has no
 # pseudo-NMI on GICv2, so the perf detector is not usable and the buddy
 # detector is selected without HARDLOCKUP_DETECTOR_PREFER_BUDDY.
+# The panic path writes nothing: the C2 record already says "session
+# armed" (persisted before the first CPU was armed) and only a clean
+# restart/power-off clears that, so the next boot keeps all C2 off.
 CONFIG_HARDLOCKUP_DETECTOR=y
 CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=y
 # A soft lockup is reported only.
