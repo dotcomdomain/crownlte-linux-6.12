@@ -198,6 +198,34 @@
 		cpu_suspend = <0xc4000001>;
 	};
 
+	/*
+	 * System suspend (drivers/soc/samsung/exynos9810-pm.c). Values from
+	 * the 4.9 exynos-pm node (crownlte_eur_open_26 DT): suspend_mode_idx 8
+	 * (SYS_SLEEP), PSCI system-sleep power_state 0x03000000 and the
+	 * SYS_SLEEP column of wakeup-masks for PMU 0x610/0x614/0x618/0x644.
+	 * The registers are only mapped (PMUCAL, cpuidle, pinctrl, GIC, MCT
+	 * and ACPM own them): INTR_GEN, GPIO_ALIVE EINT mask/pend, GICD
+	 * pending, MCT FRC, FlexPMU debug counters (APM SRAM), APM mailbox.
+	 * Only suspend self-test DTBs enable it.
+	 */
+	system_suspend: system-suspend@14070000 {
+		compatible = "samsung,exynos9810-pm";
+		reg = <0x0 0x14070000 0x1000>,
+		      <0x0 0x14050000 0x1000>,
+		      <0x0 0x10101000 0x1000>,
+		      <0x0 0x10040000 0x800>,
+		      <0x0 0x0204f800 0x400>,
+		      <0x0 0x14100000 0x100>;
+		reg-names = "intr-gen", "gpio-alive", "gicd", "mct",
+			    "flexpmu-dbg", "apm-mailbox";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,sleep-mode-idx = <8>;
+		samsung,sleep-psci-state = <0x03000000>;
+		samsung,wakeup-mask-offsets = <0x610 0x614 0x618 0x644>;
+		samsung,wakeup-masks = <0xd00f7e7e 0xffff00ff 0xffff00ff 0x0>;
+		status = "disabled";
+	};
+
 	soc: soc@0 {
 		compatible = "simple-bus";
 		ranges = <0x0 0x0 0x0 0x20000000>;
