@@ -2,7 +2,8 @@
 
 Design: gekko `roadmap/audio-design.md`, section 5 "A2" (also 1.1, 2 item 5,
 3.2, 6). Branch `crownlte-audio-a2`. Build only; not run on the phone yet.
-Sol R1 (CHANGES) fixed in fix round 1 (section 13); not re-reviewed yet.
+Sol R1 (CHANGES) fixed in fix round 1, Sol R2 (CHANGES) fixed in fix
+round 2 (section 13); not re-reviewed yet.
 
 A2 boots the ABOX ("Calliope") audio DSP firmware in the DSP's own SRAM and
 in kernel DRAM buffers, waits for the firmware's "ready to sing" message,
@@ -122,6 +123,10 @@ unchanged (the DPU uses the same driver).
 ### 3.2 Self-test at `samsung,abox-a2-selftest-ms` (60 s), on CPU1 (pinned)
 
 1. Watchdog deadline still armed and at least 30 s away; re-verified.
+   Then the reset fallback (fix round 2): `exynos9810_diagnostic_restart_check()`
+   must report the diagnostic restart ready (context published, CAL up,
+   same chip revision as at its probe, INFORM2/INFORM3 normal, DFD dump
+   off; read-only). Otherwise FAIL `restart (nothing touched)`.
 2. PMU snapshot. Refuses with nothing written if pd-aud is off, or if the
    ABOX CPU is already on (STATUS bit0 or OPTION bit28 set).
 3. Reads SFR VERSION, SYSPOWER_CTRL/STATUS, SYSREG MISC_CON, CPU PC.
@@ -131,7 +136,9 @@ unchanged (the DPU uses the same driver).
    below the IPC area. Without firmware nothing is written.
 5. `pm_runtime_resume_and_get()` → the SysMMU translates
    (`enable #1 for 17c50000.abox`).
-6. Per boot (2 boots):
+6. Per boot (2 boots), each started only if the watchdog is still live
+   (deadline at least 20 s away) and the diagnostic restart is still ready
+   (else `fails: wdt` / `fails: restart`):
    1. ABOX GIC init (GICC PRIMASK 0xff, GICD CTRL 3, 40 priority words,
       GICC CTRL 3).
    2. `MISC_CON=1`, then the firmware copy: SRAM (rest zeroed), DRAM (rest
@@ -153,9 +160,19 @@ unchanged (the DPU uses the same driver).
       ends with `fails: stop`.
 7. GIC IRQ off.
 8. If the CPU is off: `ABOX_CPU_CONFIGURATION` bit0 is set back to its
-   boot value and the SysMMU is released (bypass). OPTION was 0 at boot
-   and stays 0.
-9. Result line, also in sysfs `a2_result`; `calliope_version` in sysfs.
+   boot value. OPTION was 0 at boot and stays 0.
+9. **The SysMMU is never released in this boot** (fix round 2, choice 1 of
+   Sol R2): the runtime-PM reference taken in step 5 is kept, so the
+   SysMMU never runtime-suspends (its runtime suspend writes
+   `CTRL_DISABLE`, which is bypass). The domain stays attached and the
+   DRAM/IVA buffers and the chip-ID page stay allocated until the next
+   reset, whatever the result (PASS, `stop`, `stop-unconfirmed`). A DMA
+   engine of the ABOX that is still active after the CPU reads off only
+   reaches A2's buffers; any other IOVA faults. `.suspend` refuses system
+   suspend for the rest of the boot (it would force the SysMMU into
+   bypass through `pm_runtime_force_suspend()`). Cost: 18.5 MiB + 1 page
+   of RAM and no system suspend until the reset.
+10. Result line, also in sysfs `a2_result`; `calliope_version` in sysfs.
 
 **If the CPU-off poll fails (stop unconfirmed)**, the DSP may still
 execute, so A2 gives back nothing it may use:
@@ -168,18 +185,46 @@ execute, so A2 gives back nothing it may use:
 - `.suspend` refuses system suspend.
 
 No further boot is started. After the result line (`dsp=LEFT-RUNNING`),
-A2 ends the boot through the guarded watchdog: it calls
-`s3c2410wdt_crownlte_stop_petting()` (the crownlte final stop: the
-counter is reloaded once, so the logs reach pstore, and then never
-again), so the CL0 watchdog resets the SoC within its timeout (30 s).
-Only if the guarded watchdog cannot do that (unbound or not running,
-which the self-test checked just before) does A2 call `orderly_reboot()`.
-A watchdog reset is preferred to a kernel reboot because the reboot path
-runs device shutdown with the DSP possibly still active.
+A2 ends the boot in a full-SoC reset and keeps all of the above until it:
+1. The guarded watchdog: `s3c2410wdt_crownlte_stop_petting()` (the
+   crownlte final stop: the counter is reloaded once, so the logs reach
+   pstore, and then never again), so the CL0 watchdog resets the SoC
+   within its timeout (30 s).
+2. Only if the guarded watchdog cannot do that (unbound or not running;
+   the self-test checked it just before each boot): the **diagnostic
+   emergency restart** (fix round 2),
+   `exynos9810_diagnostic_emergency_restart()` in
+   `exynos9810-diagnostic-restart.c`. It is the vehicle's normal restart
+   path (the ramdisk's `reboot` at 600 s, every ROM-RAM trial so far)
+   minus device shutdown:
+   - on the reboot CPU (CPU0, as `migrate_to_reboot_cpu()`), via
+     `work_on_cpu()`;
+   - takes `system_transition_mutex` (waits at most 10 s for a running
+     `reboot(2)`, whose command notifier would otherwise clear the
+     prepared state), then the context lock;
+   - re-runs the read-only check, then `diagnostic_prepare()`: INFORM2 =
+     0x12345678, INFORM3 = 0x12345670 (normal boot, verified), the ACPM
+     STOP per the reset policy (best effort with
+     `EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET=y`, as configured);
+   - then `emergency_restart()` → `machine_restart()` (IRQs off, other
+     CPUs stopped) → the priority-255 restart guard, which re-checks the
+     prerequisites and INFORM, runs the DFD preparation (a read-only no-op
+     because the check required the DFD dump off) and writes PMU
+     `SWRESET`. The guard returns `NOTIFY_STOP` in every case, so no other
+     restart handler runs.
+   A bare `emergency_restart()` would not work: the guard refuses unless
+   the preparation ran (`physical reset required`).
+3. Only if the diagnostic restart refuses before `emergency_restart()`
+   (not ready any more): `orderly_reboot()`, which is not bounded.
 
 The ABOX `.suspend` callback refuses system suspend while the test is
-pending or running, or while the DSP runs. `.shutdown` aborts the test
-and clears ENABLE_CPU.
+pending or running, and for the rest of the boot once the test has turned
+the SysMMU on. `.shutdown` aborts the test; if the DSP may still run it
+clears ENABLE_CPU and LOCAL_PWR_CFG, polls STATUS off for up to 100 ms
+and withdraws the DRAM request only if it reads off. It releases nothing
+else: the SysMMU keeps translating (the runtime-PM reference is never
+dropped and the SysMMU driver has no shutdown hook) until the reset that
+follows.
 
 ### 3.3 Writes in an A2 boot (all volatile)
 
@@ -193,8 +238,9 @@ and clears ENABLE_CPU.
 | ABOX GIC 0x17CF1000/0x17CF2000 | CTRL, PRIMASK, priorities, SGI (SOFTINT), EOI/DIR | 4.9 `abox_gic.c` |
 | ABOX SRAM 0x17D00000 | firmware image, IPC mailboxes | 4.9 |
 | kernel RAM (18.5 MiB, A2's own pages) | DRAM/IVA firmware images | 4.9 (`dma_alloc_coherent`) |
-| ABOX SysMMU 0x17E00000 | CTRL/CFG/PT_BASE/flush through the 9810 SysMMU driver | DPU SysMMU path |
+| ABOX SysMMU 0x17E00000 | CTRL/CFG/PT_BASE/flush through the 9810 SysMMU driver; enabled once at the self-test and never disabled in that boot (fix round 2) | DPU SysMMU path |
 | CL0 watchdog | deadline in the ping path; final stop (`s3c2410wdt_crownlte_stop_petting()`) only if the DSP stop is unconfirmed | A1 / S0 |
+| PMU INFORM2/INFORM3 (0x14060808/0x1406080c), ACPM STOP, PMU SWRESET (0x14060400) | only if the DSP stop is unconfirmed **and** the watchdog final stop is not possible: the diagnostic emergency restart (normal boot values, then reset) | the diagnostic restart of every `reboot` in the ROM-RAM vehicle |
 
 Not written: codec (SPI/GPIO reset), amps (HSI2C18 stays disabled, no
 child), S2MPS18 (no PMIC access at all), `/efs`, UAIF/DSIF pin mux,
@@ -213,6 +259,7 @@ child), S2MPS18 (no PMIC access at all), `/efs`, UAIF/DSIF pin mux,
 | 464b9cd3c | a slowest boot over 2 s is a warning, not a failure (AUD not raised) |
 | 898a21307 | this doc |
 | 5b15c8ece | fix round 1: chip-ID RAM snapshot, unconfirmed stop keeps everything and ends via the watchdog, SUSPEND ack required (section 13) |
+| fb47f58fa | fix round 2: SysMMU never released in the boot, suspend refused; diagnostic restart emergency entry points (`exynos9810_diagnostic_restart_check()`, `exynos9810_diagnostic_emergency_restart()`, `include/soc/samsung/exynos9810-diagnostic-restart.h`) as the reset fallback; confirmed CPU-off at shutdown; Kconfig `EXYNOS9810_ABOX_A2` depends on `EXYNOS9810_DIAGNOSTIC_RESTART` (section 13) |
 
 DT bindings (A2 only, not upstream):
 - gate `samsung,exynos9810-abox-a2`: `samsung,pmu-syscon`, clocks
@@ -232,7 +279,10 @@ DT bindings (A2 only, not upstream):
 `.config` = `panel-bright-work/ko-bt-b1-r2/config` (e94d322e) +
 `CONFIG_EXYNOS9810_ABOX_A2=y`, `olddefconfig`. The only other new lines are
 `# CONFIG_EXYNOS9810_AUDIO_A1 is not set` and `# CONFIG_EXYNOS9810_PM is
-not set` (both new symbols from the merge, off). `make ARCH=arm64
+not set` (both new symbols from the merge, off). Fix round 2 adds the
+dependency on `EXYNOS9810_DIAGNOSTIC_RESTART` (=y, with
+`EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET=y`); the `olddefconfig` output is
+unchanged (`197e5ff6`). `make ARCH=arm64
 LLVM=-18 Image`, clang 18.1.3, `-j3`. The new driver and `exynos-iommu.c`
 are clean with W=1; the full build has no new warnings. In-tree DTBs
 `delayed-ufs-bt-diag` and `delayed-ufs-audio-a1-diag` build.
@@ -248,11 +298,11 @@ command reproduces the BT-B1 DTB bit for bit (adedcd7d). The `.dts` and
 
 | Item | Value |
 |---|---|
-| Image | `panel-bright-work/ko-audio-a2-fix1/arch/arm64/boot/Image` sha256 `2a5e20358eeaabecffb572b6ad7777d530da04496c7f035d401444c86703115f` (built at 5b15c8ece) |
-| config | `panel-bright-work/ko-audio-a2-fix1/config` sha256 `197e5ff61b9a4501b3608aaccda928b9915fa8800f0cac7fb650a77a34835eaa` (unchanged) |
-| DTB | `panel-bright-work/ko-audio-a2-fix1/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-audio-a2.dtb` sha256 `18fb1b412739d4b51b813f60ac4b668c1b56b8094c5c14c0bd77adfd698b2a3d` (unchanged) |
-| Pack | gekko `rom-ram/pack-romram-audio-a2-fix1/recovery.img` sha256 `a83c16b7eb35e8f52b75edd58f7638c935ef7ae09da023538bf9afb342e7b2bd` (68149248 bytes, mode 0600: the build-32 ramdisk contains the device MAC addresses; do not publish) |
-| loader | `981d9252e538e250fed7766de30f65d073e0b7cb2bfc7a20d7164e5e1b33066f`, shim bbea959 |
+| Image | `panel-bright-work/ko-audio-a2-fix2/arch/arm64/boot/Image` sha256 `ee87233c2549ce5dd9b2515ff973249c18b5275dc80fdf27b187ba83a84668ae` (built at fb47f58fa) |
+| config | `panel-bright-work/ko-audio-a2-fix2/config` sha256 `197e5ff61b9a4501b3608aaccda928b9915fa8800f0cac7fb650a77a34835eaa` (unchanged) |
+| DTB | `panel-bright-work/ko-audio-a2-fix2/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-audio-a2.dtb` sha256 `18fb1b412739d4b51b813f60ac4b668c1b56b8094c5c14c0bd77adfd698b2a3d` (unchanged) |
+| Pack | gekko `rom-ram/pack-romram-audio-a2-fix2/recovery.img` sha256 `9250fb9340a37b9d5a63e07796a5c9cd8477d584c58341bbc733ff6d4c0850e1` (68149248 bytes, mode 0600: the build-32 ramdisk contains the device MAC addresses; do not publish) |
+| loader | `ce8912f72c2822db342ba4b5964709f351ac45964b7bad3c975e5b46082e825d`, shim bbea959 |
 | ramdisk | `rom-ram/build-32/diagnostic-initramfs.cpio.gz` `82771399d5af1ff8afc6b575ef8edddd57d5ea5cc30db67084e7a05ec848f3fa` (romram-adb 46a3670, DEADLINE 600 s) |
 | parent / restore | `a8198be0...` / bright RECOVERY `8763860c...` |
 
@@ -260,10 +310,12 @@ Same env as `pack-romram-bt-b1-hal-r2-efs2`: only the Image and the DTB
 differ. Packer `rom-ram/pack-rom-ram.py`; the shim worktree and shim-out
 were removed after the loader build (see `PROVENANCE.txt`).
 
-The first A2 pack (`pack-romram-audio-a2`, `6cdb8037...`, Image
-`06f64997...` at 464b9cd3c, loader `586f1bde...`) is superseded by the
-fix round 1 pack above and was deleted on gekko (a copy is on the PC).
-Do not run it: it has the three Sol R1 defects.
+Superseded packs, deleted on gekko (copies on the PC); do not run them:
+- `pack-romram-audio-a2` (`6cdb8037...`, Image `06f64997...` at
+  464b9cd3c, loader `586f1bde...`): the three Sol R1 defects;
+- `pack-romram-audio-a2-fix1` (`a83c16b7...`, Image `2a5e2035...` at
+  5b15c8ece, loader `981d9252...`): the two Sol R2 defects (SysMMU
+  bypass after a CPU-off stop, unbounded `orderly_reboot()` fallback).
 
 ## 7. Running it
 
@@ -311,6 +363,7 @@ At 60 s:
 ```
 audio selftest A2: start uptime=60xxx ms on CPU1 (pinned), boots wanted 2, run 1000 ms each
 audio selftest A2: wdt (self-test): deadline 700000 ms armed (...)
+audio selftest A2: reset fallback: diagnostic restart ready (PMU SWRESET)
 audio selftest A2: pmu (before): AUD_STATUS=0x10000f ABOX_CPU_CONFIGURATION=0x1 ABOX_CPU_STATUS=0x20000 ABOX_CPU_OPTION=0x.. ABOX_CPU_STANDBY=0x.. PAD_RETENTION_ABOX_OPTION=0x.. GPIO_MODE_ABOX_SYS_PWR=0x..
 audio selftest A2: abox: SFR VERSION=0x.. SYSPOWER_CTRL=0x.. SYSPOWER_STATUS=0x.. SYSREG MISC_CON=0x.. CPU PC=0x..
 ... calliope_sram.bin is loaded (34784 bytes) / SRAM firmware loaded / calliope_dram.bin is loaded (2513712 bytes) / calliope_iva.bin is loaded (57728 bytes) / 7 x "<ext>.bin is loaded"
@@ -324,7 +377,7 @@ audio selftest A2: boot 1: ABOX_RESUME ipc acked
 audio selftest A2: boot 1: ABOX_SUSPEND ipc acked, WFI seen (STANDBY=0x1.......)
 audio selftest A2: boot 1: ABOX CPU off (STATUS=0x..)
 (boot 2: the same lines)
-exynos-sysmmu 17e00000.sysmmu: disabled (bypass): WRITE CTRL 0x0, CFG 0x0
+exynos9810-abox-boot 17c50000.abox: audio A2: SysMMU kept translating with the A2 domain until the next reset (runtime PM held, buffers kept, system suspend refused)
 audio selftest A2: pmu (after): ... ABOX_CPU_CONFIGURATION=0x1 (as before) ... ABOX_CPU_OPTION=(as before)
 ```
 **PASS line:**
@@ -339,6 +392,10 @@ PASS means:
 - `dsp=off`: the DSP is not left running;
 - 0 SysMMU faults, 0 firmware fault reports;
 - the firmware does not report itself incompatible.
+
+There is **no** `exynos-sysmmu 17e00000.sysmmu: disabled (bypass)` line
+any more (fix round 2). If one appears in an A2 boot, the containment
+failed: report it.
 
 `boot_ms_max` over 2000 ms gives
 `slowest boot N ms is over the 2000 ms design target (AUD not raised)`;
@@ -360,8 +417,11 @@ A2 does not).
 | `abox_iommu_fault_handler: IOVA 0x... read/write (fault #n)` + SysMMU `[READ|WRITE] ... FAULT occurred at ...`, `fails: sysmmu-faults` | firmware touched an unmapped IOVA: 0xA0000000/0xA1000000 = VSS (modem shm, not mapped in A2), 0xD0000000 = dump, other = layout difference | record IOVAs. VSS mapping waits for the modem port |
 | `fault N (...) reported from calliope`, `fails: firmware-fault` | firmware exception (data/prefetch abort, os error, vss error) | record params and log tail |
 | `ABOX_RESUME ipc NOT acked`, `fails: resume-ipc` | DSP not polling its mailbox after boot | record |
-| `ABOX_SUSPEND ipc NOT acked` / `WFI NOT seen`, then `ABOX CPU off (...), stop not clean (no SUSPEND ack or no WFI)`, `fails: stop`, `dsp=off` | firmware did not take SUSPEND or did not reach WFI; the CPU was powered off anyway and reads off, the DRAM request was then withdrawn and the SysMMU released | record STANDBY and the GPR dump; boot not counted, no further boot |
-| `ABOX CPU still on after enable/power off (STATUS=...): DRAM request (SYSPOWER_CTRL) kept`, `dsp=LEFT-RUNNING`, `fails: stop-unconfirmed` (or the earlier failure, e.g. `no-ready-to-sing`), then `ABOX CPU could not be stopped: ... ending this boot via the watchdog` and `s3c2410-wdt: petting stopped for good (audio A2: ABOX CPU not stopped)` | DSP stop unconfirmed: DRAM request, clocks, buffers and SysMMU translation kept, suspend refused; the CL0 watchdog resets the SoC ~30 s later (counter reloaded once). `CL0 watchdog final stop not possible (...): orderly reboot` instead means the guarded watchdog was gone | report; the reset clears it. Read pstore after the reset |
+| `ABOX_SUSPEND ipc NOT acked` / `WFI NOT seen`, then `ABOX CPU off (...), stop not clean (no SUSPEND ack or no WFI)`, `fails: stop`, `dsp=off` | firmware did not take SUSPEND or did not reach WFI; the CPU was powered off anyway and reads off, the DRAM request was then withdrawn. The SysMMU keeps translating until the next reset (as after every test) | record STANDBY and the GPR dump; boot not counted, no further boot |
+| `ABOX CPU still on after enable/power off (STATUS=...): DRAM request (SYSPOWER_CTRL) kept`, `dsp=LEFT-RUNNING`, `fails: stop-unconfirmed` (or the earlier failure, e.g. `no-ready-to-sing`), then `ABOX CPU could not be stopped: ... ending this boot via the watchdog` and `s3c2410-wdt: petting stopped for good (audio A2: ABOX CPU not stopped)` | DSP stop unconfirmed: DRAM request, clocks, buffers and SysMMU translation kept, suspend refused; the CL0 watchdog resets the SoC ~30 s later (counter reloaded once) | report; the reset clears it. Read pstore after the reset |
+| as above, but `CL0 watchdog final stop not possible (...): diagnostic emergency restart (PMU SWRESET, no device shutdown)`, then `Diagnostic emergency restart (audio A2: ABOX CPU not stopped) on CPU0: ...` and the reset at once | the guarded watchdog was gone; the diagnostic restart reset the SoC with the normal boot reasons, containment kept until then | report. If instead `Diagnostic emergency restart (...) refused: <why>` and `orderly reboot, containment kept`: the reset depends on user space (or the 600 s ramdisk reboot); owner force restart if the phone does not come back |
+| `diagnostic restart (reset fallback) not ready: <why>: nothing touched`, `FAIL ... fails: restart (nothing touched)`; or `boot N not started: diagnostic restart not ready: <why>`, `fails: restart` | the reset fallback is not available (diagnostic restart not probed or unbound, CAL not up, INFORM2/3 not normal, DFD dump on). Nothing was touched (first form), or no further boot was started (second form) | check the `exynos9810-diagnostic-restart` probe line and `boot selection at probe` |
+| `exynos-sysmmu 17e00000.sysmmu: disabled (bypass)` after the self-test started | must not happen in fix round 2 (containment failed) | report |
 | `Calliope is not compatible with the driver`, `fails: incompatible` | firmware reports an ABI 'A' marker (4.9 check) | record version |
 | `FAIL: ... fails: cpu0 (nothing touched)` | CPU1 went offline before 60 s | not an audio problem |
 | `... fails: wdt` | deadline gone or within 30 s | check wdt lines |
@@ -377,12 +437,16 @@ As in the other ROM-RAM trials:
 - An unconfirmed DSP stop ends the boot early: A2 stops watchdog petting
   right after the result line (section 3.2), so the SoC resets about
   30 s later (roughly 100 s uptime), long before the 600 s ramdisk
-  reboot. The shim then bounces as after any watchdog reset.
+  reboot. The shim then bounces as after any watchdog reset. If the
+  guarded watchdog is gone at that point, the diagnostic emergency
+  restart resets the SoC at once with the normal boot reasons (the same
+  return as the ramdisk's reboot); A2 checked before each boot that it
+  is ready.
 - If the phone does not come back: owner force restart (Power + Vol
   Down ~7-10 s), the shim bounces to Lineage, restore bright RECOVERY
   `8763860c` by hand.
 
-## 11. Risks (after fix round 1)
+## 11. Risks (after fix round 2)
 
 - **First non-secure access to SYSREG_AUD, ABOX SFR/SRAM/GIC and the ABOX
   SysMMU in 6.12.**
@@ -403,22 +467,40 @@ As in the other ROM-RAM trials:
   access).
 - **AUD at boot DVFS level**: slower boot; the firmware might expect the 4.9
   gear (boot timeout 5 s).
-- **SysMMU bypass after release**: the SysMMU goes to bypass, and
-  SYSPOWER_CTRL to 0, only after STATUS reads off. If STATUS were wrong and
-  the DSP still ran, DMA would hit physical addresses 0x80000000.. (kernel
-  RAM). Only the power-status poll gates the release; a missing WFI or
-  SUSPEND ack fails the test but still releases once STATUS reads off.
+- **SysMMU containment for the rest of the boot** (fix round 2): the
+  SysMMU never goes to bypass once the self-test turned it on, so a DMA
+  engine still active after the CPU reads off reaches only A2's buffers
+  and the chip-ID page; other IOVAs fault (logged, counted, no panic).
+  Remaining paths to bypass: unbinding the ABOX or SysMMU device (not
+  possible from sysfs: both drivers set `suppress_bind_attrs`), a domain change
+  by another driver (none uses this SysMMU), and system suspend (refused
+  by `.suspend` before the SysMMU's own suspend runs). Cost: 18.5 MiB +
+  1 page of RAM and no system suspend until the reset; nothing in the
+  ROM-RAM vehicle suspends. SYSPOWER_CTRL still goes to 0 once STATUS
+  reads off (the 4.9 order); if the DSP still ran after that, it would
+  lose its DRAM request, not reach kernel RAM.
 - **Chip-ID snapshot**: the DSP sees PRODUCT_ID, the unique-ID words and
   REV at their usual offsets and 0 everywhere else in the page. If the
   firmware reads another chip-ID offset (unknown: the firmware is a
   binary blob), it gets 0 and may take a different path or refuse to
   boot (`no-ready-to-sing`); no hardware is touched by that.
-- **Watchdog final stop**: the reset after an unconfirmed stop depends on
-  the guarded CL0 watchdog still running, which the self-test verified
-  just before the first boot; `orderly_reboot()` is only the fallback
-  (it runs device shutdown with the DSP possibly active; `.shutdown`
-  clears ENABLE_CPU, the SysMMU driver has no shutdown hook, so it stays
-  translating).
+- **Reset after an unconfirmed stop**: the CL0 watchdog final stop first
+  (verified live before each boot). Its fallback, the diagnostic emergency
+  restart, uses the PMU sequence of the vehicle's normal reboot, which
+  every ROM-RAM trial ran, but reaches it by a path that has not run on
+  hardware: `emergency_restart()` from a kernel worker on CPU0, without
+  device shutdown (UFS, USB and the rest are not shut down before
+  SWRESET, as after a panic). If its preparation refuses, the last
+  resort is `orderly_reboot()` (needs user space; the 600 s ramdisk
+  reboot is the backstop), then the owner force restart. The emergency
+  restart waits up to 10 s for a concurrent `reboot(2)`; in that case
+  both paths end in the same SWRESET.
+- **`fails: restart`**: A2 now refuses to start if the diagnostic restart
+  is not ready (read-only check: context, CAL, chip revision,
+  INFORM2/INFORM3 normal, DFD dump off). The guarded watchdog already
+  requires normal INFORM and DFD off to arm, so this adds no new
+  condition on the boot state; it adds the requirement that
+  `exynos9810-diagnostic-restart` has probed.
 - **ext firmware**: `dsm.bin`/`dsm_tune.bin` are loaded unchanged into DSP
   DRAM, as 4.9 does. No DSM parameter is changed (G5) and no amp exists.
 - **Firmware user-helper**: up to 60 s per missing file; the 7 ext files
@@ -427,7 +509,7 @@ As in the other ROM-RAM trials:
   (deadline in the ping path, keep-armed suspend) now run in ROM-RAM for
   the first time. Without a deadline they behave as before.
   `exynos9810-pm` is not built.
-- Sol R1 fixed (section 13); not re-reviewed yet.
+- Sol R1 and R2 fixed (section 13); fix round 2 not re-reviewed yet.
 
 ## 12. Plan after A2
 
@@ -467,3 +549,22 @@ a8198be0; built in `/dev/shm`, the shim worktree and shim-out removed
 after the loader build, then moved to `rom-ram/pack-romram-audio-a2-fix1`
 (`a83c16b7...`, section 6). The superseded `pack-romram-audio-a2`
 (`6cdb8037`) was deleted on gekko.
+
+### Fix round 2 (Sol R2 on 9449de76a: CHANGES)
+
+| # | Sol finding | Fix | Commit |
+|---|---|---|---|
+| 1 | HIGH :972: the cleanup removes the DMA containment based only on the DSP CPU status. `pm_runtime_put_sync()` lets the SysMMU runtime suspend write `CTRL_DISABLE` (bypass, `exynos-iommu.c:743`), also after `A2_STOP_OFF_DIRTY`; CPU off does not prove that every ABOX DMA engine has stopped | Choice 1 of the two Sol offered: **keep the runtime-PM reference, the attached domain and the buffers until reset**. `a2_work_fn()` never drops the reference once the SysMMU was turned on, whatever the result; `.suspend` refuses system suspend for the rest of the boot (`pm_runtime_force_suspend()` would force bypass). `.shutdown` powers the ABOX CPU off as `a2_stop()` does (shared `a2_cpu_off()`), confirms STATUS off, withdraws the DRAM request only then, and releases nothing else (3.2 step 9 and the `.suspend`/`.shutdown` paragraph) | fb47f58fa |
+| 2 | MEDIUM :786: the fallback after a failed watchdog final stop, `orderly_reboot()`, runs `/sbin/reboot` and is not bounded; `.shutdown` (:1347) only cleared ENABLE_CPU without confirming the stop | The diagnostic restart (the vehicle's normal `reboot` path) gets kernel-internal entry points: `exynos9810_diagnostic_restart_check()` (read-only readiness) and `exynos9810_diagnostic_emergency_restart()`: on the reboot CPU, under `system_transition_mutex` (bounded 10 s wait) and the context lock, `diagnostic_prepare()` (normal INFORM2/INFORM3, ACPM STOP), then `emergency_restart()`, whose priority-255 guard writes PMU SWRESET. No device shutdown. A bare `emergency_restart()` is refused by the guard (not prepared), so the preparation is required. A2 requires the check before it touches anything and before each boot (`fails: restart`); `a2_end_left_running()`: watchdog final stop, else the emergency restart, else `orderly_reboot()` as the last resort. Containment stays until the reset. `.shutdown` as in row 1 (3.2) | fb47f58fa |
+
+Build: same config (`197e5ff6`; the new Kconfig dependency changes no
+line), `make ARCH=arm64 LLVM=-18 -j3 Image`, clang 18.1.3, in
+`/dev/shm/a2fix2-build`; both changed drivers are clean with W=1 and the
+full build has only the existing bcmdhd warnings. Image `ee87233c...` at
+fb47f58fa; a `make Image` re-run on the committed tree rebuilt nothing
+(same hash). DTB unchanged (`18fb1b41`). Pack: same packer, shim
+bbea959, ramdisk build-32 (`82771399`), parent a8198be0; built in
+`/dev/shm`, the shim worktree and shim-out removed after the loader
+build, then moved to `rom-ram/pack-romram-audio-a2-fix2` (`9250fb93...`,
+loader `ce8912f7...`, section 6). The superseded
+`pack-romram-audio-a2-fix1` (`a83c16b7`) was deleted on gekko.
