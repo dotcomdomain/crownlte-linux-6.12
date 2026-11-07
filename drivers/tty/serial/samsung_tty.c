@@ -2517,15 +2517,50 @@ static const struct s3c24xx_serial_drv_data gs101_serial_drv_data = {
 	.fifosize = { 0 },
 };
 
+/*
+ * Exynos9810 USIv2-wrapped UARTs (e.g. the BT UART at 0x10840000): the same
+ * register layout as GS101, 32-bit accesses, UFRACVAL, one baud clock
+ * ("clk_uart_baud0"). The wrapper (USI_CON/USI_OPTION at +0xc4/+0xc8) is
+ * owned by the parent samsung,exynos9810-usi node, not by this driver.
+ */
+static const struct s3c24xx_serial_drv_data exynos9810_serial_drv_data = {
+	.info = {
+		.name		= "Samsung Exynos9810 UART",
+		.type		= TYPE_S3C6400,
+		.port_type	= PORT_S3C6400,
+		.iotype		= UPIO_MEM32,
+		.has_divslot	= true,
+		.rx_fifomask	= S5PV210_UFSTAT_RXMASK,
+		.rx_fifoshift	= S5PV210_UFSTAT_RXSHIFT,
+		.rx_fifofull	= S5PV210_UFSTAT_RXFULL,
+		.tx_fifofull	= S5PV210_UFSTAT_TXFULL,
+		.tx_fifomask	= S5PV210_UFSTAT_TXMASK,
+		.tx_fifoshift	= S5PV210_UFSTAT_TXSHIFT,
+		.def_clk_sel	= S3C2410_UCON_CLKSEL0,
+		.num_clks	= 1,
+		.clksel_mask	= 0,
+		.clksel_shift	= 0,
+	},
+	.def_cfg = {
+		.ucon		= S5PV210_UCON_DEFAULT,
+		.ufcon		= S5PV210_UFCON_DEFAULT,
+		.has_fracval	= 1,
+	},
+	/* samsung,uart-fifosize must be specified in the device tree. */
+	.fifosize = { 0 },
+};
+
 #define EXYNOS4210_SERIAL_DRV_DATA (&exynos4210_serial_drv_data)
 #define EXYNOS5433_SERIAL_DRV_DATA (&exynos5433_serial_drv_data)
 #define EXYNOS850_SERIAL_DRV_DATA (&exynos850_serial_drv_data)
+#define EXYNOS9810_SERIAL_DRV_DATA (&exynos9810_serial_drv_data)
 #define GS101_SERIAL_DRV_DATA (&gs101_serial_drv_data)
 
 #else
 #define EXYNOS4210_SERIAL_DRV_DATA NULL
 #define EXYNOS5433_SERIAL_DRV_DATA NULL
 #define EXYNOS850_SERIAL_DRV_DATA NULL
+#define EXYNOS9810_SERIAL_DRV_DATA NULL
 #define GS101_SERIAL_DRV_DATA NULL
 #endif
 
@@ -2615,6 +2650,9 @@ static const struct platform_device_id s3c24xx_serial_driver_ids[] = {
 	}, {
 		.name		= "gs101-uart",
 		.driver_data	= (kernel_ulong_t)GS101_SERIAL_DRV_DATA,
+	}, {
+		.name		= "exynos9810-uart",
+		.driver_data	= (kernel_ulong_t)EXYNOS9810_SERIAL_DRV_DATA,
 	},
 	{ },
 };
@@ -2638,6 +2676,8 @@ static const struct of_device_id s3c24xx_uart_dt_match[] = {
 		.data = ARTPEC8_SERIAL_DRV_DATA },
 	{ .compatible = "google,gs101-uart",
 		.data = GS101_SERIAL_DRV_DATA },
+	{ .compatible = "samsung,exynos9810-uart",
+		.data = EXYNOS9810_SERIAL_DRV_DATA },
 	{},
 };
 MODULE_DEVICE_TABLE(of, s3c24xx_uart_dt_match);
