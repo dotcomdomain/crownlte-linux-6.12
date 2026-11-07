@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * v23a-dpu plus the DECON self-test at 3 s of boot, before HWC starts
+ * (~11.6 s in v23a run4): 4 fb0 A/B flips 400 ms apart, then the
+ * composition steps C1-C3 (scaled RGB, NV12, colour window), 1.5 s each,
+ * then fb0 again (~9.5 s). It stops early, without restoring fb0, if HWC
+ * issues S3CFB_WIN_CONFIG meanwhile.
+ * See Documentation/crownlte/display-composition.md.
+ */
+#include "exynos9810-crownlte-romram-v23a-dpu.dts"
+
+&{/decon_f@16030000} {
+	samsung,decon-selftest;
+	samsung,decon-selftest-at-ms = <3000>;
+	samsung,decon-selftest-flips = <4>;
+};

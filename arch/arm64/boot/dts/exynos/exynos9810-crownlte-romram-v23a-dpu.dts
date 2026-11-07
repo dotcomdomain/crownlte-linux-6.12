@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ROM-in-RAM v23a + DPU composition parity (branch crownlte-dpu-scale).
+ *
+ * v23a unchanged, plus the HDR capabilities 4.9 reported for this panel
+ * (4.9 DT s6e3ha8_crown_ddi: hdr_num 2, hdr_type <2 3> = HDR10 and HLG,
+ * hdr_max_luma 5400000, hdr_max_avg_luma 1200000, hdr_min_luma 5) through
+ * S3CFB_GET_HDR_CAPABILITIES(_NUM). Without them none are reported.
+ * See Documentation/crownlte/display-composition.md.
+ */
+#include "exynos9810-crownlte-romram-v23a.dts"
+
+&{/decon_f@16030000} {
+	samsung,hdr-types = <2 3>;
+	samsung,hdr-max-luma = <5400000>;
+	samsung,hdr-max-avg-luma = <1200000>;
+	samsung,hdr-min-luma = <5>;
+};

@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ROM-in-RAM v23a-dpu + DPU SysMMU (branch crownlte-dpu-scale-iommu).
+ *
+ * v23a-dpu unchanged, plus the opt-in DPU SysMMU of
+ * Documentation/crownlte/display-iommu.md (the same changes as the tested
+ * romram-iommu / v22b DTB, there applied to a decompiled v18):
+ *  - sysmmu_dpu0..2 enabled in the 9810 SysMMU mode (4.9 CFG, QoS 15),
+ *    gated on PMU DPU_STATUS 0x14064024 = 0xf;
+ *  - decon_f: "iommus" = the three of them (one DMA domain), without the
+ *    read-only sysmmu0..2 reg windows (exynos-iommu requests the whole SFR
+ *    windows; the driver maps read-only views of the "iommus" nodes);
+ *  - the SBoot framebuffer reservation (0xcc000000, 20 MiB) as decon_f's
+ *    second memory-region with "iommu-addresses", so the IOMMU core maps it
+ *    1:1 before translation starts and the splash / fb0 adopt and the panel
+ *    recovery keep scanning the same memory.
+ * HWC dma-bufs are then scanned in place through cached IOVAs, without
+ * decon-pool bounce buffers. Without this DTB (plain v23a-dpu) the driver
+ * keeps the bounce path. See Documentation/crownlte/display-composition.md.
+ */
+#include "exynos9810-crownlte-romram-v23a-dpu.dts"
+
+/* 0x0d = PMU system controller (decon_f samsung,pmu-syscon) */
+&{/soc@0/sysmmu@160a0000} {
+	compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
+	samsung,qos = <15>;
+	samsung,pmu-syscon = <0x0d>;
+	samsung,pd-status = <0x4024 0xf 0xf>;
+	status = "okay";
+};
+
+&{/soc@0/sysmmu@160b0000} {
+	compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
+	samsung,qos = <15>;
+	samsung,pmu-syscon = <0x0d>;
+	samsung,pd-status = <0x4024 0xf 0xf>;
+	status = "okay";
+};
+
+&{/soc@0/sysmmu@160c0000} {
+	compatible = "samsung,exynos9810-sysmmu", "samsung,exynos-sysmmu";
+	samsung,qos = <15>;
+	samsung,pmu-syscon = <0x0d>;
+	samsung,pd-status = <0x4024 0xf 0xf>;
+	status = "okay";
+};
+
+/* identity IOVA for SBoot's lcd_buffer (root: 2 address cells, 1 size cell) */
+&{/reserved-memory/framebuffer@cc000000} {
+	iommu-addresses = <&{/decon_f@16030000} 0x0 0xcc000000 0x1400000>;
+};
+
+&{/decon_f@16030000} {
+	reg = <0x0 0x16030000 0x10000>,	/* decon */
+	      <0x0 0x16071000 0x6000>,	/* dpp-dma (IDMA G0..VGF1) */
+	      <0x0 0x16021000 0x6000>,	/* dpp */
+	      <0x0 0x16070000 0x1000>,	/* dma-common */
+	      <0x0 0x16080000 0x100>;	/* dsim */
+	reg-names = "decon", "dpp-dma", "dpp", "dma-common", "dsim";
+	iommus = <&{/soc@0/sysmmu@160a0000}>, <&{/soc@0/sysmmu@160b0000}>,
+		 <&{/soc@0/sysmmu@160c0000}>;
+	/* index 0 stays decon-pool (0x24); index 1 = the boot framebuffer */
+	memory-region = <0x24>, <&{/reserved-memory/framebuffer@cc000000}>;
+};

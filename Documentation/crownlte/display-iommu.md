@@ -5,6 +5,12 @@ display-s2 0263a2095) ported onto the HWC display driver of `crownlte-display-fl
 (23b0b1202: adopt mode, WIN_CONFIG for HWC, AFBC, per-window bounce copies into decon-pool).
 **Build-only, not run on the phone.**
 
+Update (branch `crownlte-dpu-scale-iommu`): trial v22b ran this series on ROM-in-RAM with HWC
+(boot_completed, no SysMMU faults). The source DTS `exynos9810-crownlte-romram-v23a-dpu-iommu.dts`
+opts the v23a-dpu DTB in, and a scan proof log (`decon iommu: scan proof #n …: PASS`) shows on
+the phone that HWC windows latch their IOVAs without bounce copies. See
+display-composition.md section 10.
+
 - **Opt-in by DT.** The SysMMU path is used only when decon_f has `iommus` (and the three
   `sysmmu_dpu` nodes are enabled). No shipped DTB does that. Without `iommus` the driver runs the
   default path unchanged: contiguous buffers scanned directly, scattered ones bounce-copied into
