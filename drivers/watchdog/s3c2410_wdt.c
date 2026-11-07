@@ -1643,13 +1643,14 @@ static int s3c2410wdt_reboot_notify(struct notifier_block *nb,
 	hb_ok = !s3c2410wdt_calc_heartbeat(wdt, S3C2410_WDT_RESTART_TIMEOUT, &hb);
 
 	/*
-	 * One wdt->lock section: the short timeout (refused, nothing written,
-	 * once reloading is no longer allowed), then the shared final stop,
-	 * whose last reload also only happens while reloading is allowed.
+	 * One wdt->lock section: the short timeout without a reload (after
+	 * the final stop only a change that does not slow the counter down is
+	 * made), then the shared final stop, whose one last reload (with the
+	 * new count) only happens while reloading is still allowed.
 	 */
 	spin_lock_irqsave(&wdt->lock, flags);
 	if (hb_ok)
-		__s3c2410wdt_apply_heartbeat(wdt, &hb, true);
+		__s3c2410wdt_apply_heartbeat(wdt, &hb, false);
 	reloaded = __s3c2410wdt_final_stop(wdt, "restart");
 	spin_unlock_irqrestore(&wdt->lock, flags);
 	if (!reloaded) {
