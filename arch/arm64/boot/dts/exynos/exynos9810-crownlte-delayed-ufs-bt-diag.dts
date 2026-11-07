@@ -2,11 +2,12 @@
 /*
  * Bluetooth B1, trial B1-read: the delayed-UFS diagnostic plus the BT UART,
  * the expander bus and the bluetooth rfkill device. Read-only: nothing
- * writes the PCAL6524 (the driver only reads its registers at probe) and
- * the BCM4361 BT core is never powered. The self-test at 93 s reports the
- * USI10 SW_CONF slots, the expander reset line, a full expander register
- * dump against the probe dump, the UART clock and USI wrapper readback and
- * the rfkill index, then "bt selftest: RESULT PASS-NOPOWER".
+ * writes the PCAL6524 (the driver only reads its registers) and BT_REG_ON
+ * is left as the bootloader set it. The self-test at 93 s reports the
+ * expander reset line, a full expander register dump validated against
+ * the probe dump, the BT_REG_ON state, the UART clock and USI wrapper
+ * readback and the rfkill index, then
+ * "bt selftest: RESULT PASS-NOPOWER, state ON (bootloader)".
  * See Documentation/crownlte/bluetooth-port.md.
  */
 #include "exynos9810-crownlte-delayed-ufs-diag.dts"

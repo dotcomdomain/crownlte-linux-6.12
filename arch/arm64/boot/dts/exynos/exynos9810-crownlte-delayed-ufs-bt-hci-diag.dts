@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Bluetooth B1, trial B1-hci: as B1-read, but the self-test at 93 s also
- * powers the BT core (BT_WAKE high, expander P0_7 high, 100 ms), opens
- * ttySAC1 in the kernel at 115200 8N1 RTS/CTS, sends HCI Reset, Read Local
- * Version and Read BD_ADDR, then powers the core off again. The expander is
- * dumped before and after each change. Expected end "bt selftest: RESULT
- * PASS". Only after B1-read passed. See Documentation/crownlte/bluetooth-port.md.
+ * opens ttySAC1 in the kernel at 115200 8N1 RTS/CTS, power-cycles the BT
+ * core (expander P0_7 low, 500 ms, BT_WAKE high, P0_7 high, 100 ms), sends
+ * HCI Reset, Read Local Version and Read BD_ADDR, then powers the core off.
+ * The expander is validated and dumped before and after each P0_7 write.
+ * Expected end "bt selftest: RESULT PASS, state OFF". Only after B1-read
+ * passed. See Documentation/crownlte/bluetooth-port.md.
  */
 #include "exynos9810-crownlte-delayed-ufs-bt-diag.dts"
 

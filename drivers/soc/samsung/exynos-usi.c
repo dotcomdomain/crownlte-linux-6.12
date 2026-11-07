@@ -181,6 +181,13 @@ static int exynos_usi_enable(const struct exynos_usi *usi)
 
 	/* The diagnostic must retain the configured wrapper state while its
 	 * clocks are on. Failure here prevents protocol child population.
+	 *
+	 * For the samsung,no-sw-conf blocks (UART_BT 0x108400c0, USI10_I2C
+	 * 0x109300c0) 4.9 only ever wrote USI_CON/USI_OPTION. Reading them
+	 * here, with the wrapper clocks enabled above, is hardware-proven:
+	 * B1-read (2026-11-07, recovery 218efc06) logged con=00000000
+	 * option=00000003 (UART_BT) and con=00000000 option=00000001
+	 * (USI10_I2C) with no abort. Only these two registers are read back.
 	 */
 	if (usi->data == &exynos9810_usi_data) {
 		u32 sw_conf = 0, con, option;
