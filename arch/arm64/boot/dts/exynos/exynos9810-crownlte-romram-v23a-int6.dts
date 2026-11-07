@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ROM-in-RAM integration 6 (branch crownlte-integration-6).
+ *
+ * v23a-dpu-iommu (DPU composition + DPU SysMMU scanout, hardware trial
+ * dpu-iommu, DTB a9747cb9) with:
+ *  - the 4.9 performance/efficiency parity of crownlte-perf
+ *    (exynos9810-crownlte-perf.dtsi, as in v23a-perf) and its sched_verbose
+ *    bootarg;
+ *  - the Wi-Fi stage-1 nodes of romram-wifi-s1 (hardware trial wifi-adb2),
+ *    as path overlays in exynos9810-crownlte-romram-wifi.dtsi.
+ * The Kinibi TEE node stays disabled (the TEE driver is built but does not
+ * probe). Only the read-only self-tests of these DTBs are armed; see
+ * Documentation/crownlte/integration-6.md.
+ *
+ * Build with rom-ram/src/build-dtb.sh (KSRC = this tree, KO = its build
+ * directory); kbuild does not build the flattened ROM-in-RAM DTBs.
+ */
+#include "exynos9810-crownlte-romram-v23a-dpu-iommu.dts"
+#include "exynos9810-crownlte-perf.dtsi"
+#include "exynos9810-crownlte-romram-wifi.dtsi"
+
+&{/} {
+	model = "Samsung Note9 ROM-in-RAM v23a integration 6 (DPU SysMMU + perf + Wi-Fi)";
+};
+
+&{/chosen} {
+	bootargs = "panic=30 ro sched_verbose";
+};
+
+/* Kinibi TEE: driver built in, node off in this integration */
+&{/tee} {
+	status = "disabled";
+};

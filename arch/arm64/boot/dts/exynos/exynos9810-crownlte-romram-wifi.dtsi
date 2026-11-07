@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * crownlte Wi-Fi stage 1 (BCM4361 on PCIe ch0) for the flattened ROM-in-RAM
+ * DTS, by node path only (the flat DTS has no labels).
+ *
+ * Same nodes and values as panel-bright-work/dtb/exynos9810-crownlte-romram-wifi-s1.dts
+ * (generator romram-wifi-s1-gen.py, DTB of the hardware Wi-Fi trial
+ * wifi-adb2): the PCIe RC, the samsung,brcm-wlan glue node with the full
+ * self-test at 150 s, their five pin groups and the three GPIO banks they
+ * use. Phandles are assigned by dtc instead of by hand. The only difference
+ * is the node order: the wlan node ends up last under / and pcie@116a0000
+ * last under soc@0 (the generator put them before soc@0 and before
+ * system-controller@14060000); the glue defers until the RC exists, so
+ * either order probes the same way. See Documentation/crownlte/wifi-port.md.
+ */
+
+&{/soc@0/pinctrl@10430000} {
+	romram_cfg_wlanen: cfg-wlanen-pins {
+		samsung,pins = "gpg0-5";
+		samsung,pin-function = <0x01>;
+		samsung,pin-pud = <0x00>;
+		samsung,pin-drv = <0x03>;
+		samsung,pin-con-pdn = <0x03>;
+	};
+};
+
+&{/soc@0/pinctrl@11430000} {
+	romram_pcie0_clkreq: pcie0-clkreq-pins {
+		samsung,pins = "gpf2-0";
+		samsung,pin-function = <0x02>;
+		samsung,pin-pud = <0x03>;
+		samsung,pin-drv = <0x03>;
+		samsung,pin-con-pdn = <0x03>;
+		samsung,pin-pud-pdn = <0x03>;
+	};
+
+	romram_pcie0_perst: pcie0-perst-pins {
+		samsung,pins = "gpf2-2";
+		samsung,pin-function = <0x01>;
+		samsung,pin-drv = <0x03>;
+		samsung,pin-con-pdn = <0x03>;
+	};
+};
+
+/* alive bank: no *-pdn properties (6.12 alive banks have no PDN fields) */
+&{/soc@0/pinctrl@14050000} {
+	romram_pcie_wake: pcie-wake-pins {
+		samsung,pins = "gpa3-2";
+		samsung,pin-function = <0x00>;
+		samsung,pin-pud = <0x00>;
+	};
+
+	romram_wlan_host_wake: wlan-host-wake-pins {
+		samsung,pins = "gpa0-7";
+		samsung,pin-function = <0x0f>;
+		samsung,pin-pud = <0x01>;
+	};
+};
+
+&{/soc@0} {
+	pcie@116a0000 {
+		compatible = "samsung,exynos9810-pcie";
+		reg = <0x116a0000 0x1000>, <0x116d0000 0x1000>, <0x11411044 0x10>,
+		      <0x11700000 0x1000>, <0x116c0000 0x1fc>, <0x127fe000 0x2000>,
+		      <0x11680000 0x1000>;
+		reg-names = "elbi", "phy", "sysreg", "dbi", "pcs", "config", "ia";
+		interrupts = <0x00 0xfd 0x04>;	/* SPI 253, level high */
+		#address-cells = <0x03>;
+		#size-cells = <0x02>;
+		device_type = "pci";
+		ranges = <0x82000000 0x00 0x11800000 0x11800000 0x00 0xff0000>;
+		bus-range = <0x00 0xff>;
+		#interrupt-cells = <0x01>;
+		interrupt-map-mask = <0x00 0x00 0x00 0x00>;
+		interrupt-map = <0x00 0x00 0x00 0x00
+				 &{/soc@0/interrupt-controller@10101000} 0x00 0xfd 0x04>;
+		num-lanes = <0x01>;
+		max-link-speed = <0x02>;
+		samsung,channel = <0x00>;
+		samsung,use-ia;
+		samsung,pmu-syscon = <&{/soc@0/system-controller@14060000}>;
+		perst-gpios = <&{/soc@0/pinctrl@11430000/gpf2-gpio-bank} 0x02 0x00>;
+		pinctrl-names = "default", "idle";
+		pinctrl-0 = <&romram_pcie0_clkreq &romram_pcie0_perst &romram_pcie_wake>;
+		pinctrl-1 = <&romram_pcie0_perst &romram_pcie_wake>;
+		status = "okay";
+	};
+};
+
+&{/} {
+	wlan {
+		compatible = "samsung,brcm-wlan";
+		wlan-reg-on-gpios = <&{/soc@0/pinctrl@10430000/gpg0-gpio-bank} 0x05 0x00>;
+		wlan-host-wake-gpios = <&{/soc@0/pinctrl@14050000/gpa0-gpio-bank} 0x07 0x00>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&romram_cfg_wlanen &romram_wlan_host_wake>;
+		status = "okay";
+		samsung,wifi-selftest;
+		samsung,wifi-selftest-ms = <150000>;
+	};
+};
