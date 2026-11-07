@@ -62,14 +62,19 @@
  *    disarmed, the watchdog's one shared final stop
  *    (s3c2410wdt_crownlte_stop_petting(): never reloaded again, reset
  *    within its timeout), then orderly_reboot().
- *  - Quarantine record (v2): one 4 KB no-map reserved-memory page (DT
+ *  - Quarantine record (v3): one 4 KB no-map reserved-memory page (DT
  *    memory-region of this node) that survives a watchdog reset, two
- *    alternating sequenced slots. Fail closed: no valid record, an armed
- *    session that never reached a clean restart (watchdog reset, panic,
- *    power loss) or a big loss keeps all C2 off; a LITTLE loss keeps LITTLE
- *    C2 off; until an explicit clear (root c2_quarantine_clear, or a new
- *    trial token in the DT on a valid record). "Session armed" is persisted
- *    before the first CPU is armed and closed by the reboot notifier.
+ *    alternating sequenced slots, trusted only when both are valid and
+ *    chained. Fail closed: no trusted record, an armed session that never
+ *    reached the last controlled point of a restart/halt/power-off
+ *    (watchdog reset, panic, power loss, kexec, a hang in device shutdown)
+ *    or a big loss keeps all C2 off; a LITTLE loss keeps LITTLE C2 off;
+ *    until an explicit clear (root c2_quarantine_clear, or a trial token in
+ *    the DT above the record's trial floor on a trusted record). "Session
+ *    armed" is persisted before the first CPU is armed. At shutdown the
+ *    reboot notifier closes the arm gate for good and requires every CPU to
+ *    acknowledge leaving C2 (session SHUTDOWN, still unclean); the restart
+ *    handler or syscore shutdown writes IDLE last.
  *    Without the page, boot arming and drills are refused.
  *  - Drills (diag DTBs only, once: consumed in the record before they run,
  *    root c2_drill_rearm re-arms): samsung,c2-lost-drill = <cpu ms>
@@ -95,11 +100,13 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/kexec.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
 #include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/panic.h>
 #include <linux/percpu.h>
 #include <linux/platform_device.h>
 #include <linux/psci.h>
@@ -111,6 +118,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/spinlock.h>
+#include <linux/syscore_ops.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
@@ -244,6 +252,20 @@ static bool e9810_topology_ok;
 /* CPUs that may enter C2. Written under e9810_arm_lock, read locklessly. */
 static struct cpumask e9810_armed;
 static DEFINE_MUTEX(e9810_arm_lock);
+/*
+ * Set by the reboot notifier, under e9810_arm_lock, before it clears the arm
+ * mask; never cleared. Every arming path and the C2 entry check it.
+ * reboot.c runs the reboot notifiers before it sets system_state, so
+ * system_state alone cannot stop an arming work that runs right after the
+ * notifier.
+ */
+static bool e9810_shutdown;
+/*
+ * 1 from before e9810_enter_c2() reads the arm gate until the CPU is back
+ * in the kernel stage. The shutdown drain closes the gate, then waits until
+ * it has seen 0 on every CPU (see e9810_drain()).
+ */
+static DEFINE_PER_CPU(u32, e9810_c2_busy);
 static atomic_t e9810_deep_off = ATOMIC_INIT(0);
 static const char *e9810_deep_off_why;
 static const char *e9810_setup_why;
@@ -357,7 +379,16 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	bool little = e9810_cluster_of[dev->cpu] == 0;
 	int ret, lim;
 
-	if (!cpumask_test_cpu(dev->cpu, &e9810_armed)) {
+	/*
+	 * Busy before the gate is read, with a full barrier in between. The
+	 * drain closes the gate, issues the same barrier and then reads busy
+	 * (store-buffering pattern): either this CPU sees the gate closed, or
+	 * the drain sees it busy and waits until it is out again.
+	 */
+	this_cpu_write(e9810_c2_busy, 1);
+	smp_mb();
+	if (!cpumask_test_cpu(dev->cpu, &e9810_armed) ||
+	    READ_ONCE(e9810_shutdown)) {
 		st->unarmed++;
 		goto wfi;
 	}
@@ -425,6 +456,8 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 	e9810_set_stage(E9810_ST_PM_EXIT);
 	cpu_pm_exit();
 	e9810_set_stage(E9810_ST_KERNEL);
+	/* The positive "out of C2" acknowledgement the shutdown drain waits for. */
+	smp_store_release(this_cpu_ptr(&e9810_c2_busy), 0);
 
 	if (!ret) {
 		st->c2_resumed++;
@@ -447,6 +480,8 @@ static __cpuidle int e9810_enter_c2(struct cpuidle_device *dev,
 			e9810_disable_deep("PSCI CPU_SUSPEND kept failing");
 	}
 wfi:
+	/* Not (or no longer) on the C2 path: the WFI below is not C2. */
+	smp_store_release(this_cpu_ptr(&e9810_c2_busy), 0);
 	st->wfi_fallback++;
 	return e9810_fallback_wfi();
 }
@@ -659,7 +694,8 @@ static void e9810_state_disable(unsigned int cpu, bool disable)
 }
 
 static const char *e9810_qm_session_arm(void);
-static void e9810_qm_session_close(const char *how);
+static void e9810_qm_session_drained(const char *how);
+static void e9810_qm_session_final(const char *how, bool restart);
 static void e9810_boot_arm_online(unsigned int cpu);
 
 /* Why @cpu cannot be armed, or NULL. Called with e9810_arm_lock held. */
@@ -672,8 +708,12 @@ static const char *e9810_arm_refused(unsigned int cpu)
 		return "CPU0 is never armed";
 	if (!e9810_clusters[e9810_cluster_of[cpu]].registered)
 		return "cluster not registered";
-	/* The reboot notifier closes the session; nothing arms after it. */
-	if (system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF ||
+	/*
+	 * The reboot notifier sets e9810_shutdown under e9810_arm_lock (held
+	 * here) before system_state changes; nothing arms after it.
+	 */
+	if (READ_ONCE(e9810_shutdown) ||
+	    system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF ||
 	    system_state == SYSTEM_RESTART)
 		return "restart or power-off under way";
 	if (e9810_quarantine & E9810_QF_UNINIT)
@@ -793,12 +833,54 @@ static void e9810_disarm_mask(const struct cpumask *mask)
 	wake_up_all_idle_cpus();
 }
 
+/* Shutdown drain: bound, and how often the idle CPUs are kicked meanwhile. */
+#define E9810_DRAIN_MS			1000
+#define E9810_DRAIN_KICK_MS		10
+
 /*
- * The clean end of an armed C2 session: kernel_restart() and
- * kernel_power_off()/kernel_halt() (reboot(2), orderly_reboot(), Android
- * "reboot", the diag PID1 120/150 s restart, the ROM-RAM DONE reboot) run
- * this notifier. Panic, emergency_restart(), a watchdog reset and power loss
- * do not, so their session stays ARMED and the next boot quarantines C2.
+ * After the gate is closed (e9810_shutdown set, arm mask cleared): wait, at
+ * most E9810_DRAIN_MS, until every possible CPU has shown e9810_c2_busy == 0.
+ * A 0 seen after the barrier below is a positive acknowledgement: that CPU
+ * is outside e9810_enter_c2() at that moment, and every later entry sees the
+ * closed gate. An RCU grace period (cpuidle_pause()) proves nothing here: a
+ * CPU in the firmware stage is in an RCU idle section and does not hold
+ * one up. True if all acknowledged; @stuck gets the CPUs that did not.
+ */
+static bool e9810_drain(struct cpumask *stuck)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(E9810_DRAIN_MS);
+	unsigned long kick = jiffies;
+	unsigned int cpu;
+
+	/* Pairs with the smp_mb() between busy and the gate in e9810_enter_c2(). */
+	smp_mb();
+	cpumask_copy(stuck, cpu_possible_mask);
+	for (;;) {
+		for_each_cpu(cpu, stuck)
+			if (!smp_load_acquire(per_cpu_ptr(&e9810_c2_busy, cpu)))
+				cpumask_clear_cpu(cpu, stuck);
+		if (cpumask_empty(stuck))
+			return true;
+		if (time_after(jiffies, end))
+			return false;
+		if (time_after_eq(jiffies, kick)) {
+			wake_up_all_idle_cpus();
+			kick = jiffies + msecs_to_jiffies(E9810_DRAIN_KICK_MS);
+		}
+		usleep_range(500, 1000);
+	}
+}
+
+/*
+ * Start of a restart, halt or power-off (kernel_restart(), kernel_halt(),
+ * kernel_power_off(), and kernel_kexec(): reboot(2), orderly_reboot(),
+ * Android "reboot", the diag PID1 120/150 s restart, the ROM-RAM DONE
+ * reboot). Closes the arm gate for good, then requires every CPU to
+ * acknowledge that it left C2 (e9810_drain()). Only then is an ARMED record
+ * moved to SHUTDOWN, which the next boot still treats as unclean; IDLE is
+ * written only at the last controlled point (e9810_qm_session_final():
+ * the restart handler, or syscore shutdown for halt and power-off). Panic,
+ * emergency_restart(), a watchdog reset and power loss never get there.
  */
 static int e9810_reboot_cb(struct notifier_block *nb, unsigned long event,
 			   void *data)
@@ -807,46 +889,85 @@ static int e9810_reboot_cb(struct notifier_block *nb, unsigned long event,
 		[SYS_RESTART] = "restart", [SYS_HALT] = "halt",
 		[SYS_POWER_OFF] = "power-off",
 	};
+	struct cpumask stuck;
+	unsigned int cpu;
 
-	/* Like 4.9: no deep idle while the restart/power-off path runs. */
-	if (event == SYS_RESTART || event == SYS_POWER_OFF ||
-	    event == SYS_HALT) {
-		/* system_state is set: no arming after this section. */
-		mutex_lock(&e9810_arm_lock);
-		cpumask_clear(&e9810_armed);
-		/* Disarmed before cpuidle_pause() kicks the idle CPUs. */
-		smp_mb();
-		mutex_unlock(&e9810_arm_lock);
-		/*
-		 * cpuidle_pause() waits for an RCU grace period. A CPU lost
-		 * outside an RCU idle section would block it forever, so
-		 * only kick the idle CPUs then.
-		 */
-		if (!cpumask_empty(&e9810_lost)) {
-			pr_emerg("restart with lost CPUs %*pbl: cpuidle_pause() skipped\n",
-				 cpumask_pr_args(&e9810_lost));
-			wake_up_all_idle_cpus();
-		} else {
-			/*
-			 * Returns once every CPU has passed a quiescent state,
-			 * i.e. has left C2. A CPU stuck in C2 blocks it here,
-			 * and the session is never closed.
-			 */
-			cpuidle_pause();
-			e9810_qm_session_close(how[event]);
-		}
+	if (event != SYS_RESTART && event != SYS_POWER_OFF &&
+	    event != SYS_HALT)
+		return NOTIFY_OK;
+
+	/* Irreversible; every arming path checks it under this lock. */
+	mutex_lock(&e9810_arm_lock);
+	WRITE_ONCE(e9810_shutdown, true);
+	for_each_possible_cpu(cpu)
+		e9810_state_disable(cpu, true);
+	cpumask_clear(&e9810_armed);
+	mutex_unlock(&e9810_arm_lock);
+
+	/*
+	 * Like 4.9, no deep idle while the restart/power-off path runs: the
+	 * gate does that. cpuidle_pause() is not used: its RCU wait proves
+	 * nothing about C2 and blocks on a CPU lost outside RCU idle.
+	 */
+	if (!e9810_drain(&stuck)) {
+		pr_emerg("C2 session NOT closed (%s): cpu %*pbl did not acknowledge leaving C2 within %u ms; the record keeps its session (armed: next boot UNCLEAN)\n",
+			 how[event], cpumask_pr_args(&stuck), E9810_DRAIN_MS);
+		return NOTIFY_OK;
 	}
+	e9810_qm_session_drained(how[event]);
 	return NOTIFY_OK;
 }
 
 /*
- * CPUs leave C2 before nearly every restart notifier runs. One below
- * INT_MAX, so the watchdog's restart guard (INT_MAX, arms the final timeout)
- * always runs first, even if this one blocks.
+ * One below INT_MAX, so the watchdog's restart guard (INT_MAX, arms the
+ * final timeout) always runs first, even if this one blocks.
  */
 static struct notifier_block e9810_reboot_nb = {
 	.notifier_call = e9810_reboot_cb,
 	.priority = INT_MAX - 1,
+};
+
+/*
+ * Set by syscore shutdown in an orderly kernel_restart() (not kexec): the
+ * restart handler may close the session. emergency_restart() and panic
+ * reach the restart handlers without passing syscore shutdown.
+ */
+static bool e9810_restart_final_ok;
+
+static void e9810_syscore_shutdown(void)
+{
+	if (kexec_in_progress) {
+		/* kexec is unclean by definition: no restart handler follows. */
+		pr_emerg("C2 session: kexec: the record stays as it is (next boot: UNCLEAN if C2 was armed)\n");
+		return;
+	}
+	if (system_state == SYSTEM_RESTART)
+		WRITE_ONCE(e9810_restart_final_ok, true);
+	else if (system_state == SYSTEM_POWER_OFF)
+		e9810_qm_session_final("power-off", false);
+	else if (system_state == SYSTEM_HALT)
+		e9810_qm_session_final("halt", false);
+}
+
+static struct syscore_ops e9810_syscore_ops = {
+	.shutdown = e9810_syscore_shutdown,
+};
+
+/*
+ * The last controlled point of a restart: machine_restart(), IRQs off,
+ * the other CPUs stopped. INT_MAX: before every handler that resets (the
+ * crownlte diagnostic restart guard at 255 never returns to the chain).
+ */
+static int e9810_restart_cb(struct notifier_block *nb, unsigned long mode,
+			    void *cmd)
+{
+	e9810_qm_session_final("restart", true);
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block e9810_restart_nb = {
+	.notifier_call = e9810_restart_cb,
+	.priority = INT_MAX,
 };
 
 static const char *e9810_setup(struct platform_device *pdev)
@@ -918,6 +1039,11 @@ static const char *e9810_setup(struct platform_device *pdev)
 	}
 
 	register_reboot_notifier(&e9810_reboot_nb);
+	register_syscore_ops(&e9810_syscore_ops);
+	ret = register_restart_handler(&e9810_restart_nb);
+	if (ret)
+		pr_warn("C2 restart handler not registered (%d): a restart never closes an armed session (next boot UNCLEAN)\n",
+			ret);
 	return NULL;
 }
 
@@ -1583,37 +1709,55 @@ static void e9810_log_setup(void)
 #define E9810_LAST_RESORT_MS		75000
 
 /*
- * Quarantine record v2 (Documentation/crownlte/c2-runtime.md section 6):
+ * Quarantine record v3 (Documentation/crownlte/c2-runtime.md section 6):
  * one page of no-map reserved memory holding two record slots (byte offset
  * 0 and 2048), u32 words. Each write goes to the slot that does not hold
  * the newest record, with the sequence number one higher, so a reset in
  * the middle of a write leaves the previous record intact. A slot is valid
  * only with magic, version, its own slot number, a sequence number of its
- * parity, a known session word, no unknown flag/drill bits and a CRC32 over
- * the words before it; two valid slots must be exactly one sequence number
- * apart. Written through a write-combining mapping, a DSB and a read-back.
+ * parity, a known session word, no unknown flag/drill bits or reason and a
+ * CRC32 over the words before it. Written through a write-combining
+ * mapping, a DSB and a read-back.
  *
- * Fail closed: no valid record (cold boot, another kernel, corruption)
- * means all C2 off (E9810_QF_UNINIT) until an explicit clear: root writes
- * c2_quarantine_clear, or a trial DTB carries a new
- * samsung,c2-quarantine-trial-token and the record is valid (retention
- * shown by an earlier boot of this kernel). A record whose session word
- * still says ARMED means the boot that armed C2 never reached a clean
- * restart or power-off (watchdog reset, panic, power loss): all C2 off
+ * Trust: the record is trusted only when BOTH slots are valid and exactly
+ * one sequence number apart (the newer one wins). Every write keeps it so,
+ * and a fresh record is written twice. One valid slot, or two that do not
+ * chain, is ambiguous: the missing newer record may have been ARMED or
+ * quarantined, so a lone clean slot never authorizes C2. Ambiguous and
+ * missing records mean all C2 off (E9810_QF_UNINIT); what survives (loss
+ * flags, an armed session, consumed drills, the trial floor) is merged in.
+ *
+ * Fail closed until an explicit clear: root writes c2_quarantine_clear, or
+ * a trial DTB carries samsung,c2-quarantine-trial-token above the record's
+ * trial floor on a trusted record. A record whose session word says ARMED
+ * or SHUTDOWN means the boot that armed C2 never reached the last
+ * controlled point of a restart, halt or power-off: all C2 off
  * (E9810_QF_UNCLEAN).
  */
 enum {
 	QM_MAGIC, QM_VERSION, QM_SLOT, QM_SEQ, QM_FLAGS, QM_SESSION, QM_BOOTS,
-	QM_CPUS, QM_UPTIME_MS, QM_REASON, QM_LOSSES, QM_DRILLS, QM_TOKEN,
+	QM_CPUS, QM_UPTIME_MS, QM_REASON, QM_LOSSES, QM_DRILLS, QM_TRIAL,
 	QM_CRC, QM_WORDS
 };
 #define E9810_QM_MAGIC			0x51324339	/* "9C2Q" */
-#define E9810_QM_VERSION		2
+#define E9810_QM_VERSION		3
 #define E9810_QM_SLOTS			2
 #define E9810_QM_SLOT_BYTES		2048
 /* QM_SESSION: C2 may be armed on the boot that wrote it, or not. */
 #define E9810_QS_IDLE			0x49444c45	/* "ELDI" */
 #define E9810_QS_ARMED			0x41524d44	/* "DMRA" */
+/* Drained at the start of a shutdown, last controlled point not reached. */
+#define E9810_QS_SHUTDOWN		0x5348444e	/* "NDHS" */
+/*
+ * QM_TRIAL: the trial floor. A DT trial token clears only if it is above it
+ * (and the record is trusted); then it becomes the floor. Tokens are one
+ * increasing sequence over all trial DTBs, so a token that was used, or
+ * superseded by a later one, never clears again. Tokens at or below
+ * E9810_QM_TRIAL_RETIRED (rounds 0 and 1) never clear. When the history is
+ * lost (no trusted record), the presented token is folded into the floor
+ * without clearing: a later boot needs a new DTB with a higher token.
+ */
+#define E9810_QM_TRIAL_RETIRED		0xc2b10001
 /* QM_DRILLS: drills already run (consumed); root re-arms them. */
 #define E9810_QD_LOST			BIT(0)	/* samsung,c2-lost-drill */
 #define E9810_QD_LOSS			BIT(1)	/* samsung,c2-loss-drill-ms */
@@ -1626,6 +1770,9 @@ enum {
 	E9810_QR_DRILL,		/* samsung,c2-lost-drill (simulated) */
 	E9810_QR_UNCLEAN,	/* armed session without a clean restart */
 	E9810_QR_INVALID,	/* no valid record found at boot */
+	E9810_QR_SHUTDOWN,	/* drained, last controlled point not reached */
+	E9810_QR_AMBIGUOUS,	/* one valid slot, or two that do not chain */
+	E9810_QR_COUNT
 };
 
 static const char * const e9810_qr_name[] = {
@@ -1635,6 +1782,8 @@ static const char * const e9810_qr_name[] = {
 	[E9810_QR_DRILL]	= "drill",
 	[E9810_QR_UNCLEAN]	= "unclean",
 	[E9810_QR_INVALID]	= "invalid",
+	[E9810_QR_SHUTDOWN]	= "shutdown",
+	[E9810_QR_AMBIGUOUS]	= "ambiguous",
 };
 
 static void *e9810_qm;			/* mapped page, NULL if none */
@@ -1642,8 +1791,10 @@ static phys_addr_t e9810_qm_phys;
 static const char *e9810_qm_why = "not probed";
 /* Newest record written (or adopted at probe), under e9810_qm_lock. */
 static u32 e9810_qm_cur[QM_WORDS];
-static bool e9810_qm_found;		/* a valid record was found at probe */
+static bool e9810_qm_found;		/* a trusted record was found at probe */
 static bool e9810_qm_bad;		/* a write failed its read-back */
+/* Set by the shutdown drain once it wrote SHUTDOWN: the final point closes. */
+static const char *e9810_qm_close_how;
 static DEFINE_SPINLOCK(e9810_qm_lock);
 
 struct e9810_det_ping {
@@ -1716,10 +1867,25 @@ static bool e9810_qm_valid(const u32 *w, unsigned int slot)
 	       w[QM_VERSION] == E9810_QM_VERSION &&
 	       w[QM_SLOT] == slot && (w[QM_SEQ] & 1) == slot &&
 	       (w[QM_SESSION] == E9810_QS_IDLE ||
-		w[QM_SESSION] == E9810_QS_ARMED) &&
+		w[QM_SESSION] == E9810_QS_ARMED ||
+		w[QM_SESSION] == E9810_QS_SHUTDOWN) &&
 	       !(w[QM_FLAGS] & ~E9810_QF_KNOWN) &&
 	       !(w[QM_DRILLS] & ~E9810_QD_ALL) &&
+	       w[QM_REASON] < E9810_QR_COUNT &&
 	       w[QM_CRC] == e9810_qm_crc(w);
+}
+
+static const char *e9810_qs_str(u32 session)
+{
+	switch (session) {
+	case E9810_QS_IDLE:
+		return "idle";
+	case E9810_QS_ARMED:
+		return "armed";
+	case E9810_QS_SHUTDOWN:
+		return "shutdown";
+	}
+	return "?";
 }
 
 /*
@@ -1767,42 +1933,63 @@ static const char *e9810_qr_str(u32 reason)
 	return reason < ARRAY_SIZE(e9810_qr_name) ? e9810_qr_name[reason] : "?";
 }
 
+enum { E9810_QM_TRUSTED, E9810_QM_AMBIGUOUS, E9810_QM_NONE };
+
 /*
- * Pick the newest valid slot. Two valid slots must be one sequence number
- * apart; anything else is treated as no valid record. *seq_base: the
- * highest valid sequence number seen (0 if none), so the next write never
- * reuses one.
+ * Read both slots. E9810_QM_TRUSTED: both valid and exactly one sequence
+ * number apart; @w is the newer one. E9810_QM_AMBIGUOUS: one valid slot, or
+ * two that do not chain; the newest record may be lost, so @w is the
+ * conservative merge of the valid slots (every flag, an unclean flag for a
+ * session that is not IDLE, every lost CPU and consumed drill, the highest
+ * counters and trial floor). E9810_QM_NONE: no valid slot, @w zeroed.
+ * *seq_base: the highest valid sequence number (0 if none), so the next
+ * write never reuses one.
  */
-static bool e9810_qm_pick(u32 *w, u32 *seq_base, const char **why)
+static int e9810_qm_pick(u32 *w, u32 *seq_base, const char **why)
 {
 	u32 s[E9810_QM_SLOTS][QM_WORDS];
 	bool v[E9810_QM_SLOTS];
-	unsigned int i;
+	unsigned int i, n = 0;
 
 	*seq_base = 0;
+	memset(w, 0, sizeof(s[0]));
 	for (i = 0; i < E9810_QM_SLOTS; i++) {
 		e9810_qm_read(i, s[i]);
 		v[i] = e9810_qm_valid(s[i], i);
+		n += v[i];
 	}
-	if (v[0] && v[1]) {
+	if (n == 2) {
 		u32 d = s[1][QM_SEQ] - s[0][QM_SEQ];
 
+		*seq_base = (s32)d > 0 ? s[1][QM_SEQ] : s[0][QM_SEQ];
 		if (d == 1 || d == (u32)-1) {
 			memcpy(w, s[d == 1 ? 1 : 0], sizeof(s[0]));
-			return true;
+			return E9810_QM_TRUSTED;
 		}
-		*seq_base = (s32)d > 0 ? s[1][QM_SEQ] : s[0][QM_SEQ];
 		*why = "both slots valid but not one sequence number apart";
-		return false;
+	} else if (n == 1) {
+		*why = "only one valid slot: its successor may be lost";
+	} else {
+		*why = "no valid slot";
+		return E9810_QM_NONE;
 	}
+
 	for (i = 0; i < E9810_QM_SLOTS; i++) {
-		if (v[i]) {
-			memcpy(w, s[i], sizeof(s[0]));
-			return true;
-		}
+		if (!v[i])
+			continue;
+		if (n == 1)
+			*seq_base = s[i][QM_SEQ];
+		w[QM_FLAGS] |= s[i][QM_FLAGS];
+		if (s[i][QM_SESSION] != E9810_QS_IDLE)
+			w[QM_FLAGS] |= E9810_QF_UNCLEAN;
+		w[QM_CPUS] |= s[i][QM_CPUS];
+		w[QM_DRILLS] |= s[i][QM_DRILLS];
+		w[QM_BOOTS] = max(w[QM_BOOTS], s[i][QM_BOOTS]);
+		w[QM_LOSSES] = max(w[QM_LOSSES], s[i][QM_LOSSES]);
+		w[QM_UPTIME_MS] = max(w[QM_UPTIME_MS], s[i][QM_UPTIME_MS]);
+		w[QM_TRIAL] = max(w[QM_TRIAL], s[i][QM_TRIAL]);
 	}
-	*why = "no valid slot";
-	return false;
+	return E9810_QM_AMBIGUOUS;
 }
 
 /*
@@ -1816,7 +2003,8 @@ static void e9810_qm_init(struct device *dev)
 	struct reserved_mem *rmem;
 	u32 w[QM_WORDS], seq_base, token = 0;
 	const char *bad = NULL;
-	bool nomap, cleared = false;
+	bool nomap, ok, cleared = false;
+	int state;
 
 	/* Fail closed until a valid record is in place. */
 	e9810_quarantine = E9810_QF_UNINIT;
@@ -1849,35 +2037,58 @@ static void e9810_qm_init(struct device *dev)
 	of_property_read_u32(dev->of_node, "samsung,c2-quarantine-trial-token",
 			     &token);
 
-	e9810_qm_found = e9810_qm_pick(w, &seq_base, &bad);
-	if (e9810_qm_found) {
-		e9810_qm_cur[QM_SEQ] = w[QM_SEQ];
-		if (w[QM_SESSION] == E9810_QS_ARMED) {
+	state = e9810_qm_pick(w, &seq_base, &bad);
+	e9810_qm_found = state == E9810_QM_TRUSTED;
+	e9810_qm_cur[QM_SEQ] = seq_base;
+	if (state == E9810_QM_TRUSTED) {
+		if (w[QM_SESSION] != E9810_QS_IDLE) {
 			w[QM_FLAGS] |= E9810_QF_UNCLEAN;
 			if (w[QM_REASON] == E9810_QR_NONE)
-				w[QM_REASON] = E9810_QR_UNCLEAN;
+				w[QM_REASON] =
+					w[QM_SESSION] == E9810_QS_SHUTDOWN ?
+					E9810_QR_SHUTDOWN : E9810_QR_UNCLEAN;
 		}
-		/* Explicit one-shot clear by a trial DTB (new token only). */
-		if (token && token != w[QM_TOKEN]) {
-			pr_warn("C2 quarantine: trial token %#x (record has %#x): one-shot clear of flags %#x (%s) by the DT\n",
-				token, w[QM_TOKEN], w[QM_FLAGS],
+		/* Explicit one-shot clear by a trial DTB: a token above the floor. */
+		if (token && token <= E9810_QM_TRIAL_RETIRED) {
+			pr_warn("C2 quarantine: trial token %#x is retired (rounds 0/1, at or below %#x): ignored\n",
+				token, E9810_QM_TRIAL_RETIRED);
+		} else if (token && token <= w[QM_TRIAL]) {
+			pr_warn("C2 quarantine: trial token %#x not above the trial floor %#x (already used or superseded): ignored; a clear needs a new DTB with a higher token, or root c2_quarantine_clear\n",
+				token, w[QM_TRIAL]);
+		} else if (token) {
+			pr_warn("C2 quarantine: trial token %#x (floor %#x): one-shot clear of flags %#x (%s) by the DT\n",
+				token, w[QM_TRIAL], w[QM_FLAGS],
 				e9810_qm_flags_str(w[QM_FLAGS]));
 			w[QM_FLAGS] = 0;
 			w[QM_CPUS] = 0;
 			w[QM_UPTIME_MS] = 0;
 			w[QM_REASON] = E9810_QR_NONE;
-			w[QM_TOKEN] = token;
+			w[QM_TRIAL] = token;
 			cleared = true;
 		}
 	} else {
-		memset(w, 0, sizeof(w));
-		e9810_qm_cur[QM_SEQ] = seq_base;
-		w[QM_FLAGS] = E9810_QF_UNINIT;
-		w[QM_REASON] = E9810_QR_INVALID;
+		/* @w: the merge of what survived (ambiguous), or zeroes. */
+		w[QM_FLAGS] |= E9810_QF_UNINIT;
+		w[QM_REASON] = state == E9810_QM_AMBIGUOUS ?
+			       E9810_QR_AMBIGUOUS : E9810_QR_INVALID;
+		/*
+		 * Whether this token was consumed before cannot be told: it
+		 * is spent now, without clearing (renewed authorization: a
+		 * new DTB with a higher token, or root).
+		 */
+		if (token > E9810_QM_TRIAL_RETIRED && token > w[QM_TRIAL]) {
+			pr_warn("C2 quarantine: trial token %#x not applied: no trusted record, so its earlier use cannot be ruled out; it is now the trial floor (a clear needs a new DTB with a token above %#x, or root c2_quarantine_clear)\n",
+				token, token);
+			w[QM_TRIAL] = token;
+		}
 	}
 	w[QM_SESSION] = E9810_QS_IDLE;
 	w[QM_BOOTS]++;
-	if (!e9810_qm_commit(w)) {
+	ok = e9810_qm_commit(w);
+	/* A fresh or rebuilt record goes into both slots: trusted next time. */
+	if (ok && state != E9810_QM_TRUSTED)
+		ok = e9810_qm_commit(w);
+	if (!ok) {
 		e9810_qm_why = "record write failed its read-back";
 		pr_err("C2 quarantine marker at %pa: write failed its read-back: all C2 off this boot\n",
 		       &e9810_qm_phys);
@@ -1885,26 +2096,34 @@ static void e9810_qm_init(struct device *dev)
 	}
 	e9810_quarantine = w[QM_FLAGS] & (E9810_QF_LITTLE | E9810_QF_ALL_OFF);
 
-	if (!e9810_qm_found)
-		pr_warn("C2 quarantined (all): no valid record at %pa (%s): fail closed, a new UNINIT record (seq %u) was written; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB token on a later boot\n",
-			&e9810_qm_phys, bad,
-			w[QM_SEQ], dev_name(dev));
+	if (state == E9810_QM_NONE)
+		pr_warn("C2 quarantined (all): no valid record at %pa (%s): fail closed, a new UNINIT record (seq %u, both slots) was written; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB with a token above %#x on a later boot\n",
+			&e9810_qm_phys, bad, w[QM_SEQ], dev_name(dev),
+			max_t(u32, w[QM_TRIAL], E9810_QM_TRIAL_RETIRED));
+	else if (state == E9810_QM_AMBIGUOUS)
+		pr_warn("C2 quarantined (all): ambiguous record at %pa (%s): fail closed, kept flags %#x%s, cpus %#x, %u losses, drills %#x, trial floor %#x; rewritten as UNINIT (seq %u, both slots); clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB with a token above %#x on a later boot\n",
+			&e9810_qm_phys, bad, w[QM_FLAGS],
+			(w[QM_FLAGS] & E9810_QF_UNCLEAN) ? " UNCLEAN (a surviving slot had a session that was not closed)" : "",
+			w[QM_CPUS], w[QM_LOSSES], w[QM_DRILLS], w[QM_TRIAL],
+			w[QM_SEQ], dev_name(dev),
+			max_t(u32, w[QM_TRIAL], E9810_QM_TRIAL_RETIRED));
 	else if (e9810_quarantine)
-		pr_warn("C2 quarantined (%s): flags %#x%s%s%s, cpus %#x lost at %u ms (%s), %u losses, %u boots counted (seq %u); %s; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear\n",
+		pr_warn("C2 quarantined (%s): flags %#x%s%s%s, cpus %#x lost at %u ms (%s), %u losses, %u boots counted (seq %u); %s; clear: echo 1 > /sys/bus/platform/devices/%s/c2_quarantine_clear, or a trial DTB with a token above %#x\n",
 			e9810_qm_flags_str(e9810_quarantine), w[QM_FLAGS],
-			(w[QM_FLAGS] & E9810_QF_UNCLEAN) ? " UNCLEAN (the last armed session never reached a clean restart)" : "",
-			(w[QM_FLAGS] & E9810_QF_UNINIT) ? " UNINIT (never cleared since an invalid record)" : "",
+			(w[QM_FLAGS] & E9810_QF_UNCLEAN) ? " UNCLEAN (the last armed session never reached the last controlled point of a restart/halt/power-off)" : "",
+			(w[QM_FLAGS] & E9810_QF_UNINIT) ? " UNINIT (never cleared since a missing or ambiguous record)" : "",
 			(w[QM_FLAGS] & E9810_QF_DRILL) ? " drill" : "",
 			w[QM_CPUS], w[QM_UPTIME_MS], e9810_qr_str(w[QM_REASON]),
 			w[QM_LOSSES], w[QM_BOOTS], w[QM_SEQ],
 			(e9810_quarantine & E9810_QF_ALL_OFF) ?
 			"all C2 off" : "LITTLE C2 off, big C2 allowed",
-			dev_name(dev));
+			dev_name(dev),
+			max_t(u32, w[QM_TRIAL], E9810_QM_TRIAL_RETIRED));
 	else
-		pr_info("C2 quarantine marker at %pa: clear%s (seq %u, %u losses, %u boots counted, drills consumed %#x, token %#x)\n",
+		pr_info("C2 quarantine marker at %pa: clear%s (seq %u, %u losses, %u boots counted, drills consumed %#x, trial floor %#x)\n",
 			&e9810_qm_phys, cleared ? " (trial token)" : "",
 			w[QM_SEQ], w[QM_LOSSES], w[QM_BOOTS], w[QM_DRILLS],
-			w[QM_TOKEN]);
+			w[QM_TRIAL]);
 	return;
 none:
 	/* Boot arming and drills are refused; the DT-gated self-test may arm. */
@@ -1924,6 +2143,9 @@ static const char *e9810_qm_session_arm(void)
 	u32 w[QM_WORDS];
 	bool ok = true;
 
+	/* Under e9810_arm_lock: the shutdown gate cannot close meanwhile. */
+	if (READ_ONCE(e9810_shutdown))
+		return "restart or power-off under way";
 	if (!e9810_qm)
 		return NULL;
 	spin_lock_irqsave(&e9810_qm_lock, flags);
@@ -1939,28 +2161,80 @@ static const char *e9810_qm_session_arm(void)
 }
 
 /*
- * Clean restart or power-off, every CPU out of C2 and disarmed: the
- * session ends cleanly. Never after a loss (the record says why).
+ * The shutdown drain succeeded (gate closed for good, every CPU
+ * acknowledged leaving C2): ARMED -> SHUTDOWN. The next boot still treats
+ * SHUTDOWN as unclean; e9810_qm_session_final() closes it at the last
+ * controlled point. Never after a loss (the record says why).
  */
-static void e9810_qm_session_close(const char *how)
+static void e9810_qm_session_drained(const char *how)
 {
 	unsigned long flags;
 	u32 w[QM_WORDS];
 	bool ok = true, was = false;
 
-	if (!e9810_qm || atomic_read(&e9810_lost_fired))
+	if (!e9810_qm)
 		return;
+	if (atomic_read(&e9810_lost_fired)) {
+		pr_emerg("C2 session not closed (%s): a loss was recorded on this boot\n",
+			 how);
+		return;
+	}
 	spin_lock_irqsave(&e9810_qm_lock, flags);
 	if (e9810_qm_cur[QM_SESSION] == E9810_QS_ARMED) {
 		was = true;
 		memcpy(w, e9810_qm_cur, sizeof(w));
-		w[QM_SESSION] = E9810_QS_IDLE;
+		w[QM_SESSION] = E9810_QS_SHUTDOWN;
 		ok = e9810_qm_commit(w);
+		if (ok)
+			WRITE_ONCE(e9810_qm_close_how, how);
 	}
 	spin_unlock_irqrestore(&e9810_qm_lock, flags);
 	if (was)
-		pr_info("C2 session closed cleanly (%s)%s\n", how,
-			ok ? "" : ": WRITE FAILED, the next boot sees it as unclean");
+		pr_info("C2 session drained (%s): every CPU acknowledged leaving C2; record %s (seq %u), closed only at the final %s point\n",
+			how, ok ? "SHUTDOWN" : "WRITE FAILED, stays ARMED",
+			e9810_qm_cur[QM_SEQ],
+			strcmp(how, "restart") ? "syscore shutdown" : "restart handler");
+}
+
+/*
+ * The last controlled point: the restart handler (machine_restart(), IRQs
+ * off, other CPUs stopped) after an orderly kernel_restart(), or syscore
+ * shutdown for halt and power-off. SHUTDOWN -> IDLE, only if this boot
+ * drained cleanly, recorded no loss and is not in a panic, an oops or
+ * kexec. Never waits for the lock: a stopped CPU may hold it, and then the
+ * record stays SHUTDOWN (unclean). Nothing is printed after the write.
+ */
+static void e9810_qm_session_final(const char *how, bool restart)
+{
+	unsigned long flags;
+	u32 w[QM_WORDS];
+	bool ok = false, locked;
+
+	if (!e9810_qm || !READ_ONCE(e9810_qm_close_how) ||
+	    atomic_read(&e9810_lost_fired) ||
+	    atomic_read(&panic_cpu) != PANIC_CPU_INVALID ||
+	    oops_in_progress || kexec_in_progress)
+		return;
+	if (restart && (!READ_ONCE(e9810_restart_final_ok) ||
+			system_state != SYSTEM_RESTART))
+		return;
+	pr_emerg("C2 session: final %s point: closing the record (SHUTDOWN -> IDLE)\n",
+		 how);
+	local_irq_save(flags);
+	locked = spin_trylock(&e9810_qm_lock);
+	if (locked) {
+		if (e9810_qm_cur[QM_SESSION] == E9810_QS_SHUTDOWN) {
+			memcpy(w, e9810_qm_cur, sizeof(w));
+			w[QM_SESSION] = E9810_QS_IDLE;
+			ok = e9810_qm_commit(w);
+		}
+		spin_unlock(&e9810_qm_lock);
+	}
+	WRITE_ONCE(e9810_qm_close_how, NULL);
+	local_irq_restore(flags);
+	if (!ok)
+		pr_emerg("C2 session NOT closed at the final %s point (%s): the next boot sees it as unclean\n",
+			 how, locked ? "WRITE FAILED" : "record lock busy");
 }
 
 /* Persist drill bits as consumed before the drill runs. */
@@ -2019,9 +2293,9 @@ static void e9810_qm_record(const struct cpumask *lost, u32 reason)
 		 ok ? "written and read back" : "WRITE FAILED (kept)",
 		 &e9810_qm_phys, w[QM_SEQ], w[QM_FLAGS], w[QM_CPUS],
 		 e9810_qr_str(w[QM_REASON]), w[QM_LOSSES],
-		 w[QM_SESSION] == E9810_QS_ARMED ? "armed" : "idle",
+		 e9810_qs_str(w[QM_SESSION]),
 		 e9810_qm_flags_str(w[QM_FLAGS] |
-			(w[QM_SESSION] == E9810_QS_ARMED ? E9810_QF_UNCLEAN : 0)));
+			(w[QM_SESSION] != E9810_QS_IDLE ? E9810_QF_UNCLEAN : 0)));
 }
 
 static void e9810_reboot_fn(struct work_struct *work)
@@ -2262,8 +2536,12 @@ static void e9810_detect(struct work_struct *work)
 	unsigned int cpu;
 	bool locked;
 
-	/* Not during a restart or power-off; SYSTEM_SUSPEND passes by. */
-	if (system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF ||
+	/*
+	 * Not during a restart or power-off (the shutdown drain handles a CPU
+	 * that does not come out); SYSTEM_SUSPEND passes by.
+	 */
+	if (READ_ONCE(e9810_shutdown) ||
+	    system_state == SYSTEM_HALT || system_state == SYSTEM_POWER_OFF ||
 	    system_state == SYSTEM_RESTART || atomic_read(&e9810_lost_fired))
 		return;
 	e9810_det_scans++;
@@ -2616,14 +2894,14 @@ static ssize_t c2_quarantine_show(struct device *dev,
 	for (i = 0; i < E9810_QM_SLOTS; i++)
 		e9810_qm_read(i, s[i]);
 	spin_unlock_irqrestore(&e9810_qm_lock, flags);
-	return sysfs_emit(buf, "record seq=%u flags=%#x (%s%s%s%s) session=%s cpus=%#x uptime_ms=%u reason=%s losses=%u boots=%u drills_consumed=%#x token=%#x slot0=%s/%u slot1=%s/%u found_at_boot=%d write_failed=%d in_force=%s (%#x)\n",
+	return sysfs_emit(buf, "record seq=%u flags=%#x (%s%s%s%s) session=%s cpus=%#x uptime_ms=%u reason=%s losses=%u boots=%u drills_consumed=%#x trial_floor=%#x slot0=%s/%u slot1=%s/%u trusted_at_boot=%d write_failed=%d in_force=%s (%#x)\n",
 			  w[QM_SEQ], w[QM_FLAGS], e9810_qm_flags_str(w[QM_FLAGS]),
 			  (w[QM_FLAGS] & E9810_QF_UNCLEAN) ? ", unclean" : "",
 			  (w[QM_FLAGS] & E9810_QF_UNINIT) ? ", uninit" : "",
 			  (w[QM_FLAGS] & E9810_QF_DRILL) ? ", drill" : "",
-			  w[QM_SESSION] == E9810_QS_ARMED ? "armed" : "idle",
+			  e9810_qs_str(w[QM_SESSION]),
 			  w[QM_CPUS], w[QM_UPTIME_MS], e9810_qr_str(w[QM_REASON]),
-			  w[QM_LOSSES], w[QM_BOOTS], w[QM_DRILLS], w[QM_TOKEN],
+			  w[QM_LOSSES], w[QM_BOOTS], w[QM_DRILLS], w[QM_TRIAL],
 			  e9810_qm_valid(s[0], 0) ? "valid" : "invalid",
 			  s[0][QM_SEQ],
 			  e9810_qm_valid(s[1], 1) ? "valid" : "invalid",
@@ -2633,8 +2911,10 @@ static ssize_t c2_quarantine_show(struct device *dev,
 static DEVICE_ATTR_ADMIN_RO(c2_quarantine);
 
 /*
- * The explicit clear (root): writes a record with no quarantine flags. The
- * session word and the consumed drills are kept. Takes effect on the next
+ * The explicit clear (root): writes a record with no quarantine flags
+ * (UNINIT and UNCLEAN included). The session word, the consumed drills and
+ * the trial floor are kept. The record stays trusted (both slots valid and
+ * chained), so the clear takes effect on the next
  * boot; this boot keeps the quarantine it started with.
  */
 static ssize_t c2_quarantine_clear_store(struct device *dev,
