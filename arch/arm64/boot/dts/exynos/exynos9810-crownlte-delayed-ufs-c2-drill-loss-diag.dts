@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * C2 S0 drill (b), delayed-UFS vehicle: big C2 armed (cpu4-7) at 30 s, and
+ * cpu1-3 armed at the same time for at most 60 s with no LITTLE concurrency
+ * limit: the configuration that lost a LITTLE core in EL3 in q22b, q40, q43
+ * and c2diag-a/b (20-255 attempts). Expected: the lost-core detector finds
+ * the core within about 3 s, then marker (LITTLE), watchdog stop-petting and
+ * an orderly reboot (watchdog reset within 30 s if that hangs). No cpuidle
+ * self-test. Run only with the owner present.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+#include "exynos9810-crownlte-c2.dtsi"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + C2 drill (b): real LITTLE loss";
+};
+
+&cpuidle {
+	/delete-property/ samsung,cpuidle-selftest;
+	samsung,c2-boot-cpus = <0xf0>;
+	samsung,c2-arm-delay-ms = <30000>;
+	samsung,c2-loss-drill-ms = <60000>;
+};

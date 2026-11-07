@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * C2 S0 drill (a), delayed-UFS vehicle: big C2 armed (cpu4-7) at 30 s, then
+ * at 60 s the lost-core detector treats cpu2 as lost (simulated). Expected:
+ * C2-LOST dump, quarantine marker (LITTLE), everything disarmed, watchdog no
+ * longer petted, CLUSTER0 watchdog reset at about 90 s (before the 120 s PID1
+ * restart). The driver reboots by itself at 105 s if the watchdog did not
+ * fire, and restarts at 135 s as a last resort. No cpuidle self-test.
+ */
+#include "exynos9810-crownlte-delayed-ufs-diag.dts"
+#include "exynos9810-crownlte-c2.dtsi"
+
+&{/} {
+	model = "Samsung Note9 delayed UFS diagnostic + C2 drill (a): simulated lost core";
+};
+
+&cpuidle {
+	/delete-property/ samsung,cpuidle-selftest;
+	samsung,c2-boot-cpus = <0xf0>;
+	samsung,c2-arm-delay-ms = <30000>;
+	samsung,c2-lost-drill = <2 60000>;
+};

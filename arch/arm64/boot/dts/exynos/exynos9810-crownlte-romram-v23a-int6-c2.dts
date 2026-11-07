@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ROM-in-RAM integration 6 + runtime C2 stage S1a: C2 on the big cluster
+ * (cpu4-7) from 45 s boot time, LITTLE stays WFI. Needs the S0 chain of
+ * crownlte-c2-runtime (lost-core detector, watchdog stop-petting, quarantine
+ * marker page, buddy hard-lockup panic). See Documentation/crownlte/c2-runtime.md.
+ *
+ * Build with rom-ram/src/build-dtb.sh (KSRC = this tree, KO = its build
+ * directory).
+ */
+#include "exynos9810-crownlte-romram-v23a-int6.dts"
+#include "exynos9810-crownlte-c2.dtsi"
+
+&{/} {
+	model = "Samsung Note9 ROM-in-RAM v23a integration 6 + big C2 (S1a)";
+};
+
+&{/soc@0/cpuidle@14070000} {
+	samsung,c2-boot-cpus = <0xf0>;
+	/* After the 40 s boot QoS release. */
+	samsung,c2-arm-delay-ms = <45000>;
+};
