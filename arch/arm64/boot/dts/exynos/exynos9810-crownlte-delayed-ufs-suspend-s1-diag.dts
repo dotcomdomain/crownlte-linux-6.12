@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Suspend stage S1, first half (Documentation/crownlte/suspend-s1.md):
+ * S1a reads the SoC's own RTC (AP RTC, 0x141E0000), its CMU_APM Q-channel
+ * and PMU 0x404/0x408/0x40c; S1b arms a seconds-only AP RTC alarm while
+ * awake (+3 s, +7 s), waits for INTP.ALM, disarms it and restores every RTC
+ * register it wrote. Nothing sleeps: no suspend or syscore ops are
+ * registered, there is no firmware call, no PMIC/UFS/charger write. S0a and
+ * S0b run as the regression base (S1 between them). Log prefixes
+ * "suspend s1:" and "suspend s0:".
+ *
+ * Changes against the S0 diagnostic DTB:
+ *  - samsung,suspend-s0 = "a", "b" (no S0c/S0d: no suspend ops);
+ *  - samsung,suspend-s1 = "a", "b" and two more register windows on the
+ *    suspend node: "ap-rtc" and "apm-qch-rtc" (CMU_APM QCH_CON_APBIF_RTC,
+ *    read by the 4.9 CAL save_sleep list);
+ *  - the read-only PMIC self-test also dumps PWREN_SEL1/2 (0xc8/0xc9).
+ * UFS stays unbound (never send CROWNLTE-UFS-PROBE-1).
+ */
+#include "exynos9810-crownlte-delayed-ufs-suspend-s0-diag.dts"
+
+&{/} {
+	model = "Samsung Note9 suspend S1a/S1b diagnostic";
+};
+
+&system_suspend {
+	reg = <0x0 0x14070000 0x1000>,
+	      <0x0 0x14050000 0x1000>,
+	      <0x0 0x10101000 0x1000>,
+	      <0x0 0x10040000 0x800>,
+	      <0x0 0x0204f800 0x400>,
+	      <0x0 0x14100000 0x100>,
+	      <0x0 0x141e0000 0x100>,
+	      <0x0 0x14003028 0x4>;
+	reg-names = "intr-gen", "gpio-alive", "gicd", "mct",
+		    "flexpmu-dbg", "apm-mailbox", "ap-rtc", "apm-qch-rtc";
+	samsung,suspend-s0 = "a", "b";
+	samsung,suspend-s1 = "a", "b";
+};
+
+&s2mps18_pmic {
+	samsung,pmic-selftest-pwren-sel;
+};
