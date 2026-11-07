@@ -351,6 +351,67 @@ static int suspend_test(int level)
 	return 0;
 }
 
+#ifdef CONFIG_PM_DEBUG
+/**
+ * pm_suspend_test_level - Run suspend-to-RAM once at one pm_test level.
+ * @level: "freezer", "devices", "platform", "processors" or "core", as in
+ *         /sys/power/pm_test.
+ * @delay_s: wait at that level, in seconds (pm_test_delay for this call).
+ *
+ * For in-kernel self-tests that have no user space to drive /sys/power
+ * (crownlte suspend S0c, drivers/soc/samsung/exynos9810-pm.c). Sets
+ * pm_test_level and pm_test_delay, runs pm_suspend(PM_SUSPEND_MEM) and
+ * restores both. "none" is refused: that would really suspend.
+ *
+ * Both values are changed under system_transition_mutex, as the
+ * /sys/power/pm_test store does, but the mutex cannot be held across
+ * pm_suspend() (enter_state() trylocks it). A concurrent write to
+ * /sys/power/pm_test in that window wins; a caller that must never reach
+ * suspend_ops->enter() has to ensure that in its platform ops itself.
+ *
+ * Returns the result of pm_suspend(), or -EINVAL for an unknown level.
+ */
+int pm_suspend_test_level(const char *level, unsigned int delay_s)
+{
+	static const struct {
+		const char *name;
+		int level;
+	} levels[] = {
+		{ "freezer", TEST_FREEZER },
+		{ "devices", TEST_DEVICES },
+		{ "platform", TEST_PLATFORM },
+		{ "processors", TEST_CPUS },
+		{ "core", TEST_CORE },
+	};
+	unsigned int old_delay, sleep_flags;
+	int i, old_level, error;
+
+	for (i = 0; i < ARRAY_SIZE(levels); i++)
+		if (!strcmp(level, levels[i].name))
+			break;
+	if (i == ARRAY_SIZE(levels))
+		return -EINVAL;
+
+	/* Same lock as the /sys/power/pm_test store. */
+	sleep_flags = lock_system_sleep();
+	old_level = pm_test_level;
+	old_delay = pm_test_delay;
+	pm_test_level = levels[i].level;
+	pm_test_delay = delay_s;
+	unlock_system_sleep(sleep_flags);
+
+	error = pm_suspend(PM_SUSPEND_MEM);
+
+	sleep_flags = lock_system_sleep();
+	pm_test_level = old_level;
+	pm_test_delay = old_delay;
+	unlock_system_sleep(sleep_flags);
+
+	return error;
+}
+EXPORT_SYMBOL_GPL(pm_suspend_test_level);
+#endif /* CONFIG_PM_DEBUG */
+
 /**
  * suspend_prepare - Prepare for entering system sleep state.
  * @state: Target system sleep state.
