@@ -57,8 +57,10 @@
 #include <linux/mfd/syscon.h>
 #include <linux/mm.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/reboot.h>
 #include <linux/regmap.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -100,8 +102,23 @@
 #define IOVA_DRAM_FIRMWARE		0x80000000UL
 #define IVA_FIRMWARE_SIZE		SZ_512K
 #define IOVA_IVA_FIRMWARE		0x90000000UL
-#define IOVA_CHIPID			0x10000000UL	/* identity, 4.9 */
+#define IOVA_CHIPID			0x10000000UL	/* 4.9: identity */
 #define AUDIF_RATE_HZ			24576000
+
+/*
+ * Chip-ID registers copied into the snapshot page at IOVA_CHIPID: the ones
+ * the 4.9 exynos9810 chipid driver reads (PRODUCT_ID, unique ID low/high,
+ * revision). The CPU reads them once at probe; the DSP never sees the real
+ * chip-ID page. Every other offset of the snapshot page reads 0.
+ */
+#define CHIPID_PRODUCT_ID		0x00
+#define CHIPID_UNIQUE_LO		0x04
+#define CHIPID_UNIQUE_HI		0x08
+#define CHIPID_REV			0x10
+#define CHIPID_WINDOW			0x14
+static const u16 a2_chipid_regs[] = {
+	CHIPID_PRODUCT_ID, CHIPID_UNIQUE_LO, CHIPID_UNIQUE_HI, CHIPID_REV,
+};
 
 /* IPC (4.9 include/sound/samsung/abox_ipc.h) */
 #define IPC_SYSTEM			1
@@ -402,6 +419,7 @@ struct abox_a2 {
 	void *dram;
 	struct a2_chunk iva_chunk;
 	void *iva;
+	struct page *chipid_page;	/* RAM snapshot mapped at IOVA_CHIPID */
 	struct iommu_domain *domain;
 	bool attached;
 
@@ -701,36 +719,71 @@ static void a2_log_tail(struct abox_a2 *a)
 	kfree(buf);
 }
 
+enum a2_stop_result {
+	A2_STOP_CLEAN,		/* SUSPEND acked, WFI seen, CPU off confirmed */
+	A2_STOP_OFF_DIRTY,	/* CPU off confirmed, but no SUSPEND ack or no WFI */
+	A2_STOP_UNCONFIRMED,	/* CPU off not confirmed: the DSP may still run */
+};
+
 /*
  * Stop the DSP: 4.9 abox_cpu_pm_ipc(SUSPEND) + WFI poll, then the CPU
- * enable/power clear of the 4.9 8895 path, then status off. Returns true
- * when the CPU reads off; the caller keeps the SysMMU translating if not.
+ * enable/power clear of the 4.9 8895 path, then status off. The SUSPEND
+ * ack, the WFI poll and the CPU-off poll are three separate results; only
+ * all three together are a clean stop. The DRAM request (SYSPOWER_CTRL) is
+ * withdrawn only once the CPU reads off. If it does not, nothing the DSP
+ * may still use is given back (DRAM request, clocks, buffers, SysMMU
+ * translation) and the caller ends the boot via a2_end_left_running().
  */
-static bool a2_stop(struct abox_a2 *a, int n)
+static enum a2_stop_result a2_stop(struct abox_a2 *a, int n)
 {
-	u32 v;
-	int ret, wfi;
+	u32 sb = 0, st = 0;
+	int ipc, wfi, off;
 
-	ret = a2_ipc_send(a, ABOX_SUSPEND);
-	wfi = regmap_read_poll_timeout(gate.pmu, PMU_ABOX_CPU_STANDBY, v,
-				       v & ABOX_CPU_STANDBY_WFI, 100, A2_WFI_TIMEOUT_US);
+	ipc = a2_ipc_send(a, ABOX_SUSPEND);
+	wfi = regmap_read_poll_timeout(gate.pmu, PMU_ABOX_CPU_STANDBY, sb,
+				       sb & ABOX_CPU_STANDBY_WFI, 100, A2_WFI_TIMEOUT_US);
 	pr_info(A2 "boot %d: ABOX_SUSPEND ipc %s, WFI %s (STANDBY=%#x)\n", n,
-		ret ? "NOT acked" : "acked", wfi ? "NOT seen" : "seen", v);
+		ipc ? "NOT acked" : "acked", wfi ? "NOT seen" : "seen", sb);
 	if (wfi)
 		a2_dump_gpr(a, "no WFI after ABOX_SUSPEND");
 
 	regmap_update_bits(gate.pmu, PMU_ABOX_CPU_OPTION, ABOX_CPU_OPTION_ENABLE_CPU, 0);
 	regmap_update_bits(gate.pmu, PMU_ABOX_CPU_CONFIGURATION, ABOX_CPU_LOCAL_PWR_CFG, 0);
-	ret = regmap_read_poll_timeout(gate.pmu, PMU_ABOX_CPU_STATUS, v,
-				       !(v & ABOX_CPU_STATUS_ON), 100, A2_CPU_OFF_TIMEOUT_US);
-	writel(0, a->sfr + ABOX_SYSPOWER_CTRL);	/* 4.9 abox_request_dram_on(false) */
-	if (ret) {
-		pr_err(A2 "boot %d: ABOX CPU still on after enable/power off (STATUS=%#x)\n", n, v);
-		return false;
+	off = regmap_read_poll_timeout(gate.pmu, PMU_ABOX_CPU_STATUS, st,
+				       !(st & ABOX_CPU_STATUS_ON), 100, A2_CPU_OFF_TIMEOUT_US);
+	if (off) {
+		pr_err(A2 "boot %d: ABOX CPU still on after enable/power off (STATUS=%#x): DRAM request (SYSPOWER_CTRL) kept\n",
+		       n, st);
+		return A2_STOP_UNCONFIRMED;
 	}
-	pr_info(A2 "boot %d: ABOX CPU off (STATUS=%#x)\n", n, v);
+	writel(0, a->sfr + ABOX_SYSPOWER_CTRL);	/* 4.9 abox_request_dram_on(false) */
 	WRITE_ONCE(a->dsp_running, false);
-	return !wfi;
+	pr_info(A2 "boot %d: ABOX CPU off (STATUS=%#x)%s\n", n, st,
+		ipc || wfi ? ", stop not clean (no SUSPEND ack or no WFI)" : "");
+	return ipc || wfi ? A2_STOP_OFF_DIRTY : A2_STOP_CLEAN;
+}
+
+/*
+ * The ABOX CPU did not read off after a stop. The DSP may still execute
+ * and DMA, so this boot keeps everything it may use: the DRAM request
+ * (SYSPOWER_CTRL = 1), the AUD clocks (held by the gate), the firmware
+ * buffers and the chip-ID snapshot, and the runtime-PM reference that
+ * keeps the SysMMU translating with A2's domain; a2_abox_suspend() refuses
+ * system suspend. The boot then ends through the CL0 watchdog: petting
+ * stops for good, so the SoC resets within the watchdog timeout (the
+ * counter is reloaded once, so the logs reach pstore). Only if the guarded
+ * watchdog cannot do that (gone or not running), an orderly reboot.
+ */
+static void a2_end_left_running(struct abox_a2 *a)
+{
+	int ret;
+
+	pr_emerg(A2 "ABOX CPU could not be stopped: DRAM request, AUD clocks, buffers and SysMMU translation kept, system suspend refused; ending this boot via the watchdog\n");
+	ret = s3c2410wdt_crownlte_stop_petting("audio A2: ABOX CPU not stopped");
+	if (ret >= 0)
+		return;
+	pr_emerg(A2 "CL0 watchdog final stop not possible (%d): orderly reboot\n", ret);
+	orderly_reboot();
 }
 
 /* one firmware boot, 4.9 abox_enable() order; 0 = booted, answered, stopped */
@@ -792,7 +845,7 @@ static int a2_boot_once(struct abox_a2 *a, int n, unsigned int *boot_ms)
 	msleep(a->run_ms);
 	a2_log_tail(a);
 
-	if (!a2_stop(a, n))
+	if (a2_stop(a, n) != A2_STOP_CLEAN)
 		return -EIO;
 	return ret ? -EPROTO : 0;
 }
@@ -823,6 +876,7 @@ static void a2_work_fn(struct work_struct *w)
 	unsigned int boot_ms = 0, boot_ms_max = 0;
 	const char *why, *fails = NULL;
 	u32 st, cst, opt, cfg, sbsp;
+	bool left_running = false;
 	int i, ret, boots = 0;
 
 	migrate_disable();
@@ -898,7 +952,8 @@ static void a2_work_fn(struct work_struct *w)
 		if (ret) {
 			fails = ret == -ETIME ? "cpu-enable-timeout" :
 				ret == -ETIMEDOUT ? "no-ready-to-sing" :
-				ret == -EIO ? "stop" :
+				ret == -EIO ? (READ_ONCE(a->dsp_running) ?
+					       "stop-unconfirmed" : "stop") :
 				ret == -EPROTO ? "resume-ipc" : "aborted";
 			break;
 		}
@@ -909,14 +964,15 @@ static void a2_work_fn(struct work_struct *w)
 		disable_irq(a->irq);
 		a->irq_enabled = false;
 	}
-	if (!READ_ONCE(a->dsp_running)) {
+	left_running = READ_ONCE(a->dsp_running);
+	if (!left_running) {
 		/* leave the PMU as found (the boot state is CPU off) */
 		regmap_update_bits(gate.pmu, PMU_ABOX_CPU_CONFIGURATION, ABOX_CPU_LOCAL_PWR_CFG,
 				   a->pmu_cfg0 & ABOX_CPU_LOCAL_PWR_CFG);
 		pm_runtime_put_sync(a->dev);
 		a->rpm_held = false;
-	} else {
-		pr_err(A2 "ABOX CPU could not be stopped: SysMMU kept translating, system suspend refused\n");
+	} else if (!fails) {
+		fails = "stop-unconfirmed";	/* cannot happen: every unconfirmed stop fails */
 	}
 	a2_pmu_snapshot(a, "after");
 
@@ -930,9 +986,12 @@ static void a2_work_fn(struct work_struct *w)
 			boot_ms_max, A2_BOOT_PASS_MS);
 	if (!fails && READ_ONCE(a->incompatible))
 		fails = "incompatible";
-	a2_finish(a, !fails && boots == a->boots_wanted, fails, boots, boot_ms_max);
+	a2_finish(a, !fails && !left_running && boots == a->boots_wanted, fails, boots,
+		  boot_ms_max);
 out_fw:
-	a2_release_firmware(a);
+	a2_release_firmware(a);	/* CPU-side copies; the DSP never sees them */
+	if (left_running)
+		a2_end_left_running(a);
 out:
 	migrate_enable();
 }
@@ -953,6 +1012,54 @@ static void a2_free_buffers(void *data)
 			__free_pages(a->dram_chunks[i].page, a->dram_chunks[i].order);
 	if (a->iva_chunk.page)
 		__free_pages(a->iva_chunk.page, a->iva_chunk.order);
+	if (a->chipid_page)
+		__free_page(a->chipid_page);
+}
+
+/*
+ * The firmware expects the chip-ID block at IOVA 0x10000000 (4.9 mapped
+ * the real register page there, identity). The 9810 SysMMU page tables
+ * carry no protection bits (SYSMMU_NO_PROT), so a read-only mapping would
+ * still let the DSP write. A2 therefore maps a private RAM page instead:
+ * the CPU reads the chip-ID registers once (the window described in the
+ * DT, outside pd-aud, already read by exynos-chipid at boot) and copies
+ * them to the same offsets; the rest of the page is zero. Whatever the DSP
+ * writes there only lands in this page.
+ */
+static int a2_chipid_snapshot(struct abox_a2 *a)
+{
+	struct device_node *np;
+	void __iomem *base;
+	struct resource r;
+	u32 *snap;
+	unsigned int i;
+	int ret;
+
+	np = of_find_compatible_node(NULL, NULL, "samsung,exynos9810-chipid");
+	if (!np)
+		return -ENODEV;
+	ret = of_address_to_resource(np, 0, &r);
+	of_node_put(np);
+	if (ret)
+		return ret;
+	if (r.start != IOVA_CHIPID || resource_size(&r) < CHIPID_WINDOW)
+		return -EINVAL;
+
+	a->chipid_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!a->chipid_page)
+		return -ENOMEM;
+	base = ioremap(r.start, CHIPID_WINDOW);
+	if (!base)
+		return -ENOMEM;
+	snap = page_address(a->chipid_page);
+	for (i = 0; i < ARRAY_SIZE(a2_chipid_regs); i++)
+		snap[a2_chipid_regs[i] / 4] = readl(base + a2_chipid_regs[i]);
+	iounmap(base);
+	/* the SysMMU walk and the DSP are not coherent with the CPU caches */
+	arch_dma_prep_coherent(a->chipid_page, PAGE_SIZE);
+	dev_info(a->dev, "chip-id snapshot: PRODUCT_ID=%#x REV=%#x (+ unique ID words) copied to a private page\n",
+		 snap[CHIPID_PRODUCT_ID / 4], snap[CHIPID_REV / 4]);
+	return 0;
 }
 
 /* NC kernel view of @n chunks; the cacheable linear alias is cleaned first */
@@ -1011,6 +1118,9 @@ static int a2_alloc_buffers(struct abox_a2 *a)
 	a->iva = a2_vmap_chunks(&a->iva_chunk, 1, IVA_FIRMWARE_SIZE);
 	if (!a->dram || !a->iva)
 		return -ENOMEM;
+	ret = a2_chipid_snapshot(a);
+	if (ret)
+		return dev_err_probe(a->dev, ret, "chip-id snapshot\n");
 	dev_info(a->dev, "dram firmware (%#x) alloc: %u chunks, iva firmware (%#x) alloc\n",
 		 DRAM_FIRMWARE_SIZE, a->dram_nchunks, IVA_FIRMWARE_SIZE);
 	return 0;
@@ -1052,8 +1162,12 @@ static int a2_iommu_setup(struct abox_a2 *a)
 			IVA_FIRMWARE_SIZE, IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
 	if (ret)
 		return ret;
-	/* 4.9: chip-id page identity mapped for the firmware */
-	ret = iommu_map(a->domain, IOVA_CHIPID, IOVA_CHIPID, PAGE_SIZE, IOMMU_READ, GFP_KERNEL);
+	/*
+	 * 4.9 mapped the real chip-ID page here; A2 maps its RAM snapshot
+	 * (a2_chipid_snapshot()). IOMMU_READ is not enforced by this SysMMU.
+	 */
+	ret = iommu_map(a->domain, IOVA_CHIPID, page_to_phys(a->chipid_page), PAGE_SIZE,
+			IOMMU_READ, GFP_KERNEL);
 	if (ret)
 		return ret;
 
@@ -1061,7 +1175,7 @@ static int a2_iommu_setup(struct abox_a2 *a)
 	if (ret)
 		return ret;
 	a->attached = true;
-	dev_info(a->dev, "own IOMMU domain: DRAM firmware at %#lx (%u chunks), IVA at %#lx, chip-id page %#lx identity; VSS/dump not mapped\n",
+	dev_info(a->dev, "own IOMMU domain: DRAM firmware at %#lx (%u chunks), IVA at %#lx, chip-id snapshot (RAM) at %#lx; VSS/dump not mapped\n",
 		 IOVA_DRAM_FIRMWARE, a->dram_nchunks, IOVA_IVA_FIRMWARE, IOVA_CHIPID);
 	return 0;
 }
