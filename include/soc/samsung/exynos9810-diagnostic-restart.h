@@ -8,10 +8,13 @@
  * reset can run now (context published, CAL up, same chip revision, DFD
  * dump off), else the reason it cannot.
  *
- * exynos9810_diagnostic_emergency_restart(): process context only. Runs
- * the restart preparation (normal INFORM2/INFORM3, ACPM STOP per the
- * reset policy) and then emergency_restart(), whose restart guard writes
- * PMU SWRESET. No device shutdown. Returns only if it refused before
+ * exynos9810_diagnostic_emergency_restart(): process context only; must
+ * not be called with the CPU hotplug lock held. On the reboot CPU (chosen
+ * and kept online under cpus_read_lock()), runs the restart preparation
+ * (normal INFORM2/INFORM3, ACPM STOP per the reset policy), publishes its
+ * own emergency preparation (which a concurrent restart(2) cannot clear)
+ * and calls emergency_restart(), whose restart guard writes PMU SWRESET.
+ * No device shutdown. Returns only if it refused before
  * emergency_restart(); the return value is then negative.
  *
  * Without the diagnostic restart driver the stubs refuse.

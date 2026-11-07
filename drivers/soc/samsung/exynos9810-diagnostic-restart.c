@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Experimental crownlte headless diagnostic return, never an Android ABI. */
+#include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -33,8 +34,15 @@ struct diagnostic_restart {
 	struct notifier_block command_notifier;
 	struct sys_off_handler *prepare_handler;
 	unsigned int revision;
+	/* Normal restart(2) preparation; reset by every reboot callback run. */
 	bool default_requested;
 	bool prepared;
+	/*
+	 * Emergency reset preparation: written only by the emergency worker
+	 * (under diagnostic_context_lock), never by a reboot callback, so a
+	 * concurrent restart(2) cannot withdraw it.
+	 */
+	bool emergency_prepared;
 };
 
 /* This builtin guard survives probe failure and consumer/supplier unbind. */
@@ -52,6 +60,7 @@ static int diagnostic_command(struct notifier_block *nb,
 	struct diagnostic_restart *ctx =
 		container_of(nb, struct diagnostic_restart, command_notifier);
 
+	/* Normal state only; emergency_prepared is not this path's to clear. */
 	WRITE_ONCE(ctx->prepared, false);
 	WRITE_ONCE(ctx->default_requested,
 		   event == SYS_RESTART && diagnostic_default_cmd(cmd));
@@ -98,25 +107,30 @@ static void diagnostic_optional_stop(struct diagnostic_restart *ctx)
 		pr_emerg("Experimental diagnostic STOP acknowledged\n");
 }
 
-static int diagnostic_prepare(struct sys_off_data *data)
+/*
+ * Normal boot reasons and the ACPM STOP, shared by the normal restart
+ * preparation and the emergency reset. diagnostic_context_lock serialises
+ * the two (a concurrent restart(2) and the emergency worker), so the PMU
+ * writes and STOP never interleave. True if SWRESET may follow.
+ */
+static bool diagnostic_prepare_locked(struct diagnostic_restart *ctx)
 {
-	struct diagnostic_restart *ctx = data->cb_data;
 	unsigned int main_rev, sub_rev;
 	int ret;
 
-	WRITE_ONCE(ctx->prepared, false);
-	if (!READ_ONCE(ctx->default_requested) || !cal_if_is_initialized())
-		return NOTIFY_DONE;
+	lockdep_assert_held(&diagnostic_context_lock);
+	if (!cal_if_is_initialized())
+		return false;
 	id_get_rev(&main_rev, &sub_rev);
 	if (main_rev != ctx->revision)
-		return NOTIFY_DONE;
+		return false;
 	/* The original SEC wrapper writes INFORM2 then INFORM3 for normal boot. */
 	writel(NORMAL_INFORM2, ctx->pmu + INFORM2);
 	if (readl(ctx->pmu + INFORM2) != NORMAL_INFORM2)
-		return NOTIFY_DONE;
+		return false;
 	writel(NORMAL_INFORM3, ctx->pmu + INFORM3);
 	if (!diagnostic_reasons_valid(ctx))
-		return NOTIFY_DONE;
+		return false;
 	if (ctx->revision >= 1) {
 		if (IS_ENABLED(CONFIG_EXYNOS9810_DIAGNOSTIC_ORIGINAL_RESET)) {
 			diagnostic_optional_stop(ctx);
@@ -125,11 +139,31 @@ static int diagnostic_prepare(struct sys_off_data *data)
 			ret = acpm_ipc_prepare_restart(ctx->supplier, ctx->framework);
 			if (ret) {
 				pr_emerg("Diagnostic restart STOP refused: %d\n", ret);
-				return NOTIFY_DONE;
+				return false;
 			}
 		}
 	}
-	smp_store_release(&ctx->prepared, true);
+	return true;
+}
+
+/*
+ * Restart-prepare chain (process context, after device shutdown). The
+ * handler is unregistered before ctx is retired, so ctx stays valid. Only
+ * the normal state is written; emergency_prepared is left alone.
+ */
+static int diagnostic_prepare(struct sys_off_data *data)
+{
+	struct diagnostic_restart *ctx = data->cb_data;
+	bool ok;
+
+	WRITE_ONCE(ctx->prepared, false);
+	if (!READ_ONCE(ctx->default_requested))
+		return NOTIFY_DONE;
+	mutex_lock(&diagnostic_context_lock);
+	ok = diagnostic_prepare_locked(ctx);
+	mutex_unlock(&diagnostic_context_lock);
+	if (ok)
+		smp_store_release(&ctx->prepared, true);
 	return NOTIFY_DONE;
 }
 
@@ -169,13 +203,29 @@ static int diagnostic_dfd_prepare(struct diagnostic_restart *ctx)
 	return readl(ctx->pmu + DFD) & DFD_DISABLE_RESET ? -EIO : 0;
 }
 
+/*
+ * Two independently published preparations, either of which allows
+ * SWRESET; neither path clears the other's:
+ *  - normal: restart(2) with the default command; reset by the reboot
+ *    callbacks of every new restart;
+ *  - emergency: published by the emergency worker only. A concurrent
+ *    restart(2) whose callbacks run after the worker prepared cannot
+ *    withdraw it. If that restart wins the race to machine_restart() with
+ *    a non-default command, the emergency preparation still resets, to a
+ *    normal boot (INFORM2/INFORM3 are re-checked below either way).
+ * CAL, the boot reasons and the DFD preparation are checked for both.
+ */
 static int diagnostic_restart_final(struct sys_off_data *data)
 {
 	struct diagnostic_restart *ctx = data->cb_data;
+	bool emergency = smp_load_acquire(&ctx->emergency_prepared);
+	bool normal = diagnostic_default_cmd(data->cmd) &&
+		      smp_load_acquire(&ctx->prepared) &&
+		      READ_ONCE(ctx->default_requested);
 
-	if (!diagnostic_default_cmd(data->cmd) ||
-	    !smp_load_acquire(&ctx->prepared) ||
-	    !READ_ONCE(ctx->default_requested) ||
+	if (emergency && !normal)
+		pr_emerg("Diagnostic restart: emergency preparation published; normal boot reasons used\n");
+	if (!(emergency || normal) ||
 	    !cal_if_is_initialized() || !diagnostic_reasons_valid(ctx) ||
 	    diagnostic_dfd_prepare(ctx)) {
 		pr_emerg("Diagnostic restart prerequisites failed; physical reset required\n");
@@ -218,9 +268,10 @@ static struct notifier_block diagnostic_guard = {
  * Kernel-internal emergency reset (crownlte audio A2: a DSP that could not
  * be stopped while the CL0 watchdog cannot end the boot). It is the PMU
  * sequence of a default restart(2) without device shutdown:
- * diagnostic_prepare() (normal INFORM2/INFORM3, ACPM STOP per the reset
- * policy), then emergency_restart() -> machine_restart() -> the restart
- * guard above (prerequisites and INFORM re-checked, PMU SWRESET).
+ * diagnostic_prepare_locked() (normal INFORM2/INFORM3, ACPM STOP per the
+ * reset policy), emergency_prepared published, then emergency_restart() ->
+ * machine_restart() -> the restart guard above (prerequisites and INFORM
+ * re-checked, PMU SWRESET).
  * The check below requires the DFD dump to be off, so the guard's DFD
  * preparation is the read-only no-op it is in the default restart.
  */
@@ -255,16 +306,18 @@ const char *exynos9810_diagnostic_restart_check(void)
 
 static long diagnostic_emergency_on_cpu(void *arg)
 {
-	struct sys_off_data data = { .mode = reboot_mode, .cmd = NULL };
 	struct diagnostic_restart *ctx;
 	const char *reason = arg, *why;
 	bool transition;
 	int i;
 
 	/*
-	 * A concurrent restart(2) holds system_transition_mutex, and its
-	 * command notifier clears ->prepared until its own preparation runs.
-	 * Wait for it a bounded time (it ends in the same reset), then go on.
+	 * A concurrent restart(2) holds system_transition_mutex. Let it finish
+	 * if it can (it ends in the same SWRESET, after device shutdown), but
+	 * never block on it: its device shutdown can wait for the caller of
+	 * this function (the A2 worker, via its .shutdown). Going on without
+	 * it is safe because the guard accepts the emergency preparation,
+	 * which that restart's callbacks do not clear.
 	 */
 	for (i = 0; !(transition = mutex_trylock(&system_transition_mutex)) && i < 100; i++)
 		msleep(100);
@@ -278,17 +331,14 @@ static long diagnostic_emergency_on_cpu(void *arg)
 	if (!why) {
 		pr_emerg("Diagnostic emergency restart (%s) on CPU%d: normal boot reasons, STOP, PMU SWRESET; no device shutdown\n",
 			 reason, raw_smp_processor_id());
-		WRITE_ONCE(ctx->default_requested, true);
-		data.cb_data = ctx;
-		diagnostic_prepare(&data);
-		if (smp_load_acquire(&ctx->prepared)) {
+		if (diagnostic_prepare_locked(ctx)) {
+			smp_store_release(&ctx->emergency_prepared, true);
 			emergency_restart();	/* does not return on arm64 */
 			why = "emergency_restart() returned";
+			WRITE_ONCE(ctx->emergency_prepared, false);
 		} else {
 			why = "restart preparation refused (boot reasons or STOP)";
 		}
-		WRITE_ONCE(ctx->prepared, false);
-		WRITE_ONCE(ctx->default_requested, false);
 	}
 	mutex_unlock(&diagnostic_context_lock);
 	if (transition)
@@ -297,15 +347,43 @@ static long diagnostic_emergency_on_cpu(void *arg)
 	return -EIO;
 }
 
+/*
+ * The CPU is chosen and the work runs on it under the CPU hotplug read lock
+ * (the work_on_cpu_safe() pattern, with the selection inside), so the chosen
+ * CPU cannot go offline between the online check and the end of the work.
+ * Deadlock analysis:
+ *  - a hotplug operation already in progress: cpus_read_lock() waits for it;
+ *    no hotplug callback waits for the A2 worker or this driver;
+ *  - a hotplug operation started later waits until the work returns (bounded
+ *    by the 10 s transition wait and the bounded STOP) or the reset;
+ *  - nothing in the work takes cpus_read_lock() again (a recursive read with
+ *    a writer queued would deadlock): msleep, trylock, the context lock,
+ *    device_trylock, the ACPM spin_trylock IPC, emergency_restart();
+ *  - a concurrent restart(2) holds system_transition_mutex, and its device
+ *    shutdown waits in the A2 .shutdown for the A2 worker that called this.
+ *    It takes no CPU hotplug lock before device shutdown returns
+ *    (migrate_to_reboot_cpu() comes later). The work only trylocks the
+ *    transition mutex, for at most 10 s, which breaks the cycle; a hotplug
+ *    writer between the two (holding cpu_add_remove_lock) is bounded the
+ *    same way;
+ *  - suspend takes system_transition_mutex and then the hotplug write lock,
+ *    the reverse order, but the work only trylocks it, with the same bound
+ *    (and A2 refuses suspend after its test anyway).
+ */
 int exynos9810_diagnostic_emergency_restart(const char *reason)
 {
-	int cpu = reboot_cpu;
+	long ret;
+	int cpu;
 
 	might_sleep();
+	cpus_read_lock();
 	/* the reboot CPU, as kernel_restart() -> migrate_to_reboot_cpu() */
+	cpu = reboot_cpu;
 	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
 		cpu = cpumask_first(cpu_online_mask);
-	return work_on_cpu(cpu, diagnostic_emergency_on_cpu, (void *)reason);
+	ret = work_on_cpu(cpu, diagnostic_emergency_on_cpu, (void *)reason);
+	cpus_read_unlock();
+	return ret;
 }
 
 static bool diagnostic_topology_valid(void)
