@@ -6,13 +6,17 @@ Android Common Kernel `android16-6.12` (6.12.93) with a crownlte port. Experimen
 
 ```sh
 sudo apt install clang-18 lld-18 llvm-18 make bc bison flex libssl-dev libelf-dev
-mkdir out && cp arch/arm64/configs/crownlte-int6.config out/.config
-make O=out ARCH=arm64 LLVM=-18 olddefconfig
-make O=out ARCH=arm64 LLVM=-18 -j$(nproc) Image dtbs
+mkdir ../out && cp arch/arm64/configs/crownlte-int6.config ../out/.config
+make O=../out ARCH=arm64 LLVM=-18 olddefconfig
+make O=../out ARCH=arm64 LLVM=-18 -j$(nproc) Image dtbs
+
+# DTB: built with build-dtb.sh from crownlte-rom-ram, not by kbuild
+KSRC=$PWD KO=$PWD/../out ../crownlte-rom-ram/build-dtb.sh \
+  arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-v23a-int6.dts int6.dtb
 ```
 
-Output: `out/arch/arm64/boot/Image` and
-`out/arch/arm64/boot/dts/exynos/exynos9810-crownlte-romram-v23a-int6.dtb`.
+Output: `../out/arch/arm64/boot/Image` and `int6.dtb`. Keep the output directory outside
+the source tree; the Mali driver does not build with `O=out` inside it.
 
 ## Branches
 
