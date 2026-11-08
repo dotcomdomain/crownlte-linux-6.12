@@ -20,7 +20,8 @@ the source tree; the Mali driver does not build with `O=out` inside it.
 
 ## Branches
 
-- `main`: integration 6, whose parts were each tested on hardware.
+- `main`: integration 6, tested on hardware (LineageOS boots, display, GPU, touch, Wi-Fi).
+  Current status: [STATUS.md](https://github.com/dotcomdomain/crownlte-port-notes/blob/main/STATUS.md).
 - `crownlte-*`: feature branches (BT, suspend, C2 idle, audio). They build the same way.
   Notes are in `Documentation/crownlte/`.
 

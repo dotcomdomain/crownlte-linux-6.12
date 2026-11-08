@@ -1,7 +1,8 @@
 # crownlte integration 6: perf + DPU SysMMU + Wi-Fi + TEE T3 (TEE DT off)
 
-Branch `crownlte-integration-6`. Build only; this exact combination has not run on the
-phone yet. Every part has passed on hardware on its own branch.
+Branch `crownlte-integration-6`. Ran on hardware on 2026-11-07: LineageOS boots from RAM to
+the setup wizard, with display composition through the DPU SysMMU, adb, and a Wi-Fi scan of
+2.4 and 5 GHz. Every part had passed on its own branch first.
 
 | Branch | Tip merged | Hardware result of that tip |
 |---|---|---|
